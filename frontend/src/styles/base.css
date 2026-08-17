@@ -1,0 +1,81 @@
+/* ==========================================================================
+   Base — reset, typography, scrollbars, low-level utilities
+   ========================================================================== */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg-app);
+  color: var(--text-1);
+  font-family: var(--font-ui);
+  font-size: var(--fs-body);
+  line-height: 1.45;
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+::selection { background: rgba(76, 141, 255, 0.32); }
+
+h1, h2, h3, h4, p, ul, ol, figure { margin: 0; }
+ul, ol { padding: 0; list-style: none; }
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+input, select, textarea { font: inherit; color: inherit; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: none; filter: brightness(1.12); }
+img { display: block; }
+
+/* Numeric data should align like an editor */
+.mono { font-family: var(--font-mono); font-feature-settings: "tnum"; letter-spacing: -0.01em; }
+.num  { font-variant-numeric: tabular-nums; }
+
+/* ---- Scrollbars (thin, editor style) ---------------------------------- */
+* { scrollbar-width: thin; scrollbar-color: #2A3348 transparent; }
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-thumb {
+  background: #242D3E;
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: #33405A; background-clip: padding-box; border: 2px solid transparent; }
+*::-webkit-scrollbar-track, *::-webkit-scrollbar-corner { background: transparent; }
+
+/* ---- Focus ------------------------------------------------------------- */
+:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 1px; border-radius: var(--r-sm); }
+
+/* ---- Generic helpers --------------------------------------------------- */
+.row { display: flex; align-items: center; }
+.col { display: flex; flex-direction: column; }
+.grow { flex: 1 1 auto; min-width: 0; }
+.between { justify-content: space-between; }
+.center { align-items: center; justify-content: center; }
+.wrap { flex-wrap: wrap; }
+.t1 { color: var(--text-1); }
+.t2 { color: var(--text-2); }
+.t3 { color: var(--text-3); }
+.small { font-size: var(--fs-small); }
+.micro { font-size: var(--fs-micro); }
+.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.clickable { cursor: pointer; }
+
+.g-green  { color: var(--green); }
+.g-amber  { color: var(--amber); }
+.g-red    { color: var(--red); }
+.g-orange { color: var(--orange); }
+.g-blue   { color: var(--accent); }
+.g-purple { color: var(--purple); }
+
+@keyframes wo-spin { to { transform: rotate(360deg); } }
+@keyframes wo-pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@keyframes wo-fade-in {
+  from { opacity: 0; transform: translateY(3px); }
+  to   { opacity: 1; transform: none; }
+}
