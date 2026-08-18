@@ -39,7 +39,7 @@ export function LineChart({
 
   const W = 640;
   const H = height;
-  const padL = 34, padR = 52, padT = 12, padB = xLabels || xLabel ? 26 : 10;
+  const padL = 34, padR = 16, padT = 12, padB = xLabels || xLabel ? 26 : 10;
   const iw = W - padL - padR;
   const ih = H - padT - padB;
 
@@ -108,9 +108,9 @@ export function LineChart({
               <circle cx={px(s.data.length - 1)} cy={py(s.data[s.data.length - 1])} r={3} fill={s.color} stroke="#0D1017" strokeWidth={1.4} />
             )}
             {endBadges && s.endLabel && (
-              <g transform={`translate(${W - padR + 8}, ${py(s.data[s.data.length - 1]) - 9})`}>
-                <rect width={44} height={18} rx={4.5} fill={s.dashed ? "#283042" : s.color} opacity={s.dashed ? 0.9 : 1} />
-                <text x={22} y={12.5} textAnchor="middle" fontSize={10} fontWeight={650} fill={s.dashed ? "var(--text-2)" : "#fff"} fontFamily="var(--font-mono)">
+              <g transform={`translate(${px(s.data.length - 1) + 6}, ${py(s.data[s.data.length - 1]) - 9})`}>
+                <rect width={40} height={18} rx={4} fill={s.dashed ? "#283042" : s.color} opacity={s.dashed ? 0.9 : 1} />
+                <text x={20} y={12.5} textAnchor="middle" fontSize={10} fontWeight={650} fill={s.dashed ? "var(--text-2)" : "#fff"} fontFamily="var(--font-mono)">
                   {s.endLabel}
                 </text>
               </g>

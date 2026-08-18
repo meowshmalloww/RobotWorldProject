@@ -81,6 +81,16 @@ async function main() {
   const errors = await evalJs(`window.__errs ?? "none"`);
   console.log("PAGE ERRORS:", errors);
 
+  const tb = await evalJs(`(() => {
+    const el = [...document.querySelectorAll(".vp-overlay")].find((d) => d.style.top === "10px" && d.style.right === "10px");
+    if (!el) return "no overlay";
+    const t = el.querySelector(".vp-toolbar");
+    const r = t.getBoundingClientRect();
+    const cs = getComputedStyle(t);
+    return { w: r.width, h: r.height, wrap: cs.flexWrap, display: cs.display, kids: t.children.length, overlayW: el.getBoundingClientRect().width };
+  })()`);
+  console.log("TOOLBAR:", JSON.stringify(tb));
+
   const shot = await send("Page.captureScreenshot", { format: "png" });
   if (shot.result?.data) {
     fs.writeFileSync(OUT, Buffer.from(shot.result.data, "base64"));

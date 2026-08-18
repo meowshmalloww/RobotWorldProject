@@ -1,0 +1,120 @@
+"""Runtime configuration.
+
+Resolution order for every setting:
+  1. value stored in the `settings` DB table (written via PUT /api/settings/...)
+  2. environment variable / .env file (bootstrap overrides)
+  3. hard default below
+
+Secrets (API keys) live in the same settings table but are masked by the
+settings API. Nothing secret is ever logged.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+# Packaged desktop builds set ROBOTWORLD_DATA_DIR to Electron's per-user data
+# directory.  Keeping generated assets and SQLite outside a PyInstaller bundle
+# is required because bundled resources are read-only/ephemeral.
+DATA_DIR = Path(os.environ.get("ROBOTWORLD_DATA_DIR", BASE_DIR / "data")).resolve()
+ASSETS_DIR = DATA_DIR / "assets"
+DEMOS_DIR = DATA_DIR / "demos"
+MODELS_DIR = DATA_DIR / "models"
+DB_PATH = DATA_DIR / "robotworld.db"
+
+for _d in (DATA_DIR, ASSETS_DIR, DEMOS_DIR, MODELS_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+
+class EnvSettings(BaseSettings):
+    """Bootstrap-only environment overrides (DB settings take precedence)."""
+
+    model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), extra="ignore")
+
+    host: str = "127.0.0.1"
+    port: int = 8000
+
+    openai_api_key: str | None = None
+    openai_base_url: str | None = None
+    openai_model: str = "gpt-4o"
+
+    brightdata_api_key: str | None = None
+    brightdata_account_id: str | None = None
+    brightdata_serp_zone: str = "serp"
+    brightdata_unlocker_zone: str = "web_unlocker"
+
+    signoz_endpoint: str | None = None  # e.g. https://ingest.us.signoz.cloud:443
+    signoz_query_endpoint: str | None = None  # e.g. https://my-workspace.us.signoz.cloud
+    signoz_ingestion_key: str | None = None
+    signoz_api_key: str | None = None   # for the v5 query API
+    signoz_region: str = "us"
+
+    port_api_key: str | None = None
+    port_client_id: str | None = None
+    port_client_secret: str | None = None
+    port_endpoint: str = "https://api.port.io"
+
+
+env = EnvSettings()
+
+# Settings table keys that hold secrets — masked by the settings API.
+SECRET_KEYS = {
+    "integrations.port.token",
+    "integrations.port.clientSecret",
+    "integrations.brightdata.apiKey",
+    "integrations.signoz.ingestionKey",
+    "integrations.signoz.apiKey",
+    "models.openaiKey",
+}
+
+DEFAULT_SETTINGS: dict = {
+    "general": {
+        "workspaceName": "RobotWorld Local",
+        "region": "local",
+        "autosave": True,
+        "telemetry": True,
+    },
+    "appearance": {"theme": "dark", "accent": "graphite", "density": "comfortable"},
+    "integrations": {
+        "port": {
+            "enabled": False,
+            "endpoint": env.port_endpoint,
+            "clientId": env.port_client_id or "",
+            "clientSecret": env.port_client_secret or "",
+            "token": env.port_api_key or "",
+        },
+        "brightdata": {
+            "enabled": True,
+            "accountId": env.brightdata_account_id or "",
+            "serpZone": env.brightdata_serp_zone,
+            "unlockerZone": env.brightdata_unlocker_zone,
+            "apiKey": env.brightdata_api_key or "",
+        },
+        "signoz": {
+            "enabled": True,
+            "endpoint": env.signoz_endpoint or f"https://ingest.{env.signoz_region}.signoz.cloud:443",
+            "queryEndpoint": env.signoz_query_endpoint or "",
+            "ingestionKey": env.signoz_ingestion_key or "",
+            "apiKey": env.signoz_api_key or "",
+            "region": env.signoz_region,
+        },
+    },
+    "simulation": {
+        "engine": "mujoco",
+        "gravity": -9.81,
+        "timestepHz": 500,
+        "renderer": "mujoco-offscreen",
+    },
+    "models": {
+        "planner": env.openai_model,
+        "vlm": env.openai_model,
+        "policy": "bc-mlp-v1",
+        "openaiKey": env.openai_api_key or "",
+        "openaiBaseUrl": env.openai_base_url or "https://api.openai.com/v1",
+        "provider": "openai-compatible",
+        "timeoutS": 60,
+    },
+}

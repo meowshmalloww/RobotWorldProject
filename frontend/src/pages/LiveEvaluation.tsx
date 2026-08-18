@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Canvas, useFrame } from "@react-three/fiber";
+import { Canvas } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
 import { Card, Progress } from "../components/ui/Card";
@@ -7,123 +7,283 @@ import { Icon } from "../components/ui/Icon";
 import { Badge, Segmented } from "../components/ui/controls";
 import { Viewport } from "../components/three/Viewport";
 import { WarehouseKitchen } from "../components/three/WarehouseKitchen";
-import { eventTimeline, successConditions, taskSteps } from "../data/worlds";
+import { useToast } from "../components/ui/Toast";
+import { downloadFile } from "../components/ui/Modal";
+import { api, ApiError } from "../lib/api";
+import { useWs } from "../lib/useWs";
 import type { RenderVariant } from "../components/three/materials";
+import type { ArmPose } from "../components/three/RobotArm";
 
-const RUN_LENGTH = 14; // seconds on the scripted timeline
+/* ---- API contracts (backend/app/schemas.py) ------------------------------- */
 
-interface SimClock { t: number }
+interface SessionInfo {
+  sessionId: string;
+  runId: string;
+  scenario: { name: string; desc: string; world: string; policy: string; variations: number; randomization: boolean };
+  durationS: number;
+}
+
+interface LiveMeta {
+  type: "meta";
+  durationS: number;
+  steps: { name: string }[];
+  conditions: { name: string; target: string }[];
+  events: { t: number; time: string; name: string; sub: string }[];
+}
+
+interface LiveFrame {
+  type: "frame";
+  t: number;
+  pose: { yaw: number; shoulder: number; elbow: number; wrist: number; grip: number };
+  door: number;
+  gripper: "open" | "closed";
+  forceN: number;
+  inContact: boolean;
+  contactName?: string;
+  doorAngleDeg: number;
+  success: number;
+  stepsDone: number;
+  conditions: boolean[];
+  eventsFired: number[];
+  done: boolean;
+}
+
+interface LiveEnd {
+  type: "end";
+  success: boolean;
+  summary: string;
+}
+
+type LiveMsg = LiveMeta | LiveFrame | LiveEnd;
 
 /**
- * Live Evaluation — the robot executes "Open Refrigerator" in real time.
- * Animation runs on a shared simulation clock advanced inside the master
- * canvas via useFrame (no per-frame React renders); DOM panels sample the
- * clock at 5 Hz. All five sensor views render the SAME procedural world:
- * wrist = gripper-frame camera, segmentation = per-object ID materials,
- * depth = MeshDepthMaterial pass.
+ * Live Evaluation — the robot executes the scenario in real time on the
+ * backend. Frames arrive over WS /ws/live/{sessionId}; `live` ref carries
+ * the latest pose+door into every render of the shared procedural world
+ * (no per-frame React renders); DOM panels sample state at 5 Hz.
  */
-export default function LiveEvaluation() {
-  const sim = useRef<SimClock>({ t: 0 });
-  const [running, setRunning] = useState(true);
+export default function LiveEvaluation({ embedded = false }: { embedded?: boolean }) {
+  const toast = useToast();
+  const [session, setSession] = useState<SessionInfo | null>(null);
+  const [startedAt, setStartedAt] = useState<string>("");
+  const [starting, setStarting] = useState(false);
+  const [wsState, setWsState] = useState<"idle" | "connecting" | "open" | "closed">("idle");
+  const [paused, setPaused] = useState(false);
+  const [ended, setEnded] = useState(false);
+  const [endSummary, setEndSummary] = useState<{ success: boolean; summary: string } | null>(null);
   const [speed, setSpeed] = useState("1×");
-  const speedN = speed === "2×" ? 2 : speed === "0.5×" ? 0.5 : 1;
+  const [meta, setMeta] = useState<LiveMeta | null>(null);
+  const [frame, setFrame] = useState<LiveFrame | null>(null);
   const [, setTick] = useState(0);
 
-  // sample the sim clock for DOM panels at 5 Hz
+  // per-frame drive into the 3D world (never triggers React renders)
+  const live = useRef<{ pose: ArmPose; door: number }>({ pose: { yaw: 0.62, shoulder: 0.55, elbow: -1.5, wrist: 0.7, grip: 0, door: 0 }, door: 0 });
+
+  const startSession = async () => {
+    setStarting(true);
+    try {
+      const s = await api.post<SessionInfo>("/eval/sessions", {});
+      setSession(s);
+      setStartedAt(new Date().toLocaleTimeString());
+      setMeta(null);
+      setFrame(null);
+      setPaused(false);
+      setEnded(false);
+      setEndSummary(null);
+      live.current = { pose: { yaw: 0.62, shoulder: 0.55, elbow: -1.5, wrist: 0.7, grip: 0, door: 0 }, door: 0 };
+    } catch (e) {
+      toast.push("err", "Could not start evaluation", e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const send = useWs<LiveMsg>(session ? `/live/${session.sessionId}` : null, {
+    enabled: !!session,
+    onStatus: (s) => setWsState(s),
+    onMessage: (msg) => {
+      if (msg.type === "meta") {
+        setMeta(msg);
+      } else if (msg.type === "frame") {
+        live.current = { pose: { ...msg.pose, door: msg.door }, door: msg.door };
+        setFrame(msg);
+        if (msg.done) setEnded(true);
+      } else if (msg.type === "end") {
+        setEnded(true);
+        setEndSummary({ success: msg.success, summary: msg.summary });
+        toast.push(msg.success ? "ok" : "info", msg.success ? "Run succeeded" : "Run ended", msg.summary);
+      }
+    },
+  });
+
+  // 5 Hz sampler — re-renders DOM panels from the latest frame
   useEffect(() => {
     const id = setInterval(() => setTick((x) => x + 1), 200);
     return () => clearInterval(id);
   }, []);
 
-  const t = sim.current.t;
+  const control = (action: "pause" | "resume" | "reset" | "speed" | "end", value?: number) =>
+    send({ type: "control", action, ...(value !== undefined ? { value } : {}) });
+
+  const durationS = meta?.durationS ?? session?.durationS ?? 0;
+  const t = frame?.t ?? 0;
   const mm = String(Math.floor(t / 60)).padStart(2, "0");
   const ss = String(Math.floor(t % 60)).padStart(2, "0");
   const elapsed = `${mm}:${ss}`;
-  const episodeProgress = Math.min(1, t / RUN_LENGTH);
+  const episodeProgress = durationS > 0 ? Math.min(1, t / durationS) : 0;
+  const success = frame?.success ?? 0;
+  const doorAngle = Math.round(frame?.doorAngleDeg ?? 0);
+  const stepsTotal = meta?.steps.length ?? 0;
+  const stepsDone = frame?.stepsDone ?? 0;
 
-  const gates = [0.05, 0.18, 0.55, 0.8, 0.93, 1.01];
-  const p = t / RUN_LENGTH;
-  const steps = taskSteps.map((s, i) => ({
-    ...s,
-    state: p >= gates[i] ? ("done" as const) : i === gates.findIndex((g) => p < g) ? ("active" as const) : ("pending" as const),
-  }));
-
-  const doorAngle = p < 0.2 ? 0 : p > 0.5 ? 95 : Math.round(((p - 0.2) / 0.3) * 95);
+  const exportReplay = async () => {
+    if (!session) return;
+    try {
+      const res = await fetch(`/api/eval/sessions/${session.sessionId}/replay`);
+      if (!res.ok) throw new ApiError(res.status, `Replay export failed (${res.status})`);
+      downloadFile(`replay_${session.runId}.json`, JSON.stringify(await res.json(), null, 2));
+      toast.push("ok", "Replay exported", `replay_${session.runId}.json`);
+    } catch (e) {
+      toast.push("err", "Replay export failed", e instanceof ApiError ? e.message : String(e));
+    }
+  };
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <div>
-          <h1 className="page-title row" style={{ gap: 9 }}>
-            Live Evaluation <Badge tone="live" dot>Live</Badge>
-          </h1>
-          <p className="page-sub">Watching run: Open Cabinet — Generalization v2</p>
+    <div className={embedded ? "col" : "page"} style={embedded ? { flex: 1, minHeight: 0, gap: 10 } : undefined}>
+      {!embedded && (
+        <div className="page-head">
+          <div>
+            <h1 className="page-title row" style={{ gap: 9 }}>
+              Live Evaluation {session && wsState === "open" && <Badge tone="live" dot>Live</Badge>}
+            </h1>
+            <p className="page-sub">{session ? `Watching run: ${session.scenario.name} — ${session.runId}` : "Start a run to stream a live evaluation."}</p>
+          </div>
         </div>
-        <div className="head-actions">
-          <button className="btn btn-secondary" onClick={() => setRunning(true)}><Icon name="play" size={12} /> Start</button>
-          <button className="btn btn-secondary" onClick={() => setRunning(false)}><Icon name="pause" size={12} /> Pause</button>
-          <button className="btn btn-secondary" onClick={() => { sim.current.t = 0; setTick((x) => x + 1); }}><Icon name="reset" size={12} /> Reset</button>
-          <button className="btn btn-secondary">Export replay <Icon name="chevronDown" size={12} /></button>
-          <span className="col" style={{ textAlign: "right", gap: 0, marginLeft: 8 }}>
-            <span className="micro t3">Run time &nbsp;·&nbsp; Sim time</span>
-            <span className="mono" style={{ fontWeight: 620 }}>{elapsed} &nbsp; {elapsed}</span>
+      )}
+      {/* run controls */}
+      <div className="dockbar">
+        {!session ? (
+          <button className="btn btn-primary btn-sm" onClick={startSession} disabled={starting}>
+            <Icon name="play" size={12} /> {starting ? "Starting…" : "Start run"}
+          </button>
+        ) : (
+          <>
+            {paused ? (
+              <button className="btn btn-primary btn-sm" onClick={() => { control("resume"); setPaused(false); }}>
+                <Icon name="play" size={12} /> Resume
+              </button>
+            ) : (
+              <button className="btn btn-secondary btn-sm" onClick={() => { control("pause"); setPaused(true); }} disabled={ended}>
+                <Icon name="pause" size={12} /> Pause
+              </button>
+            )}
+            <button className="btn btn-secondary btn-sm" onClick={() => { control("reset"); setPaused(false); setEnded(false); setEndSummary(null); }}>
+              <Icon name="reset" size={12} /> Reset
+            </button>
+            <button className="btn btn-secondary btn-sm" onClick={exportReplay}>
+              <Icon name="download" size={12} /> Export replay
+            </button>
+          </>
+        )}
+        <span className="grow" />
+        {session && (
+          <span className="row" style={{ gap: 12 }}>
+            <span className="micro t3">Run time <b className="mono t1">{elapsed}</b></span>
+            <span className="micro t3">Sim time <b className="mono t1">{elapsed}</b></span>
           </span>
-          <button className="btn btn-danger-ghost">End Run</button>
-        </div>
+        )}
+        {session && (
+          ended ? (
+            <Badge tone="grey">Run ended</Badge>
+          ) : (
+            <button className="btn btn-danger-ghost btn-sm" onClick={() => control("end")}>End Run</button>
+          )
+        )}
       </div>
+
+      {endSummary && (
+        <div className="card" style={{ padding: "10px 14px", display: "flex", gap: 9, alignItems: "center" }}>
+          <Icon name={endSummary.success ? "check" : "warning"} size={14} style={{ color: endSummary.success ? "var(--green)" : "var(--amber)" }} />
+          <span className="small" style={{ fontWeight: 580 }}>{endSummary.success ? "Success" : "Run finished"}</span>
+          <span className="small t2">{endSummary.summary}</span>
+        </div>
+      )}
 
       <div className="le-layout">
         {/* Left — run status + scenario */}
         <div className="col" style={{ gap: 10 }}>
-          <Card title="Run status" right={<Badge tone="live" dot>Live</Badge>}>
-            <div className="kv">
-              <KV k="Run ID" v={<span className="mono">run_7f9c2e81</span>} />
-              <KV k="World" v="Warehouse Kitchen v2" />
-              <KV k="Scenario" v="Open Refrigerator" />
-              <KV k="Policy" v="Open Cabinet Policy v3" />
-              <KV k="Start time" v="10:13:42 AM" />
-              <KV k="Elapsed" v={<span className="mono">{elapsed}</span>} />
-              <KV k="Episode" v={<span className="mono">4 / ∞</span>} />
-            </div>
-            <div style={{ marginTop: 10 }}>
-              <div className="row between small" style={{ marginBottom: 4 }}>
-                <span className="t2">Overall success</span>
-                <span className="mono" style={{ fontWeight: 620 }}>{(75 * episodeProgress).toFixed(1)}%</span>
-              </div>
-              <Progress value={75 * episodeProgress} tone="green" tall />
-            </div>
+          <Card title="Run status" right={session && wsState === "open" && !ended ? <Badge tone="live" dot>Live</Badge> : session ? <Badge tone="grey">{wsState === "connecting" ? "Connecting" : ended ? "Ended" : "Offline"}</Badge> : <Badge tone="grey">Idle</Badge>}>
+            {session ? (
+              <>
+                <div className="kv">
+                  <KV k="Run ID" v={<span className="mono">{session.runId}</span>} />
+                  <KV k="World" v={session.scenario.world} />
+                  <KV k="Scenario" v={session.scenario.name} />
+                  <KV k="Policy" v={session.scenario.policy} />
+                  <KV k="Start time" v={startedAt || "—"} />
+                  <KV k="Elapsed" v={<span className="mono">{elapsed}</span>} />
+                </div>
+                <div style={{ marginTop: 10 }}>
+                  <div className="row between small" style={{ marginBottom: 4 }}>
+                    <span className="t2">Overall success</span>
+                    <span className="mono" style={{ fontWeight: 620 }}>{success.toFixed(1)}%</span>
+                  </div>
+                  <Progress value={success} tone="green" tall />
+                </div>
+              </>
+            ) : (
+              <div className="empty-note">No active run — press <b>Start run</b> to create an evaluation session.</div>
+            )}
           </Card>
 
           <Card title="Scenario">
-            <div style={{ fontWeight: 620, marginBottom: 4 }}>Open Refrigerator</div>
-            <p className="small t2" style={{ marginBottom: 10 }}>Open the refrigerator door and expose the interior.</p>
-            <div className="kv">
-              <KV k="Initial state" v={<span className="badge b-grey" style={{ height: 18 }}>warehouse_v2.usd</span>} />
-              <KV k="Variations" v={<span className="mono">24</span>} />
-              <KV k="Domain randomization" v={<Badge tone="green" dot>On</Badge>} />
-            </div>
+            {session ? (
+              <>
+                <div style={{ fontWeight: 620, marginBottom: 4 }}>{session.scenario.name}</div>
+                <p className="small t2" style={{ marginBottom: 10 }}>{session.scenario.desc}</p>
+                <div className="kv">
+                  <KV k="Initial state" v={<span className="badge b-grey" style={{ height: 18 }}>{session.scenario.world}</span>} />
+                  <KV k="Variations" v={<span className="mono">{session.scenario.variations}</span>} />
+                  <KV k="Domain randomization" v={session.scenario.randomization ? <Badge tone="green" dot>On</Badge> : <Badge tone="grey">Off</Badge>} />
+                </div>
+              </>
+            ) : (
+              <div className="empty-note">Scenario details appear once a session starts.</div>
+            )}
           </Card>
         </div>
 
         {/* Center — viewport + sensor views */}
         <div className="le-center">
-          <Card flush style={{ padding: 10 }}>
-            <div style={{ position: "relative" }}>
+          <Card flush style={{ padding: 10, flex: 1, minHeight: 0 }}>
+            <div style={{ position: "relative", flex: 1, minHeight: 420, display: "flex", flexDirection: "column" }}>
               <Viewport
                 camera={{ position: [3.0, 2.1, 0.9], fov: 40 }}
                 target={[0.8, 1.1, -3.0]}
-                style={{ height: 400 }}
+                style={{ flex: 1, minHeight: 0 }}
                 gizmo={false}
               >
-                <SimClock sim={sim} running={running} speed={speedN} master />
-                <WarehouseKitchen simRef={sim} />
+                <WarehouseKitchen liveRef={live} />
               </Viewport>
-              <div className="vp-overlay" style={{ top: 12, left: 12 }}>
-                <div className="row" style={{ gap: 6 }}>
-                  <span className="vp-chip"><span className="dot" style={{ background: "var(--red)" }} /> LIVE</span>
-                  <span className="vp-chip mono">60 FPS</span>
+              {!session && (
+                <div className="vp-overlay" style={{ inset: 0, display: "grid", placeItems: "center", background: "rgba(20,22,27,0.55)", borderRadius: "var(--r-md)" }}>
+                  <div className="col center" style={{ gap: 10 }}>
+                    <Icon name="play" size={22} style={{ color: "var(--text-2)" }} />
+                    <span className="t2 small">No evaluation session</span>
+                    <button className="btn btn-primary" onClick={startSession} disabled={starting}>
+                      <Icon name="play" size={13} /> {starting ? "Starting…" : "Start a run"}
+                    </button>
+                  </div>
                 </div>
-              </div>
+              )}
+              {session && (
+                <div className="vp-overlay" style={{ top: 12, left: 12 }}>
+                  <div className="row" style={{ gap: 6 }}>
+                    <span className="vp-chip"><span className="dot" style={{ background: wsState === "open" && !ended ? "var(--red)" : "var(--text-3)" }} /> {wsState === "open" ? (ended ? "ENDED" : "LIVE") : wsState === "connecting" ? "CONNECTING" : "OFFLINE"}</span>
+                    <span className="vp-chip mono">20 Hz telemetry</span>
+                  </div>
+                </div>
+              )}
               <div className="vp-overlay" style={{ bottom: 12, left: 12 }}>
                 <span className="vp-chip">Camera: Third Person <Icon name="chevronDown" size={11} /></span>
               </div>
@@ -142,10 +302,10 @@ export default function LiveEvaluation() {
             <div style={{ padding: "10px 2px 2px" }}>
               <div className="section-label" style={{ marginBottom: 7 }}>Views</div>
               <div className="le-views">
-                <SensorView label="Third Person" dotColor="var(--accent)" variant="rgb" cam={[2.6, 1.9, 0.4]} tgt={[0.7, 1.1, -3.0]} sim={sim} />
-                <SensorView label="Wrist Camera" dotColor="var(--green)" variant="rgb" cam={[0.9, 1.35, -2.2]} tgt={[1.2, 1.25, -3.0]} sim={sim} fov={58} />
-                <SensorView label="Segmentation" dotColor="var(--purple)" variant="seg" cam={[2.6, 1.9, 0.4]} tgt={[0.7, 1.1, -3.0]} sim={sim} />
-                <SensorView label="Depth" dotColor="#8A94A6" variant="depth" cam={[0.4, 1.7, 0.9]} tgt={[0.8, 1.1, -3.0]} sim={sim} />
+                <SensorView label="Third Person" dotColor="var(--accent)" variant="rgb" cam={[2.6, 1.9, 0.4]} tgt={[0.7, 1.1, -3.0]} live={live} />
+                <SensorView label="Wrist Camera" dotColor="var(--green)" variant="rgb" cam={[0.9, 1.35, -2.2]} tgt={[1.2, 1.25, -3.0]} live={live} fov={58} />
+                <SensorView label="Segmentation" dotColor="var(--purple)" variant="seg" cam={[2.6, 1.9, 0.4]} tgt={[0.7, 1.1, -3.0]} live={live} />
+                <SensorView label="Depth" dotColor="#8A94A6" variant="depth" cam={[0.4, 1.7, 0.9]} tgt={[0.8, 1.1, -3.0]} live={live} />
                 <button className="add-view" title="Add view"><Icon name="plus" size={14} /></button>
               </div>
             </div>
@@ -158,53 +318,61 @@ export default function LiveEvaluation() {
               <Segmented
                 options={[{ value: "0.5×", label: "0.5×" }, { value: "1×", label: "1×" }, { value: "2×", label: "2×" }]}
                 value={speed}
-                onChange={setSpeed}
+                onChange={(v) => {
+                  setSpeed(v);
+                  control("speed", v === "2×" ? 2 : v === "0.5×" ? 0.5 : 1);
+                }}
               />
             }
           >
-            <div className="evt-timeline" style={{ paddingTop: 12 }}>
-              <div className="evt-track">
-                <div className="fill" style={{ width: `${episodeProgress * 100}%` }} />
-                {eventTimeline.map((e) => {
-                  const done = episodeProgress >= e.t;
-                  const isNow = !done && eventTimeline.findIndex((x) => episodeProgress < x.t) === eventTimeline.indexOf(e);
-                  return (
-                    <div key={e.name} className="evt-node" style={{ left: `${e.t * 100}%` }}>
-                      <div
-                        className="n-dot center"
-                        style={{
-                          background: done ? "var(--green)" : isNow ? "var(--accent)" : "var(--bg-panel-3)",
-                          borderColor: done ? "var(--green)" : isNow ? "var(--accent)" : "#3A455C",
-                          color: "#fff",
-                          boxShadow: isNow ? "0 0 10px rgba(76,141,255,0.7)" : undefined,
-                        }}
-                      >
-                        {done && <Icon name="check" size={9} strokeWidth={2.4} />}
-                      </div>
-                      <div className="evt-label" style={{ left: 0 }}>
-                        <div className="t">{e.time}</div>
-                        <div className="n">{e.name}</div>
-                        <div className={`s ${done ? "g-green" : isNow ? "g-blue" : "t3"}`}>{done ? "Completed" : isNow ? "In progress" : e.sub}</div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-            <div className="row mono micro t3" style={{ justifyContent: "space-between", padding: "34px 8px 0" }}>
-              {["00:00", "00:03", "00:06", "00:09", "00:12", "00:14"].map((x) => <span key={x}>{x}</span>)}
-            </div>
+            {meta && meta.events.length > 0 ? (
+              <>
+                <div className="evt-timeline" style={{ paddingTop: 12 }}>
+                  <div className="evt-track">
+                    <div className="fill" style={{ width: `${episodeProgress * 100}%` }} />
+                    {meta.events.map((e, i) => {
+                      const done = frame?.eventsFired.includes(i) ?? false;
+                      const isNow = !done && meta.events.findIndex((_, j) => !(frame?.eventsFired.includes(j) ?? false)) === i;
+                      return (
+                        <div key={e.name} className="evt-node" style={{ left: `${e.t * 100}%` }}>
+                          <div
+                            className="n-dot center"
+                            style={{
+                              background: done ? "var(--green)" : isNow ? "var(--accent)" : "var(--bg-panel-3)",
+                              borderColor: done ? "var(--green)" : isNow ? "var(--accent)" : "#3A4150",
+                              color: "#fff",
+                            }}
+                          >
+                            {done && <Icon name="check" size={9} strokeWidth={2.4} />}
+                          </div>
+                          <div className="evt-label" style={{ left: 0 }}>
+                            <div className="t">{e.time}</div>
+                            <div className="n">{e.name}</div>
+                            <div className={`s ${done ? "g-green" : isNow ? "g-blue" : "t3"}`}>{done ? "Completed" : isNow ? "In progress" : e.sub}</div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div className="row mono micro t3" style={{ justifyContent: "space-between", padding: "34px 8px 0" }}>
+                  {meta.events.map((e) => <span key={e.time + e.name}>{e.time}</span>)}
+                </div>
+              </>
+            ) : (
+              <div className="empty-note">{session ? "Waiting for scenario metadata…" : "Start a run to see the event timeline."}</div>
+            )}
           </Card>
         </div>
 
         {/* Right — robot state */}
         <div className="col" style={{ gap: 10 }}>
-          <Card title="Robot state" right={<Badge tone="green" dot>Nominal</Badge>}>
+          <Card title="Robot state" right={<Badge tone={session && !ended ? "green" : "grey"} dot={!!session && !ended}>{session ? (ended ? "Ended" : "Nominal") : "Idle"}</Badge>}>
             <div className="kv">
               <KV k="End-effector mode" v="Pinch" />
-              <KV k="Gripper state" v={t > 2.9 && t < 8.1 ? "Closed" : "Open"} />
-              <KV k="Applied force" v={<span className="mono">{t > 3 && t < 8 ? "4.8 N" : "0.6 N"}</span>} />
-              <KV k="Task step" v={<span className="mono">{steps.findIndex((s) => s.state === "active") + 1 || 6} / 6</span>} />
+              <KV k="Gripper state" v={frame ? (frame.gripper === "closed" ? "Closed" : "Open") : "—"} />
+              <KV k="Applied force" v={<span className="mono">{frame ? `${frame.forceN.toFixed(1)} N` : "—"}</span>} />
+              <KV k="Task step" v={<span className="mono">{stepsTotal ? `${Math.min(stepsDone + 1, stepsTotal)} / ${stepsTotal}` : "—"}</span>} />
             </div>
             <div style={{ marginTop: 10 }}>
               <div className="small t2" style={{ marginBottom: 5 }}>Pull door open</div>
@@ -219,57 +387,68 @@ export default function LiveEvaluation() {
               <div className="row card" style={{ gap: 9, padding: 8, background: "var(--bg-panel-2)" }}>
                 <span className="cell-ico"><Icon name="gripper" size={13} /></span>
                 <span className="col grow" style={{ gap: 0 }}>
-                  <span style={{ fontWeight: 580, fontSize: "var(--fs-body)" }}>Refrigerator Door Handle</span>
-                  <span className="micro t3 mono">M_Fridge_Handle_01</span>
+                  <span style={{ fontWeight: 580, fontSize: "var(--fs-body)" }}>{frame?.contactName ?? "—"}</span>
+                  <span className="micro t3 mono">{frame?.inContact ? "contact" : "no contact"}</span>
                 </span>
-                {t > 2.9 && t < 8.1 ? <Badge tone="green" dot>In contact</Badge> : <Badge tone="grey">No contact</Badge>}
+                {frame?.inContact ? <Badge tone="green" dot>In contact</Badge> : <Badge tone="grey">No contact</Badge>}
               </div>
             </div>
           </Card>
 
           <Card title="Success conditions" flush>
             <div style={{ padding: "4px 0" }}>
-              {successConditions.map((c) => {
-                const angleOk = c.name.startsWith("Door open") ? doorAngle >= 60 : true;
-                return (
-                  <div key={c.name} className="row" style={{ gap: 9, padding: "6px 14px", borderBottom: "1px solid rgba(148,170,220,0.05)" }}>
-                    <span style={{ color: angleOk ? "var(--green)" : "var(--text-3)", display: "inline-flex" }}>
-                      <Icon name={angleOk ? "check" : "clock"} size={13} />
-                    </span>
-                    <span className="grow" style={{ fontSize: "var(--fs-body)", color: angleOk ? "var(--text-1)" : "var(--text-2)" }}>{c.name}</span>
-                    <span className={`mono small ${angleOk ? "g-green" : "g-blue"}`}>
-                      {c.name.startsWith("Door open") ? `${doorAngle}°` : c.value}
-                    </span>
+              {meta && meta.conditions.length > 0 ? (
+                <>
+                  {meta.conditions.map((c, i) => {
+                    const ok = frame?.conditions[i] ?? false;
+                    return (
+                      <div key={c.name} className="row" style={{ gap: 9, padding: "6px 14px", borderBottom: "1px solid rgba(148,170,220,0.05)" }}>
+                        <span style={{ color: ok ? "var(--green)" : "var(--text-3)", display: "inline-flex" }}>
+                          <Icon name={ok ? "check" : "clock"} size={13} />
+                        </span>
+                        <span className="grow" style={{ fontSize: "var(--fs-body)", color: ok ? "var(--text-1)" : "var(--text-2)" }}>{c.name}</span>
+                        <span className={`mono small ${ok ? "g-green" : "g-blue"}`}>{c.target}</span>
+                      </div>
+                    );
+                  })}
+                  <div className="row" style={{ gap: 9, padding: "8px 14px" }}>
+                    <span style={{ color: success >= 100 ? "var(--green)" : "var(--text-3)", display: "inline-flex" }}><Icon name={success >= 100 ? "check" : "clock"} size={13} /></span>
+                    <span className="grow" style={{ fontWeight: 620 }}>Overall</span>
+                    <span className={`${success >= 100 ? "g-green" : "g-blue"} small`} style={{ fontWeight: 620 }}>{success >= 100 ? "Passed" : "On track"}</span>
                   </div>
-                );
-              })}
-              <div className="row" style={{ gap: 9, padding: "8px 14px" }}>
-                <span style={{ color: "var(--green)", display: "inline-flex" }}><Icon name="check" size={13} /></span>
-                <span className="grow" style={{ fontWeight: 620 }}>Overall</span>
-                <span className="g-green small" style={{ fontWeight: 620 }}>On track</span>
-              </div>
+                </>
+              ) : (
+                <div className="empty-note">{session ? "Waiting for scenario metadata…" : "Start a run to evaluate success conditions."}</div>
+              )}
             </div>
           </Card>
 
           <Card title="Task State">
-            <div className="steps">
-              {steps.map((s, i) => (
-                <div key={s.name} className={`step ${s.state}`}>
-                  <span className="s-rail">
-                    <span className="s-dot">
-                      {s.state === "done" ? <Icon name="check" size={9} strokeWidth={2.4} /> : i + 1}
-                    </span>
-                    <span className="s-line" />
-                  </span>
-                  <span className="s-body">
-                    <span className="s-name">{i + 1} · {s.name}</span>
-                    <span className={`micro ${s.state === "done" ? "g-green" : s.state === "active" ? "g-blue" : "t3"}`}>
-                      {s.state === "done" ? "Success" : s.state === "active" ? "In Progress" : "Pending"}
-                    </span>
-                  </span>
-                </div>
-              ))}
-            </div>
+            {meta && meta.steps.length > 0 ? (
+              <div className="steps">
+                {meta.steps.map((s, i) => {
+                  const state = i < stepsDone ? "done" : i === stepsDone ? "active" : "pending";
+                  return (
+                    <div key={s.name} className={`step ${state}`}>
+                      <span className="s-rail">
+                        <span className="s-dot">
+                          {state === "done" ? <Icon name="check" size={9} strokeWidth={2.4} /> : i + 1}
+                        </span>
+                        <span className="s-line" />
+                      </span>
+                      <span className="s-body">
+                        <span className="s-name">{i + 1} · {s.name}</span>
+                        <span className={`micro ${state === "done" ? "g-green" : state === "active" ? "g-blue" : "t3"}`}>
+                          {state === "done" ? "Success" : state === "active" ? "In Progress" : "Pending"}
+                        </span>
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="empty-note">{session ? "Waiting for scenario metadata…" : "Start a run to track task steps."}</div>
+            )}
           </Card>
         </div>
       </div>
@@ -286,31 +465,21 @@ function KV({ k, v }: { k: string; v: React.ReactNode }) {
   );
 }
 
-/** Advances the shared clock — only the master canvas mutates it. */
-function SimClock({ sim, running, speed, master }: { sim: React.MutableRefObject<SimClock>; running: boolean; speed: number; master?: boolean }) {
-  useFrame((_, dt) => {
-    if (master && running) {
-      sim.current.t = (sim.current.t + dt * speed) % RUN_LENGTH;
-    }
-  });
-  return null;
-}
-
-/** World bound to the sim clock inside a sensor tile. */
-function AnimatedWorld({ sim, variant }: { sim: React.MutableRefObject<SimClock>; variant: RenderVariant }) {
-  return <WarehouseKitchen variant={variant} simRef={sim} />;
+/** World bound to the live frame ref inside a sensor tile. */
+function AnimatedWorld({ live, variant }: { live: React.MutableRefObject<{ pose: ArmPose; door: number }>; variant: RenderVariant }) {
+  return <WarehouseKitchen variant={variant} liveRef={live} />;
 }
 
 /** One live sensor tile — its own small render of the shared world. */
 function SensorView({
-  label, dotColor, variant, cam, tgt, sim, fov,
+  label, dotColor, variant, cam, tgt, live, fov,
 }: {
   label: string;
   dotColor: string;
   variant: RenderVariant;
   cam: [number, number, number];
   tgt: [number, number, number];
-  sim: React.MutableRefObject<SimClock>;
+  live: React.MutableRefObject<{ pose: ArmPose; door: number }>;
   fov?: number;
 }) {
   return (
@@ -330,7 +499,7 @@ function SensorView({
         ) : (
           <ambientLight intensity={1.5} />
         )}
-        <AnimatedWorld sim={sim} variant={variant} />
+        <AnimatedWorld live={live} variant={variant} />
         <OrbitControls target={tgt} enableDamping={false} enablePan={false} enableZoom={false} enableRotate={false} />
       </Canvas>
       <span className="thumb-label"><span className="dot" style={{ background: dotColor }} /> {label}</span>

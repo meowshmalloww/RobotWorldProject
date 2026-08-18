@@ -1,8 +1,4 @@
-/* ==========================================================================
-   WorldOps domain model — mirrors the future REST/WebSocket API contracts.
-   Every page reads from these typed fixtures; swapping to the FastAPI
-   backend later means replacing the module bodies, not the components.
-   ========================================================================== */
+/* API contract mirrored by backend/app/schemas.py */
 
 export type Health = "healthy" | "degraded" | "failed" | "repairing";
 export type RunStatus = "in_progress" | "success" | "failed" | "pending" | "building" | "completed";
@@ -171,6 +167,7 @@ export interface PhotoCandidate {
   state: "selected" | "secondary" | "rejected" | "candidate";
   front: number; background: number; isolation: number; identity: number;
   seed: number; // procedural product render seed
+  url?: string;
 }
 
 export interface RepairEvent { time: string; title: string; desc: string; kind: "detect" | "fail" | "heal" | "approve" | "done" }
@@ -229,6 +226,17 @@ export interface Alert {
 }
 
 export interface AgentInsight { icon: string; title: string; body: string }
+
+export interface ServiceRow {
+  name: string;
+  kind: "core" | "agent" | "integration" | "worker";
+  status: "running" | "degraded" | "stopped";
+  version: string;
+  latency: string;
+  uptime: string;
+  restarts: number;
+  gpu?: string;
+}
 
 /* ---- Overview -------------------------------------------------------------- */
 export interface PipelineActivity {

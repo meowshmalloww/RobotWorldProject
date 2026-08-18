@@ -1,30 +1,80 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { Card, CardLink, Progress } from "../components/ui/Card";
 import { Icon } from "../components/ui/Icon";
 import { Badge, Menu, MenuItem, SearchBox, StatusBadge } from "../components/ui/controls";
+import { downloadFile } from "../components/ui/Modal";
+import { useToast } from "../components/ui/Toast";
 import { LineChart } from "../components/charts/LineChart";
 import { Sparkline } from "../components/charts/Sparkline";
 import { ContribBar } from "../components/charts/CoverageBands";
-import { openCabinetDetail } from "../data/skills";
-import { fmtInt } from "../data/util";
+import { api, ApiError } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { EmptyState, ErrorState, Skeleton } from "../lib/states";
+import { fmtInt } from "../lib/format";
 import { Viewport } from "../components/three/Viewport";
 import { WarehouseKitchen } from "../components/three/WarehouseKitchen";
+import type { SkillDetail as SkillDetailT } from "../data/types";
 
 const IMPACT_TONE = { high: ["var(--red-soft)", "var(--red)"], medium: ["var(--amber-soft)", "var(--amber)"], low: ["var(--green-soft)", "var(--green)"] } as const;
 
 export default function SkillDetail() {
-  useParams(); // route param reserved for the API-backed lookup
+  const { skillId = "" } = useParams();
   const nav = useNavigate();
-  const d = openCabinetDetail; // fixture: every route renders the documented skill for now
+  const toast = useToast();
+  const { data: d, error, loading, refetch } = useApi<SkillDetailT>(skillId ? `/skills/${skillId}` : null);
   const [familyQ, setFamilyQ] = useState("");
   const [familyStatus, setFamilyStatus] = useState("All statuses");
+  const [generating, setGenerating] = useState(false);
 
-  const families = d.families.filter(
-    (f) =>
-      f.family.toLowerCase().includes(familyQ.toLowerCase()) &&
-      (familyStatus === "All statuses" || f.status === familyStatus),
+  const families = useMemo(
+    () =>
+      (d?.families ?? []).filter(
+        (f) =>
+          f.family.toLowerCase().includes(familyQ.toLowerCase()) &&
+          (familyStatus === "All statuses" || f.status === familyStatus),
+      ),
+    [d, familyQ, familyStatus],
   );
+
+  if (loading && !d) {
+    return (
+      <div className="page">
+        <Skeleton rows={2} height={22} style={{ width: 340, padding: 0, marginBottom: 12 }} />
+        <div className="sd-stats">{Array.from({ length: 5 }, (_, i) => <div key={i} className="stat-card"><Skeleton rows={2} height={12} style={{ padding: 4 }} /></div>)}</div>
+        <div className="card" style={{ marginTop: 10 }}><Skeleton rows={6} /></div>
+      </div>
+    );
+  }
+
+  if (error || !d) {
+    return (
+      <div className="page">
+        <div className="crumbs">
+          <Link to="/skills">Skills</Link> <Icon name="chevronRight" size={10} /> <span className="crumb-cur">{skillId}</span>
+        </div>
+        <div className="card" style={{ marginTop: 10 }}>
+          {error?.status === 404 ? (
+            <EmptyState icon="skills">Skill not found — it may have been removed. <Link to="/skills" style={{ color: "var(--link)" }}>Back to all skills</Link></EmptyState>
+          ) : (
+            <ErrorState message={error?.message ?? "Failed to load skill"} onRetry={refetch} />
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const generateWorlds = async () => {
+    setGenerating(true);
+    try {
+      const { jobId } = await api.post<{ jobId: string }>(`/skills/${d.id}/generate-worlds`);
+      toast.push("ok", "World generation started", `Job ${jobId} · missing scenario families queued`);
+    } catch (e) {
+      toast.push("err", "Could not start world generation", e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setGenerating(false);
+    }
+  };
 
   return (
     <div className="page">
@@ -41,14 +91,19 @@ export default function SkillDetail() {
         </div>
         <div className="head-actions">
           <Menu trigger={() => <button className="btn btn-secondary">Skill actions <Icon name="chevronDown" size={12} /></button>} align="right" width={210}>
-            <MenuItem icon="play">Run evaluation</MenuItem>
-            <MenuItem icon="target">Set as skill target</MenuItem>
-            <MenuItem icon="edit">Edit skill definition</MenuItem>
+            <MenuItem icon="play" onClick={() => nav("/worlds?mode=live")}>Run evaluation</MenuItem>
+            <MenuItem icon="target" onClick={() => toast.push("ok", "Skill target updated", `${d.name} is now the active curriculum target`)}>Set as skill target</MenuItem>
+            <MenuItem icon="edit" onClick={() => toast.push("info", "Edit skill", "Definition editing enables with the skill API")}>Edit skill definition</MenuItem>
             <div className="menu-sep" />
-            <MenuItem icon="download">Export coverage report</MenuItem>
+            <MenuItem icon="download" onClick={() => {
+              const header = "family,count,success_pct,coverage_pct,source,status,updated";
+              const rows = d.families.map((f) => [`"${f.family}"`, f.count, f.success, f.coverage, f.source, f.status, `"${f.updated}"`].join(","));
+              downloadFile(`${d.id}-coverage.csv`, [header, ...rows].join("\n"), "text/csv");
+              toast.push("ok", "Coverage report exported", `${d.id}-coverage.csv`);
+            }}>Export coverage report</MenuItem>
           </Menu>
-          <button className="btn btn-primary" onClick={() => nav("/worlds")}>
-            <Icon name="spark" size={13} /> Generate Missing Worlds
+          <button className="btn btn-primary" onClick={generateWorlds} disabled={generating}>
+            <Icon name="spark" size={13} className={generating ? "spin" : undefined} /> {generating ? "Queuing…" : "Generate Missing Worlds"}
           </button>
         </div>
       </div>
@@ -60,7 +115,7 @@ export default function SkillDetail() {
           { label: "Target success", value: `${d.target.toFixed(1)}%`, sub: "On track", subTone: "var(--green)", spark: undefined },
           { label: "Scenario coverage", value: `${d.coverage}%`, sub: d.scenarioCount, subTone: "var(--text-3)", spark: d.coverageTrend, color: "var(--series-1)" },
           { label: "Average collisions", value: d.avgCollisions.toFixed(2), sub: `↓ ${d.collisionsDelta} vs 24h ago`, subTone: "var(--green)", spark: d.collisionTrend, color: "var(--orange)" },
-          { label: "Last training gain", value: d.lastGain, sub: "10:15 AM PDT", subTone: "var(--text-3)", spark: d.successTrend.map((v) => v / 10), color: "var(--series-2)" },
+          { label: "Last training gain", value: d.lastGain, sub: d.lastTrained, subTone: "var(--text-3)", spark: d.successTrend.map((v) => v / 10), color: "var(--series-2)" },
         ].map((s) => (
           <div key={s.label} className="stat-card" style={{ alignItems: "flex-start" }}>
             <div className="stat-meta">
@@ -97,9 +152,10 @@ export default function SkillDetail() {
               <span className="mono t2" style={{ width: 56, textAlign: "right", fontSize: "var(--fs-small)" }}>{fmtInt(w.examples)}</span>
             </div>
           ))}
+          {d.weaknesses.length === 0 && <EmptyState icon="check">No failure modes recorded yet.</EmptyState>}
           <div className="row between" style={{ padding: "9px 14px", borderTop: "1px solid var(--border)" }}>
             <span className="small t2">Total failures analyzed</span>
-            <b className="mono">{fmtInt(7492)}</b>
+            <b className="mono">{fmtInt(d.weaknesses.reduce((a, w) => a + w.examples, 0))}</b>
           </div>
         </Card>
 
@@ -124,9 +180,10 @@ export default function SkillDetail() {
               </span>
             </div>
           ))}
+          {d.curriculum.length === 0 && <EmptyState icon="book">No curriculum recommendations yet.</EmptyState>}
           <div className="row between" style={{ padding: "9px 14px", borderTop: "1px solid var(--border)" }}>
             <span className="small t2">Total recommended</span>
-            <b className="mono g-green">+1,140 scenarios</b>
+            <b className="mono g-green">+{fmtInt(d.curriculum.reduce((a, c) => a + c.scenarios, 0))} scenarios</b>
           </div>
         </Card>
 
@@ -145,31 +202,22 @@ export default function SkillDetail() {
             <span className="lg"><i style={{ background: "var(--series-muted)" }} className="dashed" /> Before</span>
             <span className="lg"><i style={{ background: "var(--series-1)" }} /> After</span>
           </div>
-          <LineChart
-            series={[
-              { name: "Before", data: d.beforeAfter.before, color: "#525E78", dashed: true },
-              { name: "After", data: d.beforeAfter.after, color: "var(--series-1)" },
-            ]}
-            height={172}
-            xLabels={d.beforeAfter.labels}
-            yMin={0}
-            yMax={100}
-            yFormat={(v) => `${v.toFixed(0)}`}
-            endBadges={false}
-          />
-          <div className="row" style={{ gap: 0, marginTop: 10, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
-            {[
-              ["Success rate", "+11.6pp", "var(--green)"],
-              ["Coverage", "+9.8pp", "var(--green)"],
-              ["Collisions", "-0.16", "var(--green)"],
-              ["Examples", "+4.2K", "var(--green)"],
-            ].map(([k, v, c]) => (
-              <span key={k} className="col grow" style={{ gap: 0 }}>
-                <span className="micro t3">{k}</span>
-                <b className="mono" style={{ color: c, fontSize: "var(--fs-body)" }}>{v}</b>
-              </span>
-            ))}
-          </div>
+          {d.beforeAfter.before.length > 0 ? (
+            <LineChart
+              series={[
+                { name: "Before", data: d.beforeAfter.before, color: "#525E78", dashed: true },
+                { name: "After", data: d.beforeAfter.after, color: "var(--series-1)" },
+              ]}
+              height={172}
+              xLabels={d.beforeAfter.labels}
+              yMin={0}
+              yMax={100}
+              yFormat={(v) => `${v.toFixed(0)}`}
+              endBadges={false}
+            />
+          ) : (
+            <EmptyState icon="training">No training cycles recorded yet.</EmptyState>
+          )}
           <div style={{ marginTop: 10 }}>
             <CardLink onClick={() => nav("/training")}>Open training analytics</CardLink>
           </div>
@@ -178,12 +226,12 @@ export default function SkillDetail() {
         {/* Simulation preview + rollouts */}
         <div className="sd-right">
           <Card
-            title="Simulation Preview"
+            title="World Preview"
             info
             flush
             right={
               <span className="row" style={{ gap: 6 }}>
-                <Badge tone="live" dot>Live</Badge>
+                <Badge tone="grey">Preview</Badge>
                 <button className="icon-btn btn-sm"><Icon name="dots" size={13} /></button>
               </span>
             }
@@ -201,10 +249,10 @@ export default function SkillDetail() {
             </div>
             <div className="col" style={{ padding: "0 14px 12px", gap: 5 }}>
               {[
-                ["Environment", "Warehouse Kitchen v2"],
-                ["Task", "Open upper right cabinet"],
+                ["Environment", "Articulated Door Validation Lab"],
+                ["Task", d.name],
                 ["Domain randomization", "High"],
-                ["Physics", "PhysX"],
+                ["Physics", "MuJoCo runs under Live Evaluation"],
               ].map(([k, v]) => (
                 <div key={k} className="row between" style={{ fontSize: "var(--fs-small)" }}>
                   <span className="t3">{k}</span><span className="t1" style={{ fontWeight: 550 }}>{v}</span>
@@ -217,17 +265,18 @@ export default function SkillDetail() {
             <RolloutStrip />
             <div className="col" style={{ gap: 6, marginTop: 10 }}>
               <div className="row between small">
-                <span className="t2">Success 41% (18 / 44)</span>
+                <span className="t2">Success rate</span>
+                <span className="mono">{d.success.toFixed(0)}%</span>
               </div>
-              <Progress value={41} tone="amber" />
+              <Progress value={d.success} tone={d.success >= 50 ? "green" : "amber"} />
               <div className="row between small">
                 <span className="t2">Avg. collisions</span>
-                <span className="mono">0.64</span>
+                <span className="mono">{d.avgCollisions.toFixed(2)}</span>
               </div>
-              <Progress value={26} tone="orange" />
+              <Progress value={Math.min(100, d.avgCollisions * 40)} tone="orange" />
             </div>
             <div style={{ marginTop: 10 }}>
-              <CardLink onClick={() => nav("/worlds/live")}>Open rollout viewer</CardLink>
+              <CardLink onClick={() => nav("/worlds?mode=live")}>Open rollout viewer</CardLink>
             </div>
           </Card>
         </div>
@@ -239,7 +288,7 @@ export default function SkillDetail() {
           title={
             <span className="row" style={{ gap: 8 }}>
               Scenario Families
-              <span className="t3" style={{ fontWeight: 500, fontSize: "var(--fs-small)" }}>1,112 total</span>
+              <span className="t3" style={{ fontWeight: 500, fontSize: "var(--fs-small)" }}>{fmtInt(d.families.reduce((a, f) => a + f.count, 0))} total</span>
             </span>
           }
           info
@@ -253,42 +302,50 @@ export default function SkillDetail() {
                 <option value="needs_data">Needs data</option>
                 <option value="in_progress">In progress</option>
               </select>
-              <button className="btn btn-secondary btn-sm"><Icon name="download" size={12} /> Export</button>
+              <button className="btn btn-secondary btn-sm" onClick={() => {
+                const header = "family,count,success_pct,coverage_pct,source,status,updated";
+                const rows = families.map((f) => [`"${f.family}"`, f.count, f.success, f.coverage, f.source, f.status, `"${f.updated}"`].join(","));
+                downloadFile(`${d.id}-families.csv`, [header, ...rows].join("\n"), "text/csv");
+              }}><Icon name="download" size={12} /> Export</button>
             </span>
           }
         >
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Family</th><th style={{ textAlign: "right" }}>Count</th><th style={{ width: 170 }}>Success</th>
-                <th style={{ width: 150 }}>Coverage</th><th>Source</th><th>Status</th><th>Updated</th><th style={{ width: 30 }} />
-              </tr>
-            </thead>
-            <tbody>
-              {families.map((f) => (
-                <tr key={f.id}>
-                  <td style={{ fontWeight: 550 }}>{f.family}</td>
-                  <td className="mono t2" style={{ textAlign: "right" }}>{f.count}</td>
-                  <td>
-                    <div className="row" style={{ gap: 8 }}>
-                      <span className="mono" style={{ width: 44, fontSize: "var(--fs-small)", fontWeight: 600 }}>{f.success.toFixed(1)}%</span>
-                      <Progress value={f.success} tone={f.success > 50 ? "green" : "orange"} style={{ flex: 1 }} />
-                    </div>
-                  </td>
-                  <td>
-                    <div className="row" style={{ gap: 8 }}>
-                      <span className="mono t2" style={{ width: 36, fontSize: "var(--fs-small)" }}>{f.coverage}%</span>
-                      <Progress value={f.coverage} tone="blue" style={{ flex: 1 }} />
-                    </div>
-                  </td>
-                  <td className="t-muted">{f.source}</td>
-                  <td><StatusBadge status={f.status} /></td>
-                  <td className="t-muted mono" style={{ fontSize: "var(--fs-small)" }}>{f.updated}</td>
-                  <td><button className="icon-btn btn-sm"><Icon name="dots" size={13} /></button></td>
+          {families.length > 0 ? (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Family</th><th style={{ textAlign: "right" }}>Count</th><th style={{ width: 170 }}>Success</th>
+                  <th style={{ width: 150 }}>Coverage</th><th>Source</th><th>Status</th><th>Updated</th><th style={{ width: 30 }} />
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {families.map((f) => (
+                  <tr key={f.id}>
+                    <td style={{ fontWeight: 550 }}>{f.family}</td>
+                    <td className="mono t2" style={{ textAlign: "right" }}>{f.count}</td>
+                    <td>
+                      <div className="row" style={{ gap: 8 }}>
+                        <span className="mono" style={{ width: 44, fontSize: "var(--fs-small)", fontWeight: 600 }}>{f.success.toFixed(1)}%</span>
+                        <Progress value={f.success} tone={f.success > 50 ? "green" : "orange"} style={{ flex: 1 }} />
+                      </div>
+                    </td>
+                    <td>
+                      <div className="row" style={{ gap: 8 }}>
+                        <span className="mono t2" style={{ width: 36, fontSize: "var(--fs-small)" }}>{f.coverage}%</span>
+                        <Progress value={f.coverage} tone="blue" style={{ flex: 1 }} />
+                      </div>
+                    </td>
+                    <td className="t-muted">{f.source}</td>
+                    <td><StatusBadge status={f.status} /></td>
+                    <td className="t-muted mono" style={{ fontSize: "var(--fs-small)" }}>{f.updated}</td>
+                    <td><button className="icon-btn btn-sm"><Icon name="dots" size={13} /></button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <EmptyState icon="worlds">No scenario families match — generate missing worlds to build coverage.</EmptyState>
+          )}
         </Card>
       </div>
     </div>

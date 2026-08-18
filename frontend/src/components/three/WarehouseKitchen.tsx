@@ -8,7 +8,7 @@ import { RobotArm, samplePose, type ArmPose } from "./RobotArm";
 import { Selectable, type SelectInfo } from "./Selectable";
 
 /**
- * Warehouse Kitchen v2 — fully procedural simulation world.
+ * Articulated-door validation lab used by the interactive Three.js preview.
  * Units are meters. Every mesh casts/receives shadows; variant="seg"|"depth"
  * re-renders the same scene as a semantic / depth pass.
  */
@@ -146,6 +146,7 @@ export function WarehouseKitchen({
   selection = {},
   cabinetDoorOpen,
   simRef,
+  liveRef,
 }: {
   variant?: RenderVariant;
   /** static pose time on the scripted timeline (non-animated renders) */
@@ -155,13 +156,31 @@ export function WarehouseKitchen({
   cabinetDoorOpen?: { left?: number; right?: number };
   /** live simulation clock — when set, robot + fridge door are driven per-frame */
   simRef?: MutableRefObject<{ t: number }>;
+  /** live backend frame — when set, overrides the scripted timeline */
+  liveRef?: MutableRefObject<{ pose: ArmPose; door: number }>;
 }) {
   // Live-drive refs (sampled by useFrame, applied imperatively — no re-renders)
   const poseRef = useRef<ArmPose>(samplePose(0));
   const doorOpenRef = useRef(0);
+  const wasStatic = useRef(true);
 
   useFrame(() => {
-    if (!simRef) return;
+    if (liveRef) {
+      wasStatic.current = false;
+      poseRef.current = liveRef.current.pose;
+      doorOpenRef.current = liveRef.current.door;
+      return;
+    }
+    if (!simRef) {
+      // returned to a static render — reapply the rest pose once
+      if (!wasStatic.current) {
+        poseRef.current = samplePose(simTime ?? 0);
+        doorOpenRef.current = poseRef.current.door;
+        wasStatic.current = true;
+      }
+      return;
+    }
+    wasStatic.current = false;
     poseRef.current = samplePose(simRef.current.t);
     doorOpenRef.current = poseRef.current.door;
   });
@@ -202,7 +221,7 @@ export function WarehouseKitchen({
       {/* refrigerator */}
       <group position={[1.75, 0, -3.55]}>
         <Selectable id="fridge" name="Refrigerator Samsung RF56" selected={selection.selectedId === "fridge"} onSelect={sel.onSelect} enabled={selection.interactive}>
-          <Refrigerator variant={variant} doorOpen={staticPose.door} doorRef={simRef ? doorOpenRef : undefined} />
+          <Refrigerator variant={variant} doorOpen={staticPose.door} doorRef={doorOpenRef} />
         </Selectable>
       </group>
 
@@ -228,7 +247,7 @@ export function WarehouseKitchen({
       {/* mobile robot */}
       <group position={[0.55, 0, -1.7]}>
         <Selectable id="robot-base" name="Robot Base" selected={selection.selectedId === "robot-base"} onSelect={sel.onSelect} enabled={selection.interactive}>
-          <RobotArm pose={staticPose} poseRef={simRef ? poseRef : undefined} variant={variant} />
+          <RobotArm pose={staticPose} poseRef={poseRef} variant={variant} />
         </Selectable>
       </group>
 

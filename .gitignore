@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# RobotWorld backend runtime data (DB, generated assets, demos, trained models)
+backend/data/
+backend/build/
+backend/dist/
+
+# Secrets
+.env
+*.local
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/release/
+frontend/build/
+frontend/electron-dist/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

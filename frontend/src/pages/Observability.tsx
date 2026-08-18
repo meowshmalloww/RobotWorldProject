@@ -1,124 +1,388 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
 import { Card, CardLink } from "../components/ui/Card";
 import { StatCard } from "../components/ui/StatCard";
 import { Icon, type IconName } from "../components/ui/Icon";
-import { SearchBox } from "../components/ui/controls";
+import { Badge, SearchBox, StatusBadge } from "../components/ui/controls";
 import { LineChart } from "../components/charts/LineChart";
 import { TraceWaterfall } from "../components/charts/TraceWaterfall";
-import { agentInsights, alerts, logs, metricsSeries, obsStats, traceMeta, traceSpans } from "../data/observability";
+import { useToast } from "../components/ui/Toast";
+import { useApi } from "../lib/useApi";
+import { EmptyState, ErrorState, Skeleton } from "../lib/states";
+import type { AgentInsight, Alert, LogLine, ServiceRow, Stat, TraceSpan } from "../data/types";
 
+const TABS: { id: string; label: string; icon: IconName }[] = [
+  { id: "services", label: "Services", icon: "services" },
+  { id: "traces", label: "Traces", icon: "workflow" },
+  { id: "metrics", label: "Metrics", icon: "chartBar" },
+  { id: "logs", label: "Logs", icon: "terminal" },
+  { id: "alerts", label: "Alerts", icon: "bell" },
+];
+
+export interface TraceMeta {
+  traceId: string;
+  iterationId: string;
+  status: string;
+  duration: string;
+  durationMs: number;
+  startTime: string;
+  spans: number;
+  errors: number;
+}
+
+interface TraceDetail {
+  meta: TraceMeta;
+  spans: TraceSpan[];
+  insights: AgentInsight[];
+}
+
+/**
+ * Observability — modelled on the SigNoz open-source console
+ * (Services / Traces / Metrics / Logs / Alerts over one telemetry store).
+ */
 export default function Observability() {
-  const [live, setLive] = useState(true);
-  const [logQ, setLogQ] = useState("");
-  const filteredLogs = logs.filter((l) => l.message.toLowerCase().includes(logQ.toLowerCase()) || l.service.includes(logQ));
+  const { tab = "services" } = useParams();
+  const nav = useNavigate();
+  const active = TABS.some((t) => t.id === tab) ? tab : "services";
+  const { data: alerts } = useApi<Alert[]>("/observability/alerts", []);
 
   return (
     <div className="page">
       <div className="page-head">
         <div>
           <h1 className="page-title">Observability</h1>
-          <p className="page-sub">Pipeline telemetry, distributed traces, and agent-facing failure signals — backed by SigNoz.</p>
+          <p className="page-sub">Pipeline telemetry for every agent iteration — OpenTelemetry into SigNoz.</p>
         </div>
-        <div className="head-actions">
-          <select className="select" style={{ width: 140 }}>
-            <option>Last 30 minutes</option>
-            <option>Last 15 minutes</option>
-            <option>Last 1 hour</option>
-            <option>Last 6 hours</option>
+      </div>
+
+      <div className="page-tabs">
+        {TABS.map((t) => (
+          <button key={t.id} className={active === t.id ? "on" : ""} onClick={() => nav(`/observability/${t.id}`)}>
+            <Icon name={t.icon} size={13} />
+            {t.label}
+            {t.id === "alerts" && alerts && alerts.length > 0 && <span className="tab-count">{alerts.length}</span>}
+          </button>
+        ))}
+      </div>
+
+      {active === "services" && <ServicesTab onOpenTraces={() => nav("/observability/traces")} />}
+      {active === "traces" && <TracesTab />}
+      {active === "metrics" && <MetricsTab />}
+      {active === "logs" && <LogsTab />}
+      {active === "alerts" && <AlertsTab />}
+    </div>
+  );
+}
+
+/* ---- Services (SigNoz APM list) ------------------------------------------- */
+function ServicesTab({ onOpenTraces }: { onOpenTraces: () => void }) {
+  const [q, setQ] = useState("");
+  const { data: stats, error: statsError, loading: statsLoading, refetch: refetchStats } = useApi<Stat[]>("/observability/stats");
+  const { data: services, error, loading, refetch } = useApi<ServiceRow[]>("/observability/services");
+  const rows = useMemo(() => (services ?? []).filter((s) => s.name.includes(q.toLowerCase())), [services, q]);
+
+  return (
+    <div className="col" style={{ gap: 10 }}>
+      {statsError ? (
+        <div className="card"><ErrorState message={statsError.message} onRetry={refetchStats} /></div>
+      ) : (
+        <div className="ov-stats" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
+          {statsLoading && !stats
+            ? Array.from({ length: 4 }, (_, i) => <div key={i} className="stat-card"><Skeleton rows={2} height={12} style={{ padding: 4 }} /></div>)
+            : (stats ?? []).map((s) => <StatCard key={s.label} stat={s} small />)}
+        </div>
+      )}
+
+      <Card
+        title="Services"
+        flush
+        right={<SearchBox placeholder="Search services…" value={q} onChange={setQ} style={{ width: 210 }} />}
+      >
+        {error ? (
+          <ErrorState message={error.message} onRetry={refetch} />
+        ) : loading && !services ? (
+          <Skeleton rows={6} />
+        ) : rows.length > 0 ? (
+          <div className="table-scroll">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Service</th><th>Kind</th><th>Status</th><th>Version</th>
+                  <th style={{ textAlign: "right" }}>Latency</th><th style={{ textAlign: "right" }}>Uptime</th>
+                  <th style={{ textAlign: "right" }}>Restarts</th><th>GPU</th><th style={{ width: 30 }} />
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((s) => (
+                  <tr key={s.name} className="rowlink" onClick={onOpenTraces} title="Open traces for this service">
+                    <td>
+                      <div className="cell-main">
+                        <span className="cell-ico"><Icon name={s.kind === "integration" ? "link" : s.kind === "agent" ? "agent" : s.kind === "worker" ? "chip" : "services"} size={13} /></span>
+                        <span className="mono" style={{ fontWeight: 580, fontSize: "var(--fs-small)" }}>{s.name}</span>
+                      </div>
+                    </td>
+                    <td><Badge tone={s.kind === "core" ? "blue" : s.kind === "agent" ? "purple" : s.kind === "integration" ? "teal" : "grey"}>{s.kind}</Badge></td>
+                    <td><StatusBadge status={s.status} /></td>
+                    <td className="mono t2" style={{ fontSize: "var(--fs-small)" }}>{s.version}</td>
+                    <td className="mono t2" style={{ textAlign: "right", fontSize: "var(--fs-small)" }}>{s.latency}</td>
+                    <td className="mono t2" style={{ textAlign: "right", fontSize: "var(--fs-small)" }}>{s.uptime}</td>
+                    <td className="mono" style={{ textAlign: "right", fontSize: "var(--fs-small)", color: s.restarts > 2 ? "var(--amber)" : "var(--text-2)" }}>{s.restarts}</td>
+                    <td className="mono t2" style={{ fontSize: "var(--fs-small)" }}>{s.gpu ?? "—"}</td>
+                    <td><button className="icon-btn btn-sm" onClick={(e) => e.stopPropagation()}><Icon name="dots" size={13} /></button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <EmptyState icon="services">No services registered — the backend catalog is empty.</EmptyState>
+        )}
+      </Card>
+
+      {services && services.length > 0 && (
+        <Card title="Pipeline Health" info>
+          <ServiceMap services={services} />
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/** Compact horizontal pipeline strip — services as chips with status dots. */
+function ServiceMap({ services }: { services: ServiceRow[] }) {
+  const tone: Record<string, string> = { core: "var(--accent)", agent: "var(--purple)", integration: "var(--teal)", worker: "var(--text-2)" };
+  return (
+    <div className="pipe-health">
+      {services.map((s, i) => (
+        <span key={s.name} className="pipe-health-row">
+          <span className={`pipe-health-chip ${s.status === "running" ? "" : s.status}`}>
+            <span className="pipe-health-dot" style={{ background: s.status === "degraded" ? "var(--amber)" : s.status === "stopped" ? "var(--red)" : "var(--green)" }} />
+            <span style={{ color: tone[s.kind] }}>{s.name}</span>
+          </span>
+          {i < services.length - 1 && <Icon name="arrowRight" size={10} style={{ color: "var(--text-3)" }} />}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/* ---- Traces (waterfall) ------------------------------------------------------ */
+function TracesTab() {
+  const toast = useToast();
+  const { data: list, error, loading, refetch } = useApi<{ traces: TraceMeta[] }>("/observability/traces");
+  const [selected, setSelected] = useState<string | null>(null);
+  const traces = list?.traces ?? [];
+  const activeId = selected ?? traces[0]?.traceId ?? null;
+  const { data: detail, error: detailError, loading: detailLoading } = useApi<TraceDetail>(
+    activeId ? `/observability/traces/${activeId}` : null,
+  );
+
+  if (loading && !list) return <div className="card"><Skeleton rows={6} /></div>;
+  if (error) return <div className="card"><ErrorState message={error.message} onRetry={refetch} /></div>;
+  if (traces.length === 0) {
+    return (
+      <div className="card">
+        <EmptyState icon="workflow">No traces yet — agent iterations will stream spans here once the pipeline runs.</EmptyState>
+      </div>
+    );
+  }
+
+  return (
+    <div className="col" style={{ gap: 10 }}>
+      <Card title="Traces" flush>
+        <div className="table-scroll" style={{ maxHeight: 220, overflowY: "auto" }}>
+          <table className="table">
+            <thead>
+              <tr><th>Trace ID</th><th>Iteration</th><th>Status</th><th style={{ textAlign: "right" }}>Duration</th><th style={{ textAlign: "right" }}>Spans</th><th style={{ textAlign: "right" }}>Errors</th><th>Start</th></tr>
+            </thead>
+            <tbody>
+              {traces.map((t) => (
+                <tr key={t.traceId} className={`rowlink ${activeId === t.traceId ? "selected" : ""}`} onClick={() => setSelected(t.traceId)}>
+                  <td className="mono" style={{ fontSize: "var(--fs-small)", fontWeight: 580 }}>{t.traceId}</td>
+                  <td className="mono t2" style={{ fontSize: "var(--fs-small)" }}>{t.iterationId}</td>
+                  <td><span style={{ fontWeight: 620, color: t.errors > 0 ? "var(--red)" : "var(--green)" }}>{t.status}</span></td>
+                  <td className="mono t2" style={{ textAlign: "right", fontSize: "var(--fs-small)" }}>{t.duration}</td>
+                  <td className="mono t2" style={{ textAlign: "right", fontSize: "var(--fs-small)" }}>{t.spans}</td>
+                  <td className="mono" style={{ textAlign: "right", fontSize: "var(--fs-small)", color: t.errors > 0 ? "var(--red)" : "var(--text-2)" }}>{t.errors}</td>
+                  <td className="t-muted mono" style={{ fontSize: "var(--fs-small)" }}>{t.startTime}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      {detailLoading && !detail ? (
+        <div className="card"><Skeleton rows={6} /></div>
+      ) : detailError ? (
+        <div className="card"><ErrorState message={detailError.message} onRetry={() => setSelected(null)} /></div>
+      ) : detail ? (
+        <>
+          <Card
+            title={
+              <span className="row" style={{ gap: 8 }}>
+                Trace — Autonomous Loop Iteration
+                <span className="mono micro t3" style={{ fontWeight: 400 }}>{detail.meta.traceId}</span>
+                <button
+                  className="icon-btn btn-sm"
+                  title="Copy trace ID"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(detail.meta.traceId).catch(() => {});
+                    toast.push("ok", "Copied", "Trace ID on clipboard");
+                  }}
+                >
+                  <Icon name="copy" size={11} />
+                </button>
+              </span>
+            }
+            flush
+            right={<button className="btn btn-ghost btn-sm" onClick={() => toast.push("info", "SigNoz", "Deep-link opens when the SigNoz endpoint is configured")}>View in SigNoz <Icon name="external" size={11} /></button>}
+          >
+            <div className="row" style={{ gap: 14, padding: "8px 14px", borderBottom: "1px solid var(--border)", flexWrap: "wrap" }}>
+              <span className="micro t3">Iteration ID <span className="mono t2">{detail.meta.iterationId}</span></span>
+              <span className="micro t3">Status <span style={{ fontWeight: 620, color: detail.meta.errors > 0 ? "var(--red)" : "var(--green)" }}>{detail.meta.status}</span></span>
+              <span className="micro t3">Duration <span className="mono t2">{detail.meta.duration}</span></span>
+              <span className="micro t3">Start <span className="mono t2">{detail.meta.startTime}</span></span>
+            </div>
+            <div style={{ padding: "8px 0 4px", overflowX: "auto" }}>
+              {detail.spans.length > 0 ? <TraceWaterfall spans={detail.spans} /> : <EmptyState icon="workflow">No spans recorded for this trace.</EmptyState>}
+            </div>
+            <div className="row" style={{ gap: 14, padding: "8px 14px", borderTop: "1px solid var(--border)" }}>
+              <span className="micro t3">Total duration <b className="mono t2">{detail.meta.duration}</b></span>
+              <span className="micro t3">·</span>
+              <span className="micro t3"><b className="mono t2">{detail.meta.spans} spans</b></span>
+              <span className="micro t3">·</span>
+              <span className="micro t3"><b className={`${detail.meta.errors > 0 ? "g-red" : "g-green"} mono`}>{detail.meta.errors} error{detail.meta.errors === 1 ? "" : "s"}</b></span>
+            </div>
+          </Card>
+
+          <Card title={<span className="row" style={{ gap: 7 }}><Icon name="agent" size={14} style={{ color: "var(--purple)" }} /> Agent Insights</span>}>
+            {detail.insights.length > 0 ? (
+              <div className="col" style={{ gap: 10 }}>
+                {detail.insights.map((i) => (
+                  <div key={i.title} className="row" style={{ gap: 9, alignItems: "flex-start" }}>
+                    <span className="cell-ico" style={{ width: 22, height: 22, flex: "none" }}>
+                      <Icon name={i.icon as IconName} size={12} />
+                    </span>
+                    <span className="col" style={{ gap: 2 }}>
+                      <span style={{ fontSize: "var(--fs-body)", fontWeight: 600 }}>{i.title}</span>
+                      <span className="small t2">{i.body}</span>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <EmptyState icon="agent">No agent insights for this trace.</EmptyState>
+            )}
+          </Card>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+/* ---- Metrics ------------------------------------------------------------------ */
+interface MetricsData {
+  labels: string[];
+  latency: number[];
+  error: number[];
+  gpu: number[];
+  throughput: number[];
+}
+
+function MetricsTab() {
+  const { data: stats } = useApi<Stat[]>("/observability/stats");
+  const { data: m, error, loading, refetch } = useApi<MetricsData>("/observability/metrics");
+
+  if (loading && !m) return <div className="card"><Skeleton rows={6} /></div>;
+  if (error || !m) return <div className="card"><ErrorState message={error?.message ?? "Failed to load metrics"} onRetry={refetch} /></div>;
+
+  const empty = m.latency.length === 0 && m.throughput.length === 0;
+
+  return (
+    <div className="col" style={{ gap: 10 }}>
+      {stats && stats.length > 0 && (
+        <div className="ob-stats">
+          {stats.map((s) => <StatCard key={s.label} stat={s} small />)}
+        </div>
+      )}
+      <Card title="Pipeline metrics" right={<CardLink onClick={refetch}>Refresh</CardLink>}>
+        {empty ? (
+          <EmptyState icon="chartBar">No metric series yet — charts appear once the pipeline emits telemetry.</EmptyState>
+        ) : (
+          <>
+            <div className="legend" style={{ marginBottom: 6 }}>
+              <span className="lg"><i style={{ background: "var(--series-1)" }} /> p95 latency</span>
+              <span className="lg"><i style={{ background: "var(--series-6)" }} /> Error rate</span>
+              <span className="lg"><i style={{ background: "var(--series-2)" }} /> GPU utilization</span>
+              <span className="lg"><i style={{ background: "var(--series-4)" }} /> Throughput</span>
+            </div>
+            <LineChart
+              series={[
+                { name: "p95 latency (m)", data: m.latency, color: "var(--series-1)" },
+                { name: "Error rate (%)", data: m.error, color: "var(--series-6)" },
+                { name: "GPU (%)", data: m.gpu.map((v) => v / 5.4), color: "var(--series-2)" },
+                { name: "Throughput (k spans/min)", data: m.throughput, color: "var(--series-4)" },
+              ]}
+              height={220}
+              yMin={0}
+              yTicks={4}
+              yFormat={(v) => `${v.toFixed(0)}`}
+              xLabels={m.labels}
+            />
+          </>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ---- Logs ------------------------------------------------------------------------ */
+function LogsTab() {
+  const [logQ, setLogQ] = useState("");
+  const [level, setLevel] = useState("All levels");
+  const [paused, setPaused] = useState(false);
+  const levelParam = level === "All levels" ? "" : `?level=${level}`;
+  const { data: logs, error, loading, refetch } = useApi<LogLine[]>(`/observability/logs${levelParam}`);
+
+  // 3s streaming poll unless paused
+  useEffect(() => {
+    if (paused) return;
+    const id = setInterval(refetch, 3000);
+    return () => clearInterval(id);
+  }, [paused, refetch]);
+
+  const filtered = (logs ?? []).filter(
+    (l) => l.message.toLowerCase().includes(logQ.toLowerCase()) || l.service.includes(logQ),
+  );
+
+  return (
+    <Card
+      title="Logs"
+      flush
+      right={
+        <span className="row" style={{ gap: 6 }}>
+          <SearchBox placeholder="Search logs…" value={logQ} onChange={setLogQ} style={{ width: 200 }} />
+          <select className="select" style={{ width: 110 }} value={level} onChange={(e) => setLevel(e.target.value)}>
+            {["All levels", "INFO", "WARN", "ERROR", "DEBUG"].map((l) => <option key={l}>{l}</option>)}
           </select>
-          <button className={`btn btn-sm ${live ? "btn-secondary" : "btn-ghost"}`} onClick={() => setLive(true)} style={live ? { color: "var(--green)" } : undefined}>
-            <span className="health-dot live" /> Live
+          <button className={`btn btn-sm ${paused ? "btn-ghost" : "btn-secondary"}`} onClick={() => setPaused(!paused)}>
+            {paused ? <><Icon name="play" size={11} /> Resume</> : <><Icon name="pause" size={11} /> Pause</>}
           </button>
-          <button className={`btn btn-sm ${!live ? "btn-secondary" : "btn-ghost"}`} onClick={() => setLive(false)}>
-            <Icon name="refresh" size={12} /> Auto
-          </button>
-        </div>
+        </span>
+      }
+    >
+      <div className="row micro t3" style={{ padding: "4px 12px", gap: 10, borderBottom: "1px solid var(--border)" }}>
+        <span style={{ width: 86 }}>Time</span><span style={{ width: 52 }}>Level</span><span style={{ width: 130 }}>Service</span><span className="grow">Event</span>
       </div>
-
-      <div className="ob-stats">
-        {obsStats.map((s) => <StatCard key={s.label} stat={s} small />)}
-      </div>
-
-      <div className="ob-main">
-        {/* Trace waterfall */}
-        <Card
-          title={
-            <span className="row" style={{ gap: 8 }}>
-              Trace — Autonomous Loop Iteration
-              <span className="mono micro t3" style={{ fontWeight: 400 }}>Trace ID {traceMeta.traceId}</span>
-              <button className="icon-btn btn-sm" title="Copy trace ID"><Icon name="copy" size={11} /></button>
-            </span>
-          }
-          flush
-          right={<button className="btn btn-ghost btn-sm">View in SigNoz <Icon name="external" size={11} /></button>}
-        >
-          <div className="row" style={{ gap: 14, padding: "8px 14px", borderBottom: "1px solid var(--border)", flexWrap: "wrap" }}>
-            <span className="micro t3">Iteration ID <span className="mono t2">{traceMeta.iterationId}</span></span>
-            <span className="micro t3">Status <span className="g-red" style={{ fontWeight: 620 }}>Error</span></span>
-            <span className="micro t3">Duration <span className="mono t2">{traceMeta.duration}</span></span>
-            <span className="micro t3">Start Time <span className="mono t2">{traceMeta.startTime}</span></span>
-          </div>
-          <div style={{ padding: "8px 0 4px", overflowX: "auto" }}>
-            <TraceWaterfall spans={traceSpans} />
-          </div>
-          <div className="row" style={{ gap: 14, padding: "8px 14px", borderTop: "1px solid var(--border)" }}>
-            <span className="micro t3">Total duration <b className="mono t2">{traceMeta.duration}</b></span>
-            <span className="micro t3">·</span>
-            <span className="micro t3"><b className="mono t2">{traceMeta.spans} spans</b></span>
-            <span className="micro t3">·</span>
-            <span className="micro t3"><b className="g-red mono">{traceMeta.errors} error</b></span>
-            <span className="grow" />
-            <select className="select" style={{ width: 110, height: 24, fontSize: "var(--fs-small)" }}><option>Services (8)</option></select>
-            <select className="select" style={{ width: 96, height: 24, fontSize: "var(--fs-small)" }}><option>Depth (2)</option></select>
-          </div>
-        </Card>
-
-        {/* Metrics */}
-        <Card title="Metrics" right={<CardLink>View all metrics</CardLink>}>
-          <div className="legend" style={{ marginBottom: 6 }}>
-            <span className="lg"><i style={{ background: "var(--series-1)" }} /> p95 latency</span>
-            <span className="lg"><i style={{ background: "var(--series-6)" }} /> Error rate</span>
-            <span className="lg"><i style={{ background: "var(--series-2)" }} /> GPU utilization</span>
-            <span className="lg"><i style={{ background: "var(--series-4)" }} /> Throughput (spans/min)</span>
-          </div>
-          <LineChart
-            series={[
-              { name: "p95 latency (m)", data: metricsSeries.latency, color: "var(--series-1)" },
-              { name: "Error rate (%)", data: metricsSeries.error, color: "var(--series-6)" },
-              { name: "GPU (%)", data: metricsSeries.gpu.map((v) => v / 5.4), color: "var(--series-2)" },
-              { name: "Throughput (k spans/min)", data: metricsSeries.throughput, color: "var(--series-4)" },
-            ]}
-            height={252}
-            yMin={0}
-            yMax={16}
-            yTicks={4}
-            yFormat={(v) => `${v.toFixed(0)}`}
-            xLabels={metricsSeries.labels}
-          />
-        </Card>
-      </div>
-
-      <div className="ob-bottom">
-        {/* Logs */}
-        <Card
-          title="Logs"
-          flush
-          right={
-            <span className="row" style={{ gap: 6 }}>
-              <SearchBox placeholder="Search logs…" value={logQ} onChange={setLogQ} style={{ width: 170 }} />
-              <button className="icon-btn btn-sm" title="Stream settings"><Icon name="settings" size={12} /></button>
-              <button className="icon-btn btn-sm" title="Filter"><Icon name="filter" size={12} /></button>
-              <button className={`btn btn-sm ${live ? "btn-secondary" : "btn-ghost"}`} onClick={() => setLive(!live)} style={live ? { color: "var(--green)" } : undefined}>
-                <span className="health-dot live" /> Live
-              </button>
-            </span>
-          }
-        >
-          <div className="row micro t3" style={{ padding: "4px 12px", gap: 10, borderBottom: "1px solid var(--border)" }}>
-            <span style={{ width: 74 }}>Time</span><span style={{ width: 52 }}>Level</span><span style={{ width: 120 }}>Service</span><span className="grow">Event</span>
-          </div>
-          <div className="log-list" style={{ maxHeight: 262, overflowY: "auto" }}>
-            {filteredLogs.map((l, i) => (
+      <div className="log-list" style={{ maxHeight: 480, overflowY: "auto" }}>
+        {error ? (
+          <ErrorState message={error.message} onRetry={refetch} />
+        ) : loading && !logs ? (
+          <Skeleton rows={8} height={11} />
+        ) : (
+          <>
+            {filtered.map((l, i) => (
               <div key={i} className="log-row">
                 <span className="t3">{l.time}</span>
                 <span className={`log-lvl ${l.level}`}>{l.level}</span>
@@ -127,22 +391,36 @@ export default function Observability() {
                 <Icon name="chevronRight" size={11} style={{ color: "var(--text-3)" }} />
               </div>
             ))}
-          </div>
-          <div style={{ padding: "8px 14px", borderTop: "1px solid var(--border)" }}>
-            <CardLink>View all logs in SigNoz <Icon name="external" size={10} /></CardLink>
-          </div>
-        </Card>
+            {filtered.length === 0 && <div className="empty-note">No log lines match the current filter.</div>}
+          </>
+        )}
+      </div>
+      <div style={{ padding: "8px 14px", borderTop: "1px solid var(--border)" }}>
+        <span className="micro t3">{filtered.length} lines · streamed from the telemetry exporter{paused ? " (paused)" : ""}</span>
+      </div>
+    </Card>
+  );
+}
 
-        {/* Alerts */}
-        <Card title="Alerts" right={<CardLink>View all alerts</CardLink>} flush>
-          <div style={{ maxHeight: 300, overflowY: "auto" }}>
+/* ---- Alerts ------------------------------------------------------------------------- */
+function AlertsTab() {
+  const { data: alerts, error, loading, refetch } = useApi<Alert[]>("/observability/alerts");
+  return (
+    <div className="col" style={{ gap: 10 }}>
+      <Card title="Alert rules" right={<CardLink>Manage alert policies</CardLink>} flush>
+        {error ? (
+          <ErrorState message={error.message} onRetry={refetch} />
+        ) : loading && !alerts ? (
+          <Skeleton rows={4} />
+        ) : alerts && alerts.length > 0 ? (
+          <div>
             {alerts.map((a) => (
-              <div key={a.title} style={{ padding: "10px 14px", borderBottom: "1px solid var(--border)" }}>
+              <div key={a.title} style={{ padding: "11px 14px", borderBottom: "1px solid var(--border)" }}>
                 <div className="row" style={{ gap: 8 }}>
                   <span className="health-dot" style={{ background: a.severity === "high" ? "var(--red)" : "var(--amber)" }} />
                   <span style={{ fontWeight: 620, fontSize: "var(--fs-body)" }} className="ellipsis grow">{a.title}</span>
                   <span className={`micro ${a.pending ? "g-amber" : "g-red"}`} style={{ fontWeight: 640, whiteSpace: "nowrap" }}>
-                    {a.pending ? "PENDING" : "FIRING"} for {a.firingFor}
+                    {a.pending ? "PENDING" : "FIRING"} · {a.firingFor}
                   </span>
                 </div>
                 <div className="micro t2" style={{ margin: "5px 0 7px" }}>
@@ -154,38 +432,10 @@ export default function Observability() {
               </div>
             ))}
           </div>
-          <div style={{ padding: "10px 14px", borderTop: "1px solid var(--border)" }}>
-            <CardLink>Manage alert policies <Icon name="external" size={10} /></CardLink>
-          </div>
-        </Card>
-
-        {/* Agent insights */}
-        <Card
-          title={<span className="row" style={{ gap: 7 }}><Icon name="agent" size={14} style={{ color: "var(--purple)" }} /> Agent Insights</span>}
-          right={<span className="micro t3">Generated 1m ago</span>}
-        >
-          <p className="small t2" style={{ marginBottom: 10 }}>From the last 30 minutes of telemetry, here are the top failure patterns and signals.</p>
-          <div className="col" style={{ gap: 10 }}>
-            {agentInsights.map((i) => (
-              <div key={i.title} className="row" style={{ gap: 9, alignItems: "flex-start" }}>
-                <span className="cell-ico" style={{ width: 22, height: 22, flex: "none" }}>
-                  <Icon name={i.icon as IconName} size={12} />
-                </span>
-                <span className="col" style={{ gap: 2 }}>
-                  <span style={{ fontSize: "var(--fs-body)", fontWeight: 600 }}>
-                    <b style={{ color: "var(--accent)" }}>{i.title.split(" ").slice(0, 3).join(" ")}</b>
-                    {i.title.split(" ").slice(3).join(" ")}
-                  </span>
-                  <span className="small t2">{i.body}</span>
-                </span>
-              </div>
-            ))}
-          </div>
-          <div style={{ marginTop: 12 }}>
-            <CardLink>Ask the agent a question <Icon name="external" size={10} /></CardLink>
-          </div>
-        </Card>
-      </div>
+        ) : (
+          <EmptyState icon="bell">No alerts firing — all pipelines within thresholds.</EmptyState>
+        )}
+      </Card>
     </div>
   );
 }

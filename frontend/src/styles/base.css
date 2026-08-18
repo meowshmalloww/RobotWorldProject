@@ -19,7 +19,7 @@ body {
   overflow: hidden;
 }
 
-::selection { background: rgba(76, 141, 255, 0.32); }
+::selection { background: rgba(255, 255, 255, 0.2); }
 
 h1, h2, h3, h4, p, ul, ol, figure { margin: 0; }
 ul, ol { padding: 0; list-style: none; }
@@ -34,15 +34,15 @@ img { display: block; }
 .num  { font-variant-numeric: tabular-nums; }
 
 /* ---- Scrollbars (thin, editor style) ---------------------------------- */
-* { scrollbar-width: thin; scrollbar-color: #2A3348 transparent; }
+* { scrollbar-width: thin; scrollbar-color: #343843 transparent; }
 *::-webkit-scrollbar { width: 9px; height: 9px; }
 *::-webkit-scrollbar-thumb {
-  background: #242D3E;
+  background: #333842;
   border: 2px solid transparent;
   border-radius: 8px;
   background-clip: padding-box;
 }
-*::-webkit-scrollbar-thumb:hover { background: #33405A; background-clip: padding-box; border: 2px solid transparent; }
+*::-webkit-scrollbar-thumb:hover { background: #424958; background-clip: padding-box; border: 2px solid transparent; }
 *::-webkit-scrollbar-track, *::-webkit-scrollbar-corner { background: transparent; }
 
 /* ---- Focus ------------------------------------------------------------- */
@@ -70,12 +70,21 @@ img { display: block; }
 .g-blue   { color: var(--accent); }
 .g-purple { color: var(--purple); }
 
-@keyframes wo-spin { to { transform: rotate(360deg); } }
-@keyframes wo-pulse-dot {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.35; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
+
+@keyframes wo-spin { to { transform: rotate(360deg); } }
 @keyframes wo-fade-in {
-  from { opacity: 0; transform: translateY(3px); }
+  from { opacity: 0; transform: translateY(2px); }
   to   { opacity: 1; transform: none; }
+}
+@keyframes wo-collapse {
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }

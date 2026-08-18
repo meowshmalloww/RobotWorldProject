@@ -1,6 +1,10 @@
-import type { CSSProperties, ReactNode } from "react";
+import { useState, type CSSProperties, type ReactNode } from "react";
 import { Icon } from "./Icon";
 
+/**
+ * Panel card. `collapsible` adds a chevron that expands/shrinks the body
+ * (animated grid-rows collapse, content unmounted visually but state kept).
+ */
 export function Card({
   title,
   info,
@@ -10,6 +14,9 @@ export function Card({
   style,
   className,
   pad,
+  collapsible = false,
+  defaultCollapsed = false,
+  onCollapse,
 }: {
   title?: ReactNode;
   info?: boolean;
@@ -19,12 +26,33 @@ export function Card({
   style?: CSSProperties;
   className?: string;
   pad?: boolean;
+  collapsible?: boolean;
+  defaultCollapsed?: boolean;
+  onCollapse?: (collapsed: boolean) => void;
 }) {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  const toggle = () => {
+    const next = !collapsed;
+    setCollapsed(next);
+    onCollapse?.(next);
+  };
+
+  const body = flush ? (
+    <div className="card-body-flush">{children}</div>
+  ) : (
+    <div className="card-body" style={pad === false ? { padding: 0 } : undefined}>{children}</div>
+  );
+
   return (
-    <section className={`card ${className ?? ""}`} style={style}>
+    <section className={`card ${collapsible ? "collapsible" : ""} ${collapsed ? "is-collapsed" : ""} ${className ?? ""}`} style={style}>
       {title !== undefined && (
         <header className="card-head">
-          <span className="card-title">
+          {collapsible && (
+            <button className="card-chevron" onClick={toggle} title={collapsed ? "Expand" : "Collapse"} aria-expanded={!collapsed}>
+              <Icon name="chevronDown" size={13} />
+            </button>
+          )}
+          <span className="card-title" onDoubleClick={collapsible ? toggle : undefined} style={collapsible ? { cursor: "default" } : undefined}>
             {title}
             {info && (
               <span className="info-dot">
@@ -35,10 +63,12 @@ export function Card({
           {right && <span className="head-right">{right}</span>}
         </header>
       )}
-      {flush ? (
-        <div className="card-body-flush">{children}</div>
+      {collapsible ? (
+        <div className="card-collapse">
+          <div className="cc-inner">{body}</div>
+        </div>
       ) : (
-        <div className="card-body" style={pad === false ? { padding: 0 } : undefined}>{children}</div>
+        body
       )}
     </section>
   );
@@ -69,5 +99,3 @@ export function Progress({
     </div>
   );
 }
-
-

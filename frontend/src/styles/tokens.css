@@ -1,87 +1,72 @@
-/* ==========================================================================
-   WorldOps design tokens
-   Dark editor theme — Unity / Unreal / Omniverse class UI.
-   Single source of truth for color, type, elevation, spacing.
-   ========================================================================== */
+/* RobotWorld desktop editor: neutral graphite surfaces with restrained status color. */
 
 :root {
-  /* ---- Surfaces (darkest → lightest) ---------------------------------- */
-  --bg-app:        #0A0D13;   /* canvas behind everything */
-  --bg-sidebar:    #0C1017;   /* left rail */
-  --bg-panel:      #10151E;   /* cards */
-  --bg-panel-2:    #141A25;   /* raised card section / hovered rows */
-  --bg-panel-3:    #1A2130;   /* active / selected surfaces */
-  --bg-inset:      #0B0F16;   /* inputs, code, table head */
-  --bg-overlay:    #161D2A;   /* dropdowns, popovers */
-  --bg-hover:      rgba(148, 170, 220, 0.055);
-  --bg-pressed:    rgba(148, 170, 220, 0.10);
+  --bg-app: #181818;
+  --bg-sidebar: #1E1E1E;
+  --bg-panel: #252525;
+  --bg-panel-2: #2C2C2C;
+  --bg-panel-3: #343434;
+  --bg-inset: #151515;
+  --bg-overlay: #303030;
+  --bg-hover: rgba(255, 255, 255, 0.05);
+  --bg-pressed: rgba(255, 255, 255, 0.09);
 
-  /* ---- Lines ---------------------------------------------------------- */
-  --border:        rgba(148, 170, 220, 0.10);
-  --border-strong: rgba(148, 170, 220, 0.18);
-  --border-focus:  rgba(96, 156, 255, 0.55);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.15);
+  --border-focus: rgba(255, 255, 255, 0.58);
 
-  /* ---- Text ------------------------------------------------------------ */
-  --text-1: #E9EDF5;
-  --text-2: #9AA5BA;
-  --text-3: #5D6880;
-  --text-on-accent: #F4F8FF;
+  --text-1: #F2F2F2;
+  --text-2: #B6B6B6;
+  --text-3: #929292;
+  --text-on-accent: #171717;
 
-  /* ---- Brand / accent --------------------------------------------------- */
-  --accent:        #4C8DFF;
-  --accent-hover:  #3D7CEF;
-  --accent-soft:   rgba(76, 141, 255, 0.13);
-  --accent-line:   rgba(76, 141, 255, 0.38);
-  --link:          #6EA2FF;
+  --accent: #E5E5E5;
+  --accent-hover: #FFFFFF;
+  --accent-soft: rgba(255, 255, 255, 0.10);
+  --accent-line: rgba(255, 255, 255, 0.34);
+  --link: #D6D6D6;
 
-  /* ---- Status ---------------------------------------------------------- */
-  --green:   #4CC38A;
-  --green-soft:  rgba(76, 195, 138, 0.13);
-  --amber:   #E5A13D;
-  --amber-soft:  rgba(229, 161, 61, 0.14);
-  --red:     #F0564F;
-  --red-soft:    rgba(240, 86, 79, 0.13);
-  --orange:  #E87B35;
-  --orange-soft: rgba(232, 123, 53, 0.14);
-  --purple:  #A077F0;
-  --purple-soft: rgba(160, 119, 240, 0.14);
-  --teal:    #3BBFC9;
-  --teal-soft:   rgba(59, 191, 201, 0.13);
-  --blue-soft:   rgba(76, 141, 255, 0.13);
+  --green: #65A77F;
+  --green-soft: rgba(101, 167, 127, 0.14);
+  --amber: #C39A50;
+  --amber-soft: rgba(195, 154, 80, 0.15);
+  --red: #C96A67;
+  --red-soft: rgba(201, 106, 103, 0.14);
+  --orange: #B77B55;
+  --orange-soft: rgba(183, 123, 85, 0.15);
+  --purple: #8E82B5;
+  --purple-soft: rgba(142, 130, 181, 0.15);
+  --teal: #629A9A;
+  --teal-soft: rgba(98, 154, 154, 0.14);
+  --blue-soft: rgba(255, 255, 255, 0.10);
 
-  /* ---- Chart series ---------------------------------------------------- */
-  --series-1: #4C8DFF;
-  --series-2: #4CC38A;
-  --series-3: #E5A13D;
-  --series-4: #A077F0;
-  --series-5: #3BBFC9;
-  --series-6: #F0564F;
-  --series-muted: #525E78;
+  --series-1: #DCDCDC;
+  --series-2: #65A77F;
+  --series-3: #C39A50;
+  --series-4: #8E82B5;
+  --series-5: #629A9A;
+  --series-6: #C96A67;
+  --series-muted: #686868;
 
-  /* ---- Typography ------------------------------------------------------ */
   --font-ui: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
-
   --fs-micro: 10.5px;
   --fs-small: 11.5px;
-  --fs-body:  12.5px;
+  --fs-body: 12.5px;
   --fs-title: 13px;
-  --fs-page:  20px;
-  --fs-stat:  22px;
+  --fs-page: 19px;
+  --fs-stat: 21px;
 
-  /* ---- Geometry -------------------------------------------------------- */
-  --r-sm: 5px;
-  --r-md: 7px;
-  --r-lg: 10px;
-
-  --topbar-h: 46px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --titlebar-h: 40px;
   --statusbar-h: 26px;
-  --sidebar-w: 210px;
-  --sidebar-w-collapsed: 54px;
+  --sidebar-w: 212px;
+  --sidebar-w-collapsed: 52px;
 
-  /* ---- Elevation -------------------------------------------------------- */
-  --shadow-pop: 0 10px 32px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.4);
-  --shadow-viewport: inset 0 0 0 1px rgba(148, 170, 220, 0.09);
-
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.35);
+  --shadow-modal: 0 24px 64px rgba(0, 0, 0, 0.55), 0 4px 16px rgba(0, 0, 0, 0.4);
+  --shadow-viewport: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
   --ease: cubic-bezier(0.33, 0.6, 0.2, 1);
 }

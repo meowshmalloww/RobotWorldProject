@@ -1,7 +1,7 @@
 import * as THREE from "three";
 
 /**
- * Shared material palette for the Warehouse Kitchen.
+ * Shared material palette for the articulated-door validation lab.
  * Segmentation mode swaps every mesh to a flat, per-object ID color —
  * a real semantic-segmentation render pass, not a texture trick.
  */
@@ -26,8 +26,8 @@ export const M = {
   safetyYellow: () => mat("safety", { color: "#C9A227", roughness: 0.8 }),
   steel: () => mat("steel", { color: "#8A8F98", roughness: 0.42, metalness: 0.85 }),
   steelDark: () => mat("steelDark", { color: "#4A4E55", roughness: 0.5, metalness: 0.7 }),
-  rackFrame: () => mat("rackFrame", { color: "#31507A", roughness: 0.55, metalness: 0.6 }),
-  rackBeam: () => mat("rackBeam", { color: "#B56A2A", roughness: 0.6, metalness: 0.4 }),
+  rackFrame: () => mat("rackFrame", { color: "#50545A", roughness: 0.55, metalness: 0.6 }),
+  rackBeam: () => mat("rackBeam", { color: "#756A5F", roughness: 0.6, metalness: 0.4 }),
   cardboard: () => mat("cardboard", { color: "#8A6F4D", roughness: 0.95 }),
   cardboard2: () => mat("cardboard2", { color: "#77603F", roughness: 0.95 }),
   cabinetBody: () => mat("cabBody", { color: "#B9A88E", roughness: 0.72 }),
@@ -40,13 +40,13 @@ export const M = {
   robotJoint: () => mat("robotJoint", { color: "#33373D", roughness: 0.45, metalness: 0.6 }),
   robotBase: () => mat("robotBase", { color: "#585D66", roughness: 0.5, metalness: 0.5 }),
   rubber: () => mat("rubber", { color: "#1B1D20", roughness: 0.9 }),
-  binBlue: () => mat("binBlue", { color: "#2E4A66", roughness: 0.7 }),
+  binBlue: () => mat("binBlue", { color: "#44494E", roughness: 0.7 }),
   mugRed: () => mat("mugRed", { color: "#A63D33", roughness: 0.55 }),
   bottleGreen: () => mat("bottleGreen", { color: "#4B6B45", roughness: 0.5 }),
   towel: () => mat("towel", { color: "#C8C2B4", roughness: 0.95 }),
   trashCan: () => mat("trashCan", { color: "#565B63", roughness: 0.45, metalness: 0.6 }),
-  lightStrip: () => mat("lightStrip", { color: "#D8E4F0", emissive: "#BFD9EE", emissiveIntensity: 2.4, roughness: 0.5 }),
-  exitSign: () => mat("exitSign", { color: "#123B1D", emissive: "#2E9E4F", emissiveIntensity: 1.8 }),
+  lightStrip: () => mat("lightStrip", { color: "#E0E0E0", emissive: "#D8D8D8", emissiveIntensity: 0.8, roughness: 0.5 }),
+  exitSign: () => mat("exitSign", { color: "#123B1D", emissive: "#2E9E4F", emissiveIntensity: 0.9 }),
   glassDark: () => mat("glassDark", { color: "#14161A", roughness: 0.15, metalness: 0.4 }),
 };
 

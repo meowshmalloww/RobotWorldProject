@@ -137,7 +137,7 @@ export function RobotArm({
       {/* base accent ring */}
       <mesh position={[0, 0.065, 0]} rotation={[Math.PI / 2, 0, 0]}>
         <torusGeometry args={[0.255, 0.008, 8, 40]} />
-        <meshStandardMaterial color="#3BBFC9" emissive="#3BBFC9" emissiveIntensity={1.6} />
+        <meshStandardMaterial color="#2E333B" roughness={0.6} metalness={0.4} />
       </mesh>
       {[[-0.16, 0.14], [0.16, 0.14], [-0.16, -0.14], [0.16, -0.14]].map(([x, z], i) => (
         <mesh key={i} position={[x, 0.045, z]} rotation={[Math.PI / 2, 0, 0]} material={rubber}>
@@ -200,7 +200,7 @@ export function RobotArm({
                 {/* wrist camera eye */}
                 <mesh position={[0, 0.02, 0.045]}>
                   <circleGeometry args={[0.012, 12]} />
-                  <meshStandardMaterial color="#1B1D20" emissive="#3BBFC9" emissiveIntensity={1.2} />
+                  <meshStandardMaterial color="#15171B" roughness={0.3} metalness={0.6} />
                 </mesh>
               </group>
             </group>
