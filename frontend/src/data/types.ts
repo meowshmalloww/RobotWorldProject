@@ -170,7 +170,7 @@ export interface PhotoCandidate {
   url?: string;
 }
 
-export interface RepairEvent { time: string; title: string; desc: string; kind: "detect" | "fail" | "heal" | "approve" | "done" }
+export interface RepairEvent { time: string; title: string; desc: string; kind: "detect" | "fail" | "heal" | "approve" | "success" | "done" }
 
 export interface SourceDetail {
   product: string;

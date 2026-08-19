@@ -1,13 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { TransformControls } from "@react-three/drei";
-import * as THREE from "three";
 import { Icon } from "../components/ui/Icon";
 import { Badge, InspSection, Segmented, StatusBadge } from "../components/ui/controls";
 import { Tree } from "../components/ui/Tree";
 import { PanelRail, ResizeHandle, usePanelSize } from "../components/ui/Resizable";
 import { Viewport } from "../components/three/Viewport";
-import { WarehouseKitchen } from "../components/three/WarehouseKitchen";
 import { useToast } from "../components/ui/Toast";
 import { Modal } from "../components/ui/Modal";
 import { api, ApiError } from "../lib/api";
@@ -25,7 +22,38 @@ interface SceneData {
   eventTimeline: { t: number; time: string; name: string; sub: string; state: string }[];
 }
 
-type GizmoMode = "translate" | "rotate" | "scale";
+interface AcceptanceScenario {
+  id: "kitchen-juice" | "factory-sort";
+  name: string;
+  world: "kitchen" | "factory";
+  description: string;
+  disclosure: string;
+  hierarchy: SceneNode[];
+  steps: string[];
+  successPredicates: string[];
+}
+
+interface AcceptanceCatalog {
+  scenarios: AcceptanceScenario[];
+  readiness: {
+    vulkan: { available: boolean; backend?: string; device?: string; error?: string };
+    policyConfigured: boolean;
+    brightDataConfigured: boolean;
+    sigNozConfigured: boolean;
+    trainingEnabled: false;
+  };
+}
+
+interface AcceptanceJob {
+  id: string;
+  status: "pending" | "running" | "success" | "failed" | "blocked";
+  detail: {
+    scenarioId: string;
+    stages: { name: string; status: "passed" | "blocked" | "failed"; detail: string; at: string }[];
+    error?: string;
+    result?: { outcome: string; taskSuccess: boolean | null; message: string; seed: number; manifestSha256?: string; mjcfSha256?: string };
+  };
+}
 
 export default function Worlds() {
   const [params, setParams] = useSearchParams();
@@ -60,40 +88,35 @@ export default function Worlds() {
 function SceneComposer() {
   const toast = useToast();
   const { data: scene, error, loading, refetch } = useApi<SceneData>("/worlds/scene");
+  const { data: acceptance } = useApi<AcceptanceCatalog>("/demo-scenarios");
+  const [acceptanceId, setAcceptanceId] = useState<AcceptanceScenario["id"]>("kitchen-juice");
+  const [acceptanceJob, setAcceptanceJob] = useState<AcceptanceJob | null>(null);
+  const [startingAcceptance, setStartingAcceptance] = useState(false);
   const [selected, setSelected] = useState<string | null>("cabinet-02");
   const [selectedName, setSelectedName] = useState("Kitchen Cabinet 02");
-  const [gizmo, setGizmo] = useState<GizmoMode>("translate");
-  const [playing, setPlaying] = useState(false);
   const [seed, setSeed] = useState("1048576");
   const [variant, setVariant] = useState("");
   const [inspTab, setInspTab] = useState<"Properties" | "References">("Properties");
-  const [shelfTab, setShelfTab] = useState<"Variants" | "Checks">("Variants");
+  const [shelfTab, setShelfTab] = useState<"Console" | "Variants" | "Checks">("Console");
   const [saved, setSaved] = useState("never");
   const [saving, setSaving] = useState(false);
   const [checks, setChecks] = useState<PhysicsCheck[] | null>(null);
   const [checksRunning, setChecksRunning] = useState(false);
-  const [deleteConfirm, setDeleteConfirm] = useState(false);
   const [newVariantOpen, setNewVariantOpen] = useState(false);
   const [creatingVariant, setCreatingVariant] = useState(false);
   const variantNameRef = useRef<HTMLInputElement>(null);
   const variantDescRef = useRef<HTMLInputElement>(null);
 
   // panel state — resizable + collapsible
-  const [leftW, setLeftW] = usePanelSize(248, 190, 420);
-  const [rightW, setRightW] = usePanelSize(318, 250, 460);
+  const [leftW, setLeftW] = usePanelSize(248, 190, 420, "robotworld.worlds.leftW");
+  const [rightW, setRightW] = usePanelSize(318, 250, 460, "robotworld.worlds.rightW");
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
-  const [shelfH, setShelfH] = usePanelSize(196, 120, 340);
+  const [shelfH, setShelfH] = usePanelSize(196, 120, 340, "robotworld.worlds.shelfH");
   const [shelfOpen, setShelfOpen] = useState(true);
-  const [camMode, setCamMode] = useState<"orbit" | "fly">("orbit");
 
-  // live clock for Play mode inside the composer viewport
-  const sim = useRef({ t: 0 });
-
-  const [proxyObj, setProxyObj] = useState<THREE.Group | null>(null);
-  const showGizmo = selected === "cabinet-02" || selected === "fridge" || selected === "cart" || selected === "worktable";
-
-  const sceneTree = useMemo(() => scene?.sceneTree ?? [], [scene]);
+  const activeAcceptance = acceptance?.scenarios.find((item) => item.id === acceptanceId);
+  const sceneTree = useMemo(() => activeAcceptance?.hierarchy ?? scene?.sceneTree ?? [], [activeAcceptance, scene]);
   const variantCards = useMemo(() => scene?.variants ?? [], [scene]);
   const physicsChecks = checks ?? scene?.physicsChecks ?? [];
 
@@ -104,6 +127,51 @@ function SceneComposer() {
       if (active) setVariant(active.id);
     }
   }, [scene, variant]);
+
+  useEffect(() => {
+    const reset = () => {
+      setLeftW(248);
+      setRightW(318);
+      setShelfH(196);
+      setLeftOpen(true);
+      setRightOpen(true);
+      setShelfOpen(true);
+    };
+    window.addEventListener("robotworld:reset-layout", reset);
+    return () => window.removeEventListener("robotworld:reset-layout", reset);
+  }, [setLeftW, setRightW, setShelfH]);
+
+  useEffect(() => {
+    if (!acceptanceJob || ["success", "failed", "blocked"].includes(acceptanceJob.status)) return;
+    const timer = window.setInterval(() => {
+      api.get<AcceptanceJob>(`/jobs/${acceptanceJob.id}`)
+        .then((job) => {
+          setAcceptanceJob(job);
+          if (job.status === "blocked") toast.push("info", "Environment ready; VLA required", job.detail.result?.message ?? "No robot-task success was claimed.");
+          if (job.status === "failed") toast.push("err", "Acceptance run failed", job.detail.error ?? "See the console for evidence.");
+        })
+        .catch(() => undefined);
+    }, 800);
+    return () => window.clearInterval(timer);
+  }, [acceptanceJob, toast]);
+
+  const runAcceptance = async (id: AcceptanceScenario["id"]) => {
+    setAcceptanceId(id);
+    setSelected(id === "kitchen-juice" ? "blender" : "parcel-set");
+    setSelectedName(id === "kitchen-juice" ? "Blender" : "Randomized parcel set");
+    setShelfTab("Console");
+    setShelfOpen(true);
+    setStartingAcceptance(true);
+    try {
+      const response = await api.post<{ jobId: string }>(`/demo-scenarios/${id}/runs`, { seed: Number(seed) });
+      setAcceptanceJob({ id: response.jobId, status: "pending", detail: { scenarioId: id, stages: [] } });
+      toast.push("ok", "Acceptance run queued", "A fresh seed will compile and validate; the run will fail closed if the VLA is absent.");
+    } catch (e) {
+      toast.push("err", "Could not start acceptance run", e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setStartingAcceptance(false);
+    }
+  };
 
   const save = async () => {
     setSaving(true);
@@ -165,14 +233,14 @@ function SceneComposer() {
   };
 
   return (
-    <div className="col" style={{ flex: 1, minHeight: 0, gap: 8 }}>
+    <div className="world-editor col" style={{ flex: 1, minHeight: 0, gap: 2 }}>
       {/* transport toolbar */}
       <div className="dockbar">
-        <button className={`btn btn-sm ${playing ? "btn-secondary" : "btn-primary"}`} onClick={() => setPlaying(!playing)}>
-          <Icon name={playing ? "pause" : "play"} size={12} /> {playing ? "Pause" : "Play"}
+        <button className={`btn btn-sm ${acceptanceId === "kitchen-juice" ? "btn-secondary" : "btn-ghost"}`} disabled={startingAcceptance || acceptanceJob?.status === "running"} onClick={() => runAcceptance("kitchen-juice")} title="Compile a fresh randomized kitchen world, run physical validation, then execute only if a compatible VLA is configured">
+          <Icon name="play" size={12} /> Kitchen acceptance
         </button>
-        <button className="btn btn-ghost btn-sm btn-icon" title="Stop" onClick={() => { setPlaying(false); sim.current.t = 0; }}>
-          <Icon name="stop" size={12} />
+        <button className={`btn btn-sm ${acceptanceId === "factory-sort" ? "btn-secondary" : "btn-ghost"}`} disabled={startingAcceptance || acceptanceJob?.status === "running"} onClick={() => runAcceptance("factory-sort")} title="Compile a fresh randomized logistics world, run physical validation, then execute only if a compatible VLA is configured">
+          <Icon name="play" size={12} /> Logistics acceptance
         </button>
         <span className="v-divider" style={{ margin: "0 4px" }} />
         <span className="small t2">Variant</span>
@@ -185,16 +253,6 @@ function SceneComposer() {
           <Icon name="refresh" size={12} />
         </button>
         <span className="grow" />
-        <Segmented
-          options={[
-            { value: "translate", icon: "move", label: "Move" },
-            { value: "rotate", icon: "rotate", label: "Rotate" },
-            { value: "scale", icon: "gizmoScale", label: "Scale" },
-          ]}
-          value={gizmo}
-          onChange={(v) => setGizmo(v)}
-        />
-        <span className="v-divider" style={{ margin: "0 2px" }} />
         <button className={`btn btn-ghost btn-sm btn-icon ${leftOpen ? "" : ""}`} title="Toggle stage tree" onClick={() => setLeftOpen(!leftOpen)} style={!leftOpen ? { color: "var(--accent)" } : undefined}>
           <Icon name="panelLeft" size={13} />
         </button>
@@ -217,9 +275,6 @@ function SceneComposer() {
             <div className="card" style={{ width: leftW, flex: "none", display: "flex", flexDirection: "column", minHeight: 0 }}>
               <header className="card-head" style={{ minHeight: 36 }}>
                 <span className="card-title" style={{ fontSize: "var(--fs-small)" }}>Stage Tree</span>
-                <span className="head-right">
-                  <button className="icon-btn btn-sm" title="Add node" onClick={() => toast.push("info", "Add node", "Pick an asset from the library (backend pending)")}><Icon name="plus" size={12} /></button>
-                </span>
               </header>
               <div style={{ padding: "6px 8px 6px", borderBottom: "1px solid var(--border)" }}>
                 <div className="search-box">
@@ -259,87 +314,27 @@ function SceneComposer() {
               <Viewport
                 camera={{ position: [3.6, 2.5, 1.4], fov: 42 }}
                 target={[-0.1, 0.9, -2.8]}
+                scene={activeAcceptance?.world ?? "kitchen"}
+                doorAngle={variant.includes("left") ? 55 : variant.includes("default") ? 18 : 0}
                 style={{ flex: 1, minHeight: 0, borderRadius: 0 }}
                 onPointerMissed={() => setSelected(null)}
                 grid
-                fly={camMode === "fly"}
-                controls={camMode === "orbit"}
-              >
-                <WarehouseKitchen
-                  simRef={playing ? sim : undefined}
-                  simTime={playing ? undefined : 0}
-                  selection={{
-                    interactive: true,
-                    selectedId: selected,
-                    onSelect: (s) => {
-                      setSelected(s?.id ?? null);
-                      setSelectedName(s?.name ?? "");
-                    },
-                  }}
-                  cabinetDoorOpen={{ left: variant.includes("left") ? 0.8 : 0 }}
-                />
-                <group ref={setProxyObj} position={[-0.5, 1.62, -3.48]}>
-                  {showGizmo && (
-                    <mesh>
-                      <boxGeometry args={[0.94, 0.79, 0.38]} />
-                      <meshBasicMaterial color="#4C86E8" transparent opacity={0.07} depthWrite={false} />
-                    </mesh>
-                  )}
-                </group>
-                {showGizmo && proxyObj && (
-                  <TransformControls object={proxyObj} mode={gizmo} size={0.75} />
-                )}
-              </Viewport>
+                controls
+              />
 
               {/* engine HUD overlays */}
               <div className="vp-overlay" style={{ top: 10, left: 10 }}>
                 <span className="vp-chip"><span className="dot" style={{ background: "var(--text-2)" }} /> Scene preview</span>
               </div>
               <div className="vp-overlay" style={{ top: 10, right: 10 }}>
-                <div className="vp-toolbar">
-                  <button title="Perspective" className="on" style={{ width: "auto", padding: "0 8px", fontSize: "var(--fs-small)" }}>Persp</button>
-                  <span className="sep" />
-                  <button title="Lit" style={{ width: "auto", padding: "0 8px", gap: 5 }}><Icon name="sun" size={12} /> Lit</button>
-                  <button title="Collision view is available in the MuJoCo diagnostics" disabled><Icon name="collider" size={13} /></button>
-                  <span className="sep" />
-                  <button title="Frame all is not available in preview mode" disabled><Icon name="maximize" size={12} /></button>
-                </div>
-              </div>
-              {/* camera mode toggle — orbit vs fly */}
-              <div className="vp-overlay" style={{ top: 44, right: 10 }}>
-                <Segmented
-                  options={[
-                    { value: "orbit", icon: "rotate", label: "Orbit" },
-                    { value: "fly", icon: "hand", label: "Fly" },
-                  ]}
-                  value={camMode}
-                  onChange={(v) => setCamMode(v)}
-                />
-              </div>
-              <div className="vp-overlay" style={{ bottom: 10, left: "50%", transform: "translateX(-50%)" }}>
-                <div className="vp-toolbar">
-                  <button title="Select" className="on"><Icon name="hand" size={13} /></button>
-                  <button title="Orbit"><Icon name="rotate" size={13} /></button>
-                  <button title="Pan"><Icon name="move" size={13} /></button>
-                  <span className="sep" />
-                  <button title="Focus selection"><Icon name="target" size={13} /></button>
-                  <button title="Measure is not available in preview mode" disabled><Icon name="ruler" size={13} /></button>
-                  <button title="Screenshot is not available in preview mode" disabled><Icon name="camera" size={13} /></button>
-                </div>
+                <span className="vp-chip">Drag to orbit · wheel to zoom</span>
               </div>
               {/* engine status strip — bottom-right, away from the gizmo */}
               <div className="vp-overlay" style={{ bottom: 10, right: 10 }}>
                 <div className="vp-stat">
-                  <span className="mono">Three.js preview</span>
-                  <span className="vp-stat-sep" />
                   <span className="mono g-blue">{selected ? selectedName : "—"}</span>
                 </div>
               </div>
-              {camMode === "fly" && (
-                <div className="vp-overlay" style={{ top: 38, left: 10 }}>
-                  <span className="vp-chip" style={{ fontSize: 10.5 }}>WASD move · drag to look · shift = boost</span>
-                </div>
-              )}
             </div>
           </div>
 
@@ -350,24 +345,28 @@ function SceneComposer() {
               <div className="card" style={{ height: shelfH, flex: "none", display: "flex", flexDirection: "column", minHeight: 0 }}>
                 <header className="card-head" style={{ minHeight: 34, padding: "0 8px 0 12px" }}>
                   <span className="tabs" style={{ border: 0 }}>
-                    {(["Variants", "Checks"] as const).map((t) => (
+                    {(["Console", "Variants", "Checks"] as const).map((t) => (
                       <button key={t} className={shelfTab === t ? "on" : ""} style={{ height: 26 }} onClick={() => setShelfTab(t)}>
-                        {t === "Checks" ? "Placement & Physics" : "Scenario Variants"}
+                        {t === "Checks" ? "Placement & Physics" : t === "Variants" ? "Scenario Variants" : "Acceptance Console"}
                       </button>
                     ))}
                   </span>
                   <span className="head-right">
                     {shelfTab === "Variants" ? (
                       <button className="btn btn-ghost btn-sm" onClick={() => setNewVariantOpen(true)}><Icon name="plus" size={12} /> New Variant</button>
-                    ) : (
+                    ) : shelfTab === "Checks" ? (
                       <button className="btn btn-ghost btn-sm" onClick={rerunChecks} disabled={checksRunning}>
                         <Icon name="refresh" size={12} className={checksRunning ? "spin" : undefined} /> {checksRunning ? "Running…" : "Re-run Checks"}
                       </button>
+                    ) : (
+                      <StatusBadge status={acceptanceJob?.status ?? "idle"} />
                     )}
                   </span>
                 </header>
                 <div style={{ flex: 1, overflowY: "auto", minHeight: 0 }}>
-                  {shelfTab === "Variants" ? (
+                  {shelfTab === "Console" ? (
+                    <AcceptanceConsole scenario={activeAcceptance} catalog={acceptance ?? undefined} job={acceptanceJob} />
+                  ) : shelfTab === "Variants" ? (
                     loading && !scene ? (
                       <Skeleton rows={2} height={40} />
                     ) : variantCards.length > 0 ? (
@@ -379,19 +378,14 @@ function SceneComposer() {
                                 <Viewport
                                   camera={{ position: [2.7, 2.0, 0.4], fov: 44 }}
                                   target={[0.1, 1.0, -3.1]}
+                                  scene={activeAcceptance?.world ?? "kitchen"}
+                                  doorAngle={v.id.includes("left") ? 55 : v.id.includes("default") ? 18 : 0}
                                   style={{ height: "100%", borderRadius: 0 }}
                                   gizmo={false}
                                   controls={false}
                                   shadows={false}
                                   dpr={[0.5, 0.8]}
-                                >
-                                  <WarehouseKitchen
-                                    cabinetDoorOpen={{
-                                      left: v.id.includes("left") ? 0.85 : v.id.includes("default") ? 0.3 : 0,
-                                      right: v.id.includes("cluttered") ? 0.5 : 0,
-                                    }}
-                                  />
-                                </Viewport>
+                                />
                                 {v.active && <span className="badge b-blue" style={{ position: "absolute", top: 5, left: 5, height: 16, fontSize: 9 }}>Active</span>}
                               </div>
                               <div className="v-body">
@@ -446,10 +440,7 @@ function SceneComposer() {
                 <span className="row" style={{ gap: 8, minWidth: 0 }}>
                   <span className="cell-ico" style={{ width: 22, height: 22 }}><Icon name="cabinet" size={12} /></span>
                   <span className="ellipsis" style={{ fontWeight: 620, fontSize: "var(--fs-small)" }}>{selected ? selectedName : "Nothing selected"}</span>
-                  {selected && <Badge tone="grey">Static Mesh</Badge>}
-                </span>
-                <span className="head-right">
-                  <button className="icon-btn btn-sm" title="Lock node" onClick={() => toast.push("info", "Node locked", selectedName)}><Icon name="lock" size={12} /></button>
+                  {selected && <Badge tone="grey">Scene node</Badge>}
                 </span>
               </header>
               <div className="tabs" style={{ padding: "0 12px" }}>
@@ -458,11 +449,22 @@ function SceneComposer() {
                 ))}
               </div>
               <div style={{ flex: 1, overflowY: "auto", minHeight: 0 }}>
-                {selected ? (
-                  <InspectorBody
+                {selected && inspTab === "Properties" ? (
+                  <EvidenceInspectorBody
                     selected={selected}
-                    onDelete={() => setDeleteConfirm(true)}
+                    selectedName={selectedName}
+                    scenario={activeAcceptance}
+                    job={acceptanceJob}
                   />
+                ) : selected && inspTab === "References" ? (
+                  <div className="col" style={{ padding: 12, gap: 8 }}>
+                    <span className="section-label">Measured success predicates</span>
+                    {(activeAcceptance?.successPredicates ?? []).map((predicate, index) => (
+                      <div className="row small t2" style={{ alignItems: "flex-start", gap: 7 }} key={predicate}>
+                        <span className="mono t3">{String(index + 1).padStart(2, "0")}</span><span>{predicate}</span>
+                      </div>
+                    ))}
+                  </div>
                 ) : (
                   <div className="empty-note">Select a node in the viewport or stage tree to inspect its properties.</div>
                 )}
@@ -478,32 +480,6 @@ function SceneComposer() {
       </div>
 
       {/* modals */}
-      {deleteConfirm && (
-        <Modal
-          title="Delete node"
-          onClose={() => setDeleteConfirm(false)}
-          footer={
-            <>
-              <button className="btn btn-ghost" onClick={() => setDeleteConfirm(false)}>Cancel</button>
-              <button
-                className="btn btn-primary"
-                style={{ background: "var(--red)" }}
-                onClick={() => {
-                  setDeleteConfirm(false);
-                  setSelected(null);
-                  toast.push("ok", "Node deleted", selectedName);
-                }}
-              >
-                Delete
-              </button>
-            </>
-          }
-        >
-          <p style={{ fontSize: "var(--fs-body)", color: "var(--text-2)" }}>
-            Delete <b style={{ color: "var(--text-1)" }}>{selectedName}</b> from this world? References in saved scenario variants will be removed.
-          </p>
-        </Modal>
-      )}
       {newVariantOpen && (
         <Modal
           title="New scenario variant"
@@ -529,45 +505,88 @@ function SceneComposer() {
 }
 
 /* ---- inspector body (clean, no XYZ inputs) --------------------------------- */
-function InspectorBody({ selected, onDelete }: { selected: string; onDelete: () => void }) {
+function AcceptanceConsole({
+  scenario,
+  catalog,
+  job,
+}: {
+  scenario?: AcceptanceScenario;
+  catalog?: AcceptanceCatalog;
+  job: AcceptanceJob | null;
+}) {
+  if (!scenario) return <div style={{ padding: 12 }}><Skeleton rows={3} /></div>;
+  return (
+    <div className="acceptance-console">
+      <div className="acceptance-brief">
+        <div className="row between acceptance-summary" style={{ gap: 10 }}>
+          <strong>{scenario.name}</strong>
+          <span className="row" style={{ gap: 5 }}>
+            <Badge tone={catalog?.readiness.vulkan.available ? "green" : "red"}>Vulkan</Badge>
+            <Badge tone={catalog?.readiness.policyConfigured ? "green" : "amber"}>VLA {catalog?.readiness.policyConfigured ? "configured" : "required"}</Badge>
+            <Badge tone="grey">No training</Badge>
+          </span>
+        </div>
+        <p className="small t2">{scenario.description}</p>
+        <p className="micro t3">{scenario.disclosure}</p>
+      </div>
+      <div className="acceptance-log mono">
+        {!job ? (
+          <div className="console-line"><span className="console-time">ready</span><span>Select this scenario's acceptance button to compile a fresh randomized world.</span></div>
+        ) : (
+          <>
+            <div className="console-line"><span className="console-time">job</span><span>{job.id} · {job.status}</span></div>
+            {job.detail.stages.map((stage, index) => (
+              <div className={`console-line ${stage.status}`} key={`${stage.name}-${index}`}>
+                <span className="console-time">{new Date(stage.at).toLocaleTimeString([], { hour12: false })}</span>
+                <span><b>{stage.status.toUpperCase()}</b> {stage.name} · {stage.detail}</span>
+              </div>
+            ))}
+            {job.detail.error && <div className="console-line failed"><span className="console-time">error</span><span>{job.detail.error}</span></div>}
+            {job.detail.result && <div className="console-line blocked"><span className="console-time">result</span><span>taskSuccess={String(job.detail.result.taskSuccess)} · {job.detail.result.message}</span></div>}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EvidenceInspectorBody({
+  selected,
+  selectedName,
+  scenario,
+  job,
+}: {
+  selected: string;
+  selectedName: string;
+  scenario?: AcceptanceScenario;
+  job: AcceptanceJob | null;
+}) {
+  const result = job?.detail.result;
   return (
     <>
       <InspSection title="Identity">
         <div className="kv">
           <div className="kv-row"><span className="kv-k">ID</span><span className="kv-v mono">{selected}</span></div>
-          <div className="kv-row"><span className="kv-k">Asset</span><span className="kv-v row" style={{ gap: 5 }}>Kitchen_Cabinet_02.usd <Icon name="external" size={10} /></span></div>
-        </div>
-        <div className="row wrap" style={{ gap: 5, marginTop: 8 }}>
-          {["furniture", "storage", "kitchen"].map((t) => (
-            <span key={t} className="tag">{t}<button><Icon name="x" size={9} /></button></span>
-          ))}
-          <button className="tag-add"><Icon name="plus" size={10} /></button>
+          <div className="kv-row"><span className="kv-k">Name</span><span className="kv-v">{selectedName}</span></div>
+          <div className="kv-row"><span className="kv-k">Scenario</span><span className="kv-v mono">{scenario?.id ?? "not loaded"}</span></div>
         </div>
       </InspSection>
-      <InspSection title="Mesh">
+      <InspSection title="Runtime evidence">
         <div className="kv">
-          <div className="kv-row"><span className="kv-k">Materials</span><span className="kv-v mono">4</span></div>
-          <div className="kv-row"><span className="kv-k">Collision</span><span className="kv-v">Convex Decomposition</span></div>
-          <div className="kv-row"><span className="kv-k">Physics</span><span className="kv-v">Static</span></div>
-          <div className="kv-row"><span className="kv-k">Mass (kg)</span><span className="kv-v mono">—</span></div>
+          <div className="kv-row"><span className="kv-k">Job</span><span className="kv-v mono">{job?.id ?? "not run"}</span></div>
+          <div className="kv-row"><span className="kv-k">State</span><span className="kv-v"><StatusBadge status={job?.status ?? "not run"} /></span></div>
+          <div className="kv-row"><span className="kv-k">Seed</span><span className="kv-v mono">{result?.seed ?? "generated at run"}</span></div>
+          <div className="kv-row"><span className="kv-k">Task success</span><span className="kv-v mono">{result ? String(result.taskSuccess) : "not evaluated"}</span></div>
         </div>
       </InspSection>
-      <InspSection title="Interaction" defaultOpen={false}>
+      <InspSection title="Provenance" defaultOpen={false}>
         <div className="kv">
-          <div className="kv-row"><span className="kv-k">Graspable</span><span className="kv-v">Handle only</span></div>
-          <div className="kv-row"><span className="kv-k">Articulation</span><span className="kv-v">2 revolute doors</span></div>
+          <div className="kv-row"><span className="kv-k">Definition</span><span className="kv-v">Acceptance manifest</span></div>
+          <div className="kv-row"><span className="kv-k">Physics</span><span className="kv-v">MuJoCo compile + stability gate</span></div>
+          <div className="kv-row"><span className="kv-k">Manifest SHA</span><span className="kv-v mono">{result?.manifestSha256?.slice(0, 16) ?? "pending"}</span></div>
+          <div className="kv-row"><span className="kv-k">MJCF SHA</span><span className="kv-v mono">{result?.mjcfSha256?.slice(0, 16) ?? "pending"}</span></div>
         </div>
       </InspSection>
-      <InspSection title="Metadata" defaultOpen={false}>
-        <div className="kv">
-          <div className="kv-row"><span className="kv-k">Source</span><span className="kv-v">bestbuy.com</span></div>
-          <div className="kv-row"><span className="kv-k">Compiled</span><span className="kv-v">May 24, 10:02 AM</span></div>
-          <div className="kv-row"><span className="kv-k">Compiler</span><span className="kv-v mono">usd.compiler v1.4.0</span></div>
-        </div>
-      </InspSection>
-      <div style={{ padding: 12 }}>
-        <button className="btn btn-danger-ghost" style={{ width: "100%" }} onClick={onDelete}>Delete Node</button>
-      </div>
     </>
   );
 }

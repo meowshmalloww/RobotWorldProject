@@ -34,15 +34,15 @@ img { display: block; }
 .num  { font-variant-numeric: tabular-nums; }
 
 /* ---- Scrollbars (thin, editor style) ---------------------------------- */
-* { scrollbar-width: thin; scrollbar-color: #343843 transparent; }
+* { scrollbar-width: thin; scrollbar-color: #3A3A3A transparent; }
 *::-webkit-scrollbar { width: 9px; height: 9px; }
 *::-webkit-scrollbar-thumb {
-  background: #333842;
+  background: #3A3A3A;
   border: 2px solid transparent;
   border-radius: 8px;
   background-clip: padding-box;
 }
-*::-webkit-scrollbar-thumb:hover { background: #424958; background-clip: padding-box; border: 2px solid transparent; }
+*::-webkit-scrollbar-thumb:hover { background: #505050; background-clip: padding-box; border: 2px solid transparent; }
 *::-webkit-scrollbar-track, *::-webkit-scrollbar-corner { background: transparent; }
 
 /* ---- Focus ------------------------------------------------------------- */

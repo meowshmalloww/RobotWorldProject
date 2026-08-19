@@ -34,39 +34,41 @@ def robot_xml(base: tuple[float, float] = (0.55, 0.55)) -> str:
   <body name="robot" pos="{bx} 0 {bz}">
     <geom name="robot_base" class="robot" type="cylinder" size="0.25 0.14" pos="0 0.14 0" euler="90 0 0" mass="18" rgba="0.16 0.18 0.22 1" contype="1" conaffinity="1"/>
     <geom name="robot_mast" class="robot" type="cylinder" size="0.08 {(m['mast_h'] - 0.38)/2:.3f}" pos="0 {0.30 + (m['mast_h'] - 0.38)/2:.3f} 0" euler="90 0 0" mass="4" rgba="0.75 0.78 0.83 1"/>
-    <body name="yaw_link" pos="0 {m['mast_h']} 0">
+    <body name="yaw_link" pos="0 {m['mast_h']} 0" gravcomp="1">
       <joint name="j_yaw" type="hinge" axis="0 1 0" range="-3.0 3.0" damping="2.5"/>
       <geom name="shoulder_housing" class="robot" type="sphere" size="0.085" mass="1.2" rgba="0.35 0.38 0.44 1"/>
-      <body name="shoulder_link" pos="0 0 0">
+      <body name="shoulder_link" pos="0 0 0" gravcomp="1">
         <joint name="j_shoulder" type="hinge" axis="0 0 -1" range="0.05 1.9" damping="2.0"/>
         <geom name="upper_arm" class="robot" type="capsule" size="0.055 {m['upper_len']/2:.3f}" pos="0 {m['upper_len']/2:.3f} 0" euler="90 0 0" mass="1.6" rgba="0.8 0.83 0.88 1"/>
-        <body name="elbow_link" pos="0 {m['upper_len']} 0">
+        <body name="elbow_link" pos="0 {m['upper_len']} 0" gravcomp="1">
           <joint name="j_elbow" type="hinge" axis="0 0 -1" range="-2.8 0.2" damping="1.5"/>
           <geom name="elbow_housing" class="robot" type="sphere" size="0.07" mass="0.8" rgba="0.35 0.38 0.44 1"/>
           <geom name="forearm" class="robot" type="capsule" size="0.046 {m['fore_len']/2:.3f}" pos="0 {m['fore_len']/2:.3f} 0" euler="90 0 0" mass="1.1" rgba="0.8 0.83 0.88 1"/>
-          <body name="wrist_link" pos="0 {m['fore_len']} 0">
+          <body name="wrist_link" pos="0 {m['fore_len']} 0" gravcomp="1">
             <joint name="j_wrist" type="hinge" axis="0 0 -1" range="-1.5 2.2" damping="0.8"/>
             <geom name="wrist_housing" class="robot" type="sphere" size="0.052" mass="0.4" rgba="0.35 0.38 0.44 1"/>
-            <geom name="wrist_stub" class="robot" type="capsule" size="0.032 {m['wrist_len']/2:.3f}" pos="0 {m['wrist_len']/2:.3f} 0" euler="90 0 0" mass="0.3" rgba="0.8 0.83 0.88 1"/>
-            <body name="hand" pos="0 {m['wrist_len']} 0">
-              <geom name="palm" class="robot" type="box" size="0.045 0.0225 0.035" mass="0.25" rgba="0.35 0.38 0.44 1"/>
+            <geom name="wrist_stub" class="robot" type="capsule" size="0.032 {m['wrist_len']/2:.3f}" pos="0 {m['wrist_len']/2:.3f} 0" euler="90 0 0" mass="0.3" margin="0.003" rgba="0.8 0.83 0.88 1"/>
+            <body name="hand" pos="0 {m['wrist_len']} 0" gravcomp="1">
+              <!-- Wrist RGB used by learned-policy evaluation.  MuJoCo cameras
+                   look down local -Z; these axes point that direction along
+                   the gripper's +Y approach axis. -->
+              <camera name="wrist" pos="0 0.025 0.018" xyaxes="1 0 0 0 0 1" fovy="72"/>
+              <geom name="palm" class="robot" type="box" size="0.045 0.0225 0.035" mass="0.25" margin="0.003" rgba="0.35 0.38 0.44 1"/>
               <!-- grasp sites along the finger length: root / mid(ee) / tip —
                    attach picks whichever coincides with the bar -->
               <site name="ee" pos="0 0.075 0" size="0.008" rgba="1 0 0 0"/>
               <site name="grasp_root" pos="0 0.03 0" size="0.008" rgba="1 0 0 0"/>
               <site name="grasp_tip" pos="0 0.125 0" size="0.008" rgba="1 0 0 0"/>
-              <body name="finger_l" pos="-0.05 0.055 0">
-                <joint name="j_finger_l" type="slide" axis="1 0 0" range="0 0.04" damping="4.0"/>
-                <geom name="finger_l_pad" class="robot" type="box" size="0.007 0.047 0.045" pos="0 0.02 -0.01" mass="0.05" friction="1.6 0.1 0.001" rgba="0.2 0.21 0.24 1"/>
-                <!-- hooked fingertips: the handle cannot slide out along the jaw -->
-                <geom name="finger_l_hook_a" class="robot" type="box" size="0.007 0.047 0.009" pos="0.006 0.02 -0.055" mass="0.01" friction="1.4 0.1 0.001" rgba="0.2 0.21 0.24 1"/>
-                <geom name="finger_l_hook_b" class="robot" type="box" size="0.007 0.047 0.009" pos="0.006 0.02 0.035" mass="0.01" friction="1.4 0.1 0.001" rgba="0.2 0.21 0.24 1"/>
+              <!-- With the wrist approach axis horizontal, local X is the
+                   handle's vertical axis.  The jaws therefore close along
+                   local Z and extend along local X. -->
+              <body name="finger_l" pos="0 0.055 -0.05" gravcomp="1">
+                <joint name="j_finger_l" type="slide" axis="0 0 1" range="0 0.04" damping="4.0"/>
+                <geom name="finger_l_pad" class="robot" type="box" size="0.045 0.047 0.007" pos="0 0.02 0" mass="0.05" margin="0.003" friction="1.6 0.1 0.001" rgba="0.2 0.21 0.24 1"/>
               </body>
-              <body name="finger_r" pos="0.05 0.055 0">
-                <joint name="j_finger_r" type="slide" axis="-1 0 0" range="0 0.04" damping="4.0"/>
-                <geom name="finger_r_pad" class="robot" type="box" size="0.007 0.047 0.045" pos="0 0.02 -0.01" mass="0.05" friction="1.6 0.1 0.001" rgba="0.2 0.21 0.24 1"/>
-                <geom name="finger_r_hook_a" class="robot" type="box" size="0.007 0.047 0.009" pos="-0.006 0.02 -0.055" mass="0.01" friction="1.4 0.1 0.001" rgba="0.2 0.21 0.24 1"/>
-                <geom name="finger_r_hook_b" class="robot" type="box" size="0.007 0.047 0.009" pos="-0.006 0.02 0.035" mass="0.01" friction="1.4 0.1 0.001" rgba="0.2 0.21 0.24 1"/>
+              <body name="finger_r" pos="0 0.055 0.05" gravcomp="1">
+                <joint name="j_finger_r" type="slide" axis="0 0 -1" range="0 0.04" damping="4.0"/>
+                <geom name="finger_r_pad" class="robot" type="box" size="0.045 0.047 0.007" pos="0 0.02 0" mass="0.05" margin="0.003" friction="1.6 0.1 0.001" rgba="0.2 0.21 0.24 1"/>
               </body>
             </body>
           </body>

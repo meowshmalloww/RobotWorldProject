@@ -30,10 +30,13 @@ export default function Sources() {
   const [photo, setPhoto] = useState(1);
   const [creating, setCreating] = useState(false);
   const [running, setRunning] = useState(false);
+  const [repairing, setRepairing] = useState(false);
 
   // Add-source form
   const domainRef = useRef<HTMLInputElement>(null);
   const [category, setCategory] = useState("Refrigerators");
+  const [collector, setCollector] = useState("");
+  const [sourceQuery, setSourceQuery] = useState("");
 
   const sources = useMemo(() => data?.sources ?? [], [data]);
   const filtered = useMemo(
@@ -60,15 +63,33 @@ export default function Sources() {
     }
     setCreating(true);
     try {
-      const created = await api.post<Source>("/sources", { domain, category, query: domain });
+      const created = await api.post<Source>("/sources", { domain, category, query: sourceQuery || domain, collector });
       setAddOpen(false);
-      toast.push("ok", "Source registered", `${created.domain} · collector lifecycle: run → heal → approve → rerun`);
+      toast.push("ok", "Source registered", collector ? `${created.domain} · custom collector ${collector}` : `${created.domain} · add a c_* collector ID before running`);
       setSelectedSource(created.id);
       refetch();
     } catch (e) {
       toast.push("err", "Could not add source", e instanceof ApiError ? e.message : String(e));
     } finally {
       setCreating(false);
+    }
+  };
+
+  const repairCollector = async (approve = false) => {
+    if (!sel || sel.collector === "—") return;
+    if (!window.confirm(approve ? "Approve and save the pending Bright Data repair, then rerun this collector?" : "Start a billable Bright Data self-heal job for this collector?")) return;
+    setRepairing(true);
+    try {
+      const path = approve ? `/sources/${sel.id}/repair/approve` : `/sources/${sel.id}/repair`;
+      const body = approve ? {} : { prompt: "Repair the extractor so every row contains model, dimensions, source URL, and at least one product image." };
+      const { jobId } = await api.post<{ jobId: string }>(path, body);
+      toast.push("ok", approve ? "Repair approval queued" : "Self-heal queued", `${sel.collector} · job ${jobId}`);
+      refetch();
+      refetchDetail();
+    } catch (e) {
+      toast.push("err", "Repair request failed", e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setRepairing(false);
     }
   };
 
@@ -91,7 +112,7 @@ export default function Sources() {
       <div className="page-head">
         <div>
           <h1 className="page-title">Sources</h1>
-          <p className="page-sub">Web data collection, extraction quality, and self-healing scrapers — via Bright Data.</p>
+          <p className="page-sub">Custom Scraper Studio collectors, validated structured output, and human-approved self-healing.</p>
         </div>
         <div className="head-actions">
           <button className="btn btn-ghost btn-sm" title="Refresh" onClick={refetch}><Icon name="refresh" size={13} /></button>
@@ -276,6 +297,12 @@ export default function Sources() {
               <div style={{ padding: "10px 14px", borderTop: "1px solid var(--border)", flex: "none" }} className="row">
                 <button className="btn btn-secondary btn-sm" onClick={() => toast.push("info", "Open in source", "External navigation requires the backend proxy")}>Open in source <Icon name="external" size={11} /></button>
                 <span className="grow" />
+                {sel.collector !== "—" && (
+                  <>
+                    <button className="btn btn-ghost btn-sm" onClick={() => repairCollector(false)} disabled={repairing}><Icon name="chip" size={12} /> Start self-heal</button>
+                    <button className="btn btn-secondary btn-sm" onClick={() => repairCollector(true)} disabled={repairing}><Icon name="check" size={12} /> Approve pending repair</button>
+                  </>
+                )}
                 <button className="btn btn-ghost btn-sm" onClick={runCollector} disabled={running}>
                   <Icon name="refresh" size={12} className={running ? "spin" : undefined} /> {running ? "Queued…" : "Re-run collector"}
                 </button>
@@ -293,13 +320,15 @@ export default function Sources() {
             <>
               <button className="btn btn-ghost" onClick={() => setAddOpen(false)}>Cancel</button>
               <button className="btn btn-primary" onClick={addSource} disabled={creating}>
-                {creating ? "Creating…" : "Create collector"}
+                {creating ? "Registering…" : "Register source"}
               </button>
             </>
           }
         >
           <div className="col" style={{ gap: 12 }}>
             <div className="field"><label>URL</label><input ref={domainRef} className="input mono" placeholder="https://www.retailer.com/appliances/refrigerators" autoFocus /></div>
+            <div className="field"><label>Custom Scraper Studio collector ID</label><input className="input mono" value={collector} onChange={(e) => setCollector(e.target.value.trim())} placeholder="c_... (created in Bright Data Scraper Studio)" /></div>
+            <div className="field"><label>Product query / model</label><input className="input" value={sourceQuery} onChange={(e) => setSourceQuery(e.target.value)} placeholder="Samsung RF28T5001SR refrigerator" /></div>
             <div className="row" style={{ gap: 10 }}>
               <div className="field grow">
                 <label>Category</label>

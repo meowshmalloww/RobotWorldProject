@@ -2,13 +2,11 @@ import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { Card } from "../components/ui/Card";
 import { Icon } from "../components/ui/Icon";
-import { Badge, InspSection, Menu, MenuItem, Segmented, VecInput } from "../components/ui/controls";
+import { Badge, InspSection, Menu, MenuItem, VecInput } from "../components/ui/controls";
 import { Tree, type TreeNodeData } from "../components/ui/Tree";
 import { Modal } from "../components/ui/Modal";
 import { useToast } from "../components/ui/Toast";
 import { Viewport } from "../components/three/Viewport";
-import { CabinetAsset } from "../components/three/Cabinet";
-import { Refrigerator } from "../components/three/Appliances";
 import { api, ApiError, downloadApiFile } from "../lib/api";
 import { useApi } from "../lib/useApi";
 import { EmptyState, ErrorState, Skeleton } from "../lib/states";
@@ -36,7 +34,6 @@ export default function AssetDetail() {
   const [retiring, setRetiring] = useState(false);
   const [part, setPart] = useState<string | null>("body");
   const [turntable, setTurntable] = useState(true);
-  const [wireframe, setWireframe] = useState(false);
   const [doorOpen, setDoorOpen] = useState(0.65);
   const [pos, setPos] = useState<[string, string, string]>(["1.842", "0.000", "0.000"]);
   const [rot, setRot] = useState<[string, string, string]>(["0.000", "0.000", "90.000"]);
@@ -132,7 +129,6 @@ export default function AssetDetail() {
     }
   };
 
-  const isFridge = asset.id.startsWith("refrigerator");
   const selectedPartName = findPartName(asset.parts, part) ?? "Body";
 
   return (
@@ -223,11 +219,6 @@ export default function AssetDetail() {
           flush
           right={
             <span className="row" style={{ gap: 7 }}>
-              <Segmented
-                options={[{ value: "pbr", label: "PBR" }, { value: "wire", label: "Wireframe" }]}
-                value={wireframe ? "wire" : "pbr"}
-                onChange={(v) => setWireframe(v === "wire")}
-              />
               <button
                 className="btn btn-ghost btn-sm"
                 onClick={() => setTurntable(!turntable)}
@@ -242,37 +233,14 @@ export default function AssetDetail() {
             <Viewport
               camera={{ position: [1.5, 1.35, 1.9], fov: 38 }}
               target={[0, 0.5, 0]}
+              doorAngle={doorOpen * 75}
               style={{ height: 392 }}
               gizmo={false}
               autoRotate={turntable}
               grid
-            >
-              {/* studio turntable disc */}
-              <mesh position={[0, -0.045, 0]} receiveShadow>
-                <cylinderGeometry args={[1.05, 1.12, 0.09, 48]} />
-              </mesh>
-              <mesh position={[0, 0.001, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-                <ringGeometry args={[1.02, 1.07, 48]} />
-                <meshStandardMaterial color="#4C86E8" emissive="#4C86E8" emissiveIntensity={0.35} transparent opacity={0.45} />
-              </mesh>
-              <group position={[0, isFridge ? 0 : 0.375, 0]}>
-                {isFridge ? (
-                  <Refrigerator doorOpen={doorOpen} />
-                ) : (
-                  <CabinetAsset leftOpen={doorOpen} rightOpen={0} wireframe={wireframe} />
-                )}
-              </group>
-            </Viewport>
-            {/* viewport bottom toolbar */}
+            />
             <div className="vp-overlay" style={{ left: "50%", bottom: 18, transform: "translateX(-50%)" }}>
-              <div className="vp-toolbar">
-                <button title="Reset view"><Icon name="reset" size={13} /></button>
-                <button title="Pan"><Icon name="hand" size={13} /></button>
-                <button title="Move"><Icon name="move" size={13} /></button>
-                <button title="Rotate"><Icon name="rotate" size={13} /></button>
-                <span className="sep" />
-                <button title="Frame selection"><Icon name="maximize" size={13} /></button>
-              </div>
+              <span className="vp-chip">Drag to orbit · wheel to zoom</span>
             </div>
           </div>
           {/* door articulation slider — real kinematic control */}
@@ -331,9 +299,8 @@ export default function AssetDetail() {
             <InspSection title="Tags">
               <div className="row wrap" style={{ gap: 5 }}>
                 {asset.tags.map((t) => (
-                  <span key={t} className="tag">{t}<button aria-label={`Remove ${t}`}><Icon name="x" size={9} /></button></span>
+                  <span key={t} className="tag">{t}</span>
                 ))}
-                <button className="tag-add" title="Add tag"><Icon name="plus" size={10} /></button>
               </div>
             </InspSection>
           </div>
@@ -387,8 +354,6 @@ export default function AssetDetail() {
                   </>
                 )}
                 <span className="micro t3">Last evaluation: {asset.lastEval}</span>
-                <span className="grow" />
-                <CardLinkSmall>View logs</CardLinkSmall>
               </div>
             </>
           ) : (
@@ -457,12 +422,6 @@ function Ring({ value, color, label }: { value: number; color: string; label: st
         {label}
       </text>
     </svg>
-  );
-}
-
-function CardLinkSmall({ children }: { children: React.ReactNode }) {
-  return (
-    <a className="card-link" style={{ cursor: "pointer", fontSize: "var(--fs-small)" }}>{children}</a>
   );
 }
 

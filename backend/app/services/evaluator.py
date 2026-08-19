@@ -38,7 +38,7 @@ def sample_scenario(family_name: str, skill_id: str, rng: np.random.Generator) -
         "handle_height": float(rng.uniform(*gen["handle_height"])),
         "handle_orientation": gen["handle_orientation"],
         "max_open_deg": 110.0,
-        "robot_base": (0.68, 1.05),
+        "robot_base": simcore.robot_base_for_asset(simcore.FRIDGE_SPEC),
     }
 
 
@@ -65,7 +65,6 @@ async def evaluate_skill(
     *,
     policy: str = "scripted-v1",
     episodes_per_family: int = 4,
-    policy_model=None,
     job_id: str | None = None,
 ) -> dict[str, Any]:
     """Run real rollouts across all families; persist Evaluation rows."""
@@ -83,12 +82,19 @@ async def evaluate_skill(
                 )[:episodes_per_family]
                 for scen in scen_rows:
                     t0 = time.time()
-                    world = simcore.World(scen.params)
-                    if policy_model is not None:
-                        ctrl = simcore.PolicyController(world, policy_model)
-                        r = simcore.run_rollout(world, lambda _w: ctrl, record=False)
-                    else:
+                    with span(
+                        "robot.evaluation.episode",
+                        skill=skill_id,
+                        family=fam.family,
+                        scenario=scen.id,
+                        policy=policy,
+                    ) as episode_span:
+                        world = simcore.World(scen.params)
                         r = simcore.run_rollout(world, simcore.ScriptedController)
+                        episode_span.set_attribute("robot.success", r.success)
+                        episode_span.set_attribute("robot.failure_mode", r.failure_mode or "none")
+                        episode_span.set_attribute("robot.door_angle_deg", r.door_angle_deg)
+                        episode_span.set_attribute("robot.collisions", r.collisions)
                     ev = Evaluation(
                         id=new_id("ev"),
                         run_id=run_id,
@@ -104,7 +110,7 @@ async def evaluate_skill(
                         failure_detail=r.failure_detail,
                     )
                     session.add(ev)
-                    emit_metric("robot.evaluation", 1.0, skill=skill_id, success=str(r.success))
+                    emit_metric("robot.evaluation", 1.0, skill=skill_id, success=str(r.success), policy=policy)
                     if r.success:
                         emit_metric("skill.success", 1.0, skill=skill_id)
                     else:

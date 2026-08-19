@@ -22,8 +22,8 @@ from ..db import SessionLocal
 from ..models import Artifact, Asset, CompileStage, Source
 from ..telemetry import span
 from ..util import new_id
-from . import brightdata, events, geometry, usda
-from .simcore import World, ScriptedController, run_rollout
+from . import brightdata, events, geometry, trellis, usda
+from .simcore import World, ScriptedController, robot_base_for_asset, run_rollout
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +98,65 @@ async def _gather_spec(query: str, source_id: str | None) -> tuple[dict[str, Any
     Returns (spec, provenance, photos)."""
     provenance: list[str] = []
     photos: list[dict] = []
+    # When a source is explicitly selected, its validated Scraper Studio rows
+    # are authoritative.  Do not silently bypass them with reference data.
+    if source_id:
+        async with SessionLocal() as session:
+            source = await session.get(Source, source_id)
+        if source is None:
+            raise ValueError(f"unknown source '{source_id}'")
+        detail = source.detail or {}
+        rows = detail.get("rawRows") or []
+        if not rows or source.completeness < 50:
+            raise ValueError("Selected Scraper Studio source has no sufficiently complete validated rows; run its collector first.")
+        first = rows[0]
+        spec: dict[str, Any] = {}
+
+        def number(*keys: str) -> float | None:
+            for key in keys:
+                value = first.get(key)
+                if isinstance(value, (int, float)):
+                    return float(value)
+                if isinstance(value, str):
+                    match = re.search(r"-?\d+(?:\.\d+)?", value.replace(",", ""))
+                    if match:
+                        return float(match.group())
+            return None
+
+        unit_scale = {
+            "width_m": 1.0, "height_m": 1.0, "depth_m": 1.0,
+            "width_cm": 0.01, "height_cm": 0.01, "depth_cm": 0.01,
+            "width_in": 0.0254, "height_in": 0.0254, "depth_in": 0.0254,
+            "width_inches": 0.0254, "height_inches": 0.0254, "depth_inches": 0.0254,
+        }
+        for axis in ("width", "height", "depth"):
+            for key in (f"{axis}_m", f"{axis}_cm", f"{axis}_in", f"{axis}_inches"):
+                value = number(key)
+                if value is not None:
+                    spec[f"{axis}_m"] = (value * unit_scale[key], "scraper_studio", 0.95)
+                    break
+        # A combined dimension string is accepted only through the unit-aware
+        # parser; it is never treated as an unlabeled scalar.
+        if not all(key in spec for key in ("width_m", "height_m", "depth_m")):
+            spec.update(parse_dimensions(str(first.get("dimensions") or "")))
+        mass = number("mass_kg", "weight_kg")
+        if mass is not None:
+            spec["mass_kg"] = (mass, "scraper_studio", 0.9)
+        for key, aliases in {
+            "manufacturer": ("manufacturer", "brand"),
+            "model": ("model", "model_number", "sku", "mpn"),
+            "category": ("category", "product_type"),
+            "hinge_side": ("hinge_side",),
+        }.items():
+            value = next((first.get(alias) for alias in aliases if first.get(alias)), None)
+            if value is not None:
+                spec[key] = (value, "scraper_studio", 0.95)
+        photos = list(detail.get("photos") or [])
+        provenance = [f"Scraper Studio {source.collector}: https://{source.domain}"]
+        for item in detail.get("provenance") or []:
+            if isinstance(item, list) and len(item) == 2:
+                provenance.append(f"{item[0]}: {item[1]}")
+        return spec, provenance, photos
     # known-product fast path (still real reference data)
     for key, spec in KNOWN_PRODUCTS.items():
         if key.lower() in query.lower():
@@ -137,6 +196,7 @@ async def build_asset(
     kind: str = "articulated",
     source_id: str | None = None,
     manual_spec: dict | None = None,
+    generator: str = "parametric",
     *,
     asset_id: str | None = None,
 ) -> str:
@@ -194,7 +254,15 @@ async def build_asset(
 
     async def do_geometry():
         out = ASSETS_DIR / asset_id / "model.glb"
-        return geometry.build_glb(spec, out)
+        if generator == "parametric":
+            return geometry.build_glb(spec, out)
+        if generator == "trellis2":
+            selected = next((item for item in photos if item.get("state") == "selected" and item.get("url")), None)
+            selected = selected or next((item for item in photos if item.get("url")), None)
+            if selected is None:
+                raise trellis.TrellisError("TRELLIS.2 requires a validated source image; the selected collector returned none.")
+            return await trellis.generate_glb(str(selected["url"]), out)
+        raise ValueError(f"unknown geometry generator '{generator}'")
 
     async def do_usd():
         out = ASSETS_DIR / asset_id / "asset.usda"
@@ -202,14 +270,6 @@ async def build_asset(
 
     async def do_physics_validation() -> dict[str, Any]:
         """Load the compiled MJCF into MuJoCo and run a smoke rollout."""
-        scen = {
-            "door_mass": spec.get("door_mass_kg", 12.0),
-            "hinge_friction": spec.get("hinge_friction", 2.5),
-            "handle_height": spec.get("handle_height_m", 1.05),
-            "handle_orientation": "vertical",
-            "max_open_deg": spec.get("max_open_deg", 110.0),
-            "robot_base": (0.68, 1.05),
-        }
         asset_spec = {
             "width": spec.get("width_m", 0.7),
             "height": spec.get("height_m", 1.7),
@@ -220,9 +280,28 @@ async def build_asset(
             "pos": [0.55, 0.0],
             "handle": {"height": spec.get("handle_height_m", 1.05), "orientation": "vertical", "offset_from_edge": 0.06, "protrude": 0.09},
         }
+        robot_base = robot_base_for_asset(asset_spec)
+        scen = {
+            "door_mass": spec.get("door_mass_kg", 12.0),
+            "hinge_friction": spec.get("hinge_friction", 2.5),
+            "handle_height": spec.get("handle_height_m", 1.05),
+            "handle_orientation": "vertical",
+            "max_open_deg": spec.get("max_open_deg", 110.0),
+            "robot_base": robot_base,
+        }
         world = World(scen, asset_spec)
         r = run_rollout(world, ScriptedController, record=False)
-        return {"success": r.success, "door_deg": r.door_angle_deg, "collisions": r.collisions}
+        return {
+            "success": r.success,
+            "door_deg": round(r.door_angle_deg, 3),
+            "door_peak_deg": round(r.door_peak_deg, 3),
+            "threshold_deg": 60.0,
+            "collisions": r.collisions,
+            "duration_s": round(r.duration_s, 3),
+            "failure_mode": r.failure_mode,
+            "failure_detail": r.failure_detail,
+            "robot_base_xz_m": list(robot_base),
+        }
 
     try:
         parts, vcount = await stage("generate_geometry", do_geometry)
@@ -243,7 +322,7 @@ async def build_asset(
         "properties": {k: ({"value": v[0], "source": v[1], "confidence": v[2]} if isinstance(v, tuple) else v) for k, v in spec_triples.items()},
         "provenance": provenance,
         "photos": photos,
-        "geometry": {"vertices": vcount},
+        "geometry": {"vertices": vcount, "generator": generator},
         "openusdValidated": usd_validated,
         "physicsValidation": validation,
     }

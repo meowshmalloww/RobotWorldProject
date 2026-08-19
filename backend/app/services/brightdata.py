@@ -7,6 +7,7 @@ Auth: `Authorization: Bearer <API_KEY>` against https://api.brightdata.com.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import urllib.parse
@@ -80,6 +81,42 @@ async def _send(method: str, url: str, **kwargs: Any) -> httpx.Response:
     raise BrightDataError("Bright Data request failed") from last_error
 
 
+def _decode_request_response(response: httpx.Response, fmt: str) -> Any:
+    """Normalize both documented Bright Data ``/request`` response shapes.
+
+    SERP zones can return the parsed result directly or a gateway envelope of
+    ``{status_code, headers, body}``.  In the latter shape ``body`` is commonly
+    a JSON-encoded string even when ``format=json`` was requested.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text if fmt == "raw" else {"raw": response.text}
+
+    if isinstance(payload, dict) and "status_code" in payload and "body" in payload:
+        try:
+            upstream_status = int(payload["status_code"])
+        except (TypeError, ValueError):
+            raise BrightDataError("Bright Data returned an invalid upstream status code.") from None
+        if not 200 <= upstream_status < 300:
+            detail = str(payload.get("body") or "")[:300]
+            raise BrightDataError(f"Bright Data upstream target failed ({upstream_status}): {detail}")
+
+        body = payload["body"]
+        if fmt == "raw":
+            return body if isinstance(body, str) else json.dumps(body)
+        if isinstance(body, (dict, list)):
+            return body
+        if isinstance(body, str):
+            try:
+                return json.loads(body)
+            except ValueError:
+                return {"raw": body}
+        return body
+
+    return response.text if fmt == "raw" else payload
+
+
 async def _request(zone: str, url: str, fmt: str = "json") -> Any:
     """POST /request — used by both SERP API and Web Unlocker (zone decides)."""
     creds = await _creds()
@@ -93,12 +130,7 @@ async def _request(zone: str, url: str, fmt: str = "json") -> Any:
         raise BrightDataError("Bright Data authentication failed — check the API key.")
     if r.status_code >= 400:
         raise BrightDataError(f"Bright Data request failed ({r.status_code}): {r.text[:300]}")
-    if fmt == "raw":
-        return r.text
-    try:
-        return r.json()
-    except ValueError:
-        return {"raw": r.text}
+    return _decode_request_response(r, fmt)
 
 
 async def google_search(query: str, *, country: str = "us", language: str = "en") -> dict:
@@ -164,13 +196,15 @@ async def unlock(url: str, *, render: bool = False, markdown: bool = False) -> A
         )
         if r.status_code >= 400:
             raise BrightDataError(f"Web Unlocker failed ({r.status_code}): {r.text[:300]}")
-        return r.text
+        return _decode_request_response(r, "raw")
 
 
 # ---- Scraper Studio (DCA) -------------------------------------------------
 
 async def dca_trigger(collector: str, inputs: list[dict]) -> str:
     """Batch collection: POST /dca/trigger?collector=c_*&queue_next=1 → collection_id (j_*)."""
+    if not collector.startswith("c_"):
+        raise BrightDataError("Scraper Studio collector IDs must start with 'c_'.")
     creds = await _creds()
     r = await _send(
         "POST",
@@ -216,26 +250,61 @@ async def dca_run_and_wait(collector: str, inputs: list[dict], *, timeout_s: flo
 
 async def dca_heal(collector: str, note: str, url: str) -> dict:
     """Self-healing: POST /dca/collectors/{c_*}/refactor_template → awaiting_approval + preview."""
+    if not collector.startswith("c_"):
+        raise BrightDataError("Scraper Studio collector IDs must start with 'c_'.")
     creds = await _creds()
     r = await _send(
         "POST",
         f"{API}/dca/collectors/{collector}/refactor_template",
         headers={"Authorization": f"Bearer {creds['key']}", "Content-Type": "application/json"},
-        json={"note": note, "url": url},
+        json={"prompt": note, "custom_input": [{"url": url}]},
     )
     if r.status_code >= 400:
         raise BrightDataError(f"DCA heal failed ({r.status_code}): {r.text[:300]}")
     return r.json()
 
 
-async def dca_approve(collector: str, url: str, approve: bool = True) -> dict:
+async def dca_heal_progress(collector: str) -> dict:
+    """Return the current AI refactor job state for a collector."""
+    creds = await _creds()
+    r = await _send(
+        "GET",
+        f"{API}/dca/collectors/{collector}/refactor_template/progress",
+        headers={"Authorization": f"Bearer {creds['key']}"},
+    )
+    if r.status_code >= 400:
+        raise BrightDataError(f"DCA heal progress failed ({r.status_code}): {r.text[:300]}")
+    return r.json()
+
+
+async def dca_wait_for_heal(collector: str, *, timeout_s: float = 600.0, stop_at_approval: bool = True) -> dict:
+    """Poll a billable AI refactor with bounded backoff.
+
+    Bright Data status names have changed over time, so terminal detection is
+    deliberately explicit and the full response is preserved for evidence.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    wait = 3.0
+    while asyncio.get_event_loop().time() < deadline:
+        progress = await dca_heal_progress(collector)
+        status = str(progress.get("status") or progress.get("state") or progress.get("stage") or "").lower()
+        if stop_at_approval and status in {"pending_answer", "awaiting_approval", "waiting_for_approval"}:
+            return progress
+        if status in {"completed", "complete", "done", "success", "failed", "error", "cancelled"}:
+            return progress
+        await asyncio.sleep(wait)
+        wait = min(wait * 1.5, 15.0)
+    raise BrightDataError(f"Collector {collector} self-heal timed out after {timeout_s:.0f}s")
+
+
+async def dca_approve(collector: str, approve: bool = True, *, auto_save: bool = True) -> dict:
     """POST /dca/collectors/{c_*}/resume_automation_job — approve or reject a heal."""
     creds = await _creds()
     r = await _send(
         "POST",
         f"{API}/dca/collectors/{collector}/resume_automation_job",
         headers={"Authorization": f"Bearer {creds['key']}", "Content-Type": "application/json"},
-        json={"url": url, "approve": approve},
+        json={"message": approve, "auto_save": auto_save if approve else False},
     )
     if r.status_code >= 400:
         raise BrightDataError(f"DCA approve failed ({r.status_code}): {r.text[:300]}")

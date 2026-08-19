@@ -8,6 +8,7 @@ declare global {
       toggleMaximize: () => void;
       close: () => void;
       isMaximized: () => Promise<boolean>;
+      openExternal: (url: string) => Promise<boolean>;
       onMaximizedChange: (cb: (v: boolean) => void) => () => void;
     };
   }

@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * Drag handle between docked panels. `onDelta` receives the horizontal
@@ -81,11 +81,18 @@ export function PanelRail({
 }
 
 /** Panel width state with clamp. */
-export function usePanelSize(initial: number, min: number, max: number) {
-  const [size, setSize] = useState(initial);
+export function usePanelSize(initial: number, min: number, max: number, storageKey?: string) {
+  const [size, setSize] = useState(() => {
+    if (!storageKey) return initial;
+    const stored = Number(window.localStorage.getItem(storageKey));
+    return Number.isFinite(stored) ? Math.max(min, Math.min(max, stored)) : initial;
+  });
   const apply = useCallback(
     (next: number) => setSize(Math.max(min, Math.min(max, next))),
     [min, max],
   );
+  useEffect(() => {
+    if (storageKey) window.localStorage.setItem(storageKey, String(size));
+  }, [size, storageKey]);
   return [size, apply] as const;
 }

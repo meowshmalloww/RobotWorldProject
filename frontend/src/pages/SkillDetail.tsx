@@ -13,7 +13,6 @@ import { useApi } from "../lib/useApi";
 import { EmptyState, ErrorState, Skeleton } from "../lib/states";
 import { fmtInt } from "../lib/format";
 import { Viewport } from "../components/three/Viewport";
-import { WarehouseKitchen } from "../components/three/WarehouseKitchen";
 import type { SkillDetail as SkillDetailT } from "../data/types";
 
 const IMPACT_TONE = { high: ["var(--red-soft)", "var(--red)"], medium: ["var(--amber-soft)", "var(--amber)"], low: ["var(--green-soft)", "var(--green)"] } as const;
@@ -160,7 +159,7 @@ export default function SkillDetail() {
         </Card>
 
         {/* Curriculum plan */}
-        <Card title="Curriculum Plan" info right={<CardLink>View plan</CardLink>} flush>
+        <Card title="Curriculum Plan" info flush>
           <div style={{ padding: "6px 14px 4px" }} className="micro t3">Recommended next scenario families</div>
           {d.curriculum.map((c) => (
             <div key={c.rank} className="row" style={{ gap: 10, padding: "8px 14px", borderTop: "1px solid rgba(148,170,220,0.05)" }}>
@@ -232,7 +231,6 @@ export default function SkillDetail() {
             right={
               <span className="row" style={{ gap: 6 }}>
                 <Badge tone="grey">Preview</Badge>
-                <button className="icon-btn btn-sm"><Icon name="dots" size={13} /></button>
               </span>
             }
           >
@@ -243,9 +241,8 @@ export default function SkillDetail() {
                 style={{ height: 210 }}
                 gizmo={false}
                 dpr={[1, 1.4]}
-              >
-                <WarehouseKitchen cabinetDoorOpen={{ left: 0.7 }} />
-              </Viewport>
+                doorAngle={52}
+              />
             </div>
             <div className="col" style={{ padding: "0 14px 12px", gap: 5 }}>
               {[
@@ -261,7 +258,7 @@ export default function SkillDetail() {
             </div>
           </Card>
 
-          <Card title="Recent Evaluation Rollouts" right={<CardLink>View all</CardLink>}>
+          <Card title="Recent Evaluation Rollouts">
             <RolloutStrip />
             <div className="col" style={{ gap: 6, marginTop: 10 }}>
               <div className="row between small">
@@ -315,7 +312,7 @@ export default function SkillDetail() {
               <thead>
                 <tr>
                   <th>Family</th><th style={{ textAlign: "right" }}>Count</th><th style={{ width: 170 }}>Success</th>
-                  <th style={{ width: 150 }}>Coverage</th><th>Source</th><th>Status</th><th>Updated</th><th style={{ width: 30 }} />
+                  <th style={{ width: 150 }}>Coverage</th><th>Source</th><th>Status</th><th>Updated</th>
                 </tr>
               </thead>
               <tbody>
@@ -338,7 +335,6 @@ export default function SkillDetail() {
                     <td className="t-muted">{f.source}</td>
                     <td><StatusBadge status={f.status} /></td>
                     <td className="t-muted mono" style={{ fontSize: "var(--fs-small)" }}>{f.updated}</td>
-                    <td><button className="icon-btn btn-sm"><Icon name="dots" size={13} /></button></td>
                   </tr>
                 ))}
               </tbody>
@@ -366,14 +362,13 @@ function RolloutStrip() {
           <Viewport
             camera={{ position: r.cam, fov: 46 }}
             target={[0.3, 1.1, -3.1]}
+            doorAngle={r.door * 75}
             style={{ height: "100%", borderRadius: 0 }}
             gizmo={false}
             controls={false}
             shadows={false}
             dpr={[0.6, 0.9]}
-          >
-            <WarehouseKitchen cabinetDoorOpen={{ left: r.door }} />
-          </Viewport>
+          />
           <span
             style={{
               position: "absolute", right: 5, bottom: 5, width: 16, height: 16, borderRadius: "50%",

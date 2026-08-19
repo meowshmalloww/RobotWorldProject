@@ -1,60 +1,30 @@
-import { Canvas, useThree } from "@react-three/fiber";
-import { GizmoHelper, GizmoViewport, Grid, OrbitControls } from "@react-three/drei";
-import * as THREE from "three";
-import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
-import { useEffect, type ReactNode } from "react";
-import type { RenderVariant } from "./materials";
-import { FlyControls } from "./FlyControls";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent, type WheelEvent } from "react";
 
-/** PBR environment — PMREM of three's RoomEnvironment, fully offline. */
-function EnvSetup() {
-  const { gl, scene } = useThree();
-  useEffect(() => {
-    const pmrem = new THREE.PMREMGenerator(gl);
-    const env = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-    scene.environment = env;
-    scene.environmentIntensity = 0.7;
-    return () => {
-      scene.environment = null;
-      env.dispose();
-      pmrem.dispose();
-    };
-  }, [gl, scene]);
-  return null;
-}
+export type RenderVariant = "rgb" | "seg" | "depth";
 
-/** Aim the camera at the target when OrbitControls are disabled. */
-function CameraLookAt({ target }: { target: [number, number, number] }) {
-  const { camera } = useThree();
-  useEffect(() => {
-    camera.lookAt(new THREE.Vector3(...target));
-    camera.updateProjectionMatrix();
-  }, [camera, target]);
-  return null;
+interface CameraState {
+  yaw: number;
+  pitch: number;
+  distance: number;
 }
 
 /**
- * Shared 3D viewport. RGB mode uses studio + warehouse lighting with soft
- * shadows; seg/depth modes use flat lighting so IDs/depth read cleanly.
+ * Native Vulkan viewport. The React client presents PNG frames only; pygfx and
+ * wgpu-native perform all scene rasterization in the FastAPI process with the
+ * backend forced to Vulkan. This component deliberately has no WebGL fallback.
  */
 export function Viewport({
-  children,
   camera = { position: [2.6, 2.1, 1.8] as [number, number, number], fov: 42 },
   target = [-0.2, 0.9, -2.6] as [number, number, number],
   variant = "rgb",
-  shadows = true,
-  grid = false,
-  gizmo = true,
   controls = true,
-  dpr = [1, 1.75] as [number, number],
   onPointerMissed,
   className,
   style,
-  fov,
   autoRotate = false,
-  fly = false,
+  scene = "kitchen",
+  doorAngle = 0,
 }: {
-  children: ReactNode;
   camera?: { position: [number, number, number]; fov?: number };
   target?: [number, number, number];
   variant?: RenderVariant;
@@ -65,89 +35,157 @@ export function Viewport({
   dpr?: [number, number];
   onPointerMissed?: () => void;
   className?: string;
-  style?: React.CSSProperties;
+  style?: CSSProperties;
   fov?: number;
   autoRotate?: boolean;
   fly?: boolean;
+  scene?: "kitchen" | "factory";
+  doorAngle?: number;
 }) {
-  const flat = variant !== "rgb";
+  const initial = useMemo<CameraState>(() => {
+    const dx = camera.position[0] - target[0];
+    const dy = camera.position[1] - target[1];
+    const dz = camera.position[2] - target[2];
+    const distance = Math.max(5, Math.hypot(dx, dy, dz) * 2.15);
+    return {
+      yaw: Math.atan2(dx, dz) * 180 / Math.PI,
+      pitch: Math.asin(Math.max(-1, Math.min(1, dy / Math.max(Math.hypot(dx, dy, dz), 0.001)))) * 180 / Math.PI,
+      distance,
+    };
+  }, [camera.position, target]);
+  const host = useRef<HTMLDivElement>(null);
+  const drag = useRef<{ x: number; y: number; yaw: number; pitch: number } | null>(null);
+  const imageRef = useRef<string | null>(null);
+  const [view, setView] = useState(initial);
+  const [renderView, setRenderView] = useState(initial);
+  const [size, setSize] = useState({ width: 960, height: 540 });
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [backend, setBackend] = useState<string>("checking");
+
+  useEffect(() => {
+    const node = host.current;
+    if (!node) return;
+    const observer = new ResizeObserver(([entry]) => {
+      const width = Math.max(320, Math.min(1400, Math.round(entry.contentRect.width)));
+      const height = Math.max(180, Math.min(900, Math.round(entry.contentRect.height)));
+      setSize((old) => old.width === width && old.height === height ? old : { width, height });
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setRenderView(view), 70);
+    return () => window.clearTimeout(timer);
+  }, [view]);
+
+  useEffect(() => {
+    if (!autoRotate) return;
+    const timer = window.setInterval(() => setView((old) => ({ ...old, yaw: old.yaw + 0.35 })), 40);
+    return () => window.clearInterval(timer);
+  }, [autoRotate]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch("/api/render/vulkan/probe", { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `HTTP ${response.status}`);
+        return response.json() as Promise<{ backend: string; device: string }>;
+      })
+      .then((data) => setBackend(`${data.backend} · ${data.device}`))
+      .catch((reason) => {
+        if (reason?.name !== "AbortError") setError(`Vulkan unavailable: ${reason instanceof Error ? reason.message : String(reason)}`);
+      });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    if (variant === "depth") {
+      setLoading(false);
+      setError("Depth view requires a calibrated sensor stream; no synthetic depth frame is substituted.");
+      return;
+    }
+    const query = new URLSearchParams({
+      scene,
+      width: String(size.width),
+      height: String(size.height),
+      yaw: renderView.yaw.toFixed(2),
+      pitch: renderView.pitch.toFixed(2),
+      distance: renderView.distance.toFixed(2),
+      doorAngle: String(Math.max(0, Math.min(120, doorAngle))),
+      variant,
+    });
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setLoading(true);
+      fetch(`/api/render/vulkan/frame?${query}`, { signal: controller.signal })
+        .then(async (response) => {
+          if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `HTTP ${response.status}`);
+          return response.blob();
+        })
+        .then((blob) => {
+          const next = URL.createObjectURL(blob);
+          if (imageRef.current) URL.revokeObjectURL(imageRef.current);
+          imageRef.current = next;
+          setImageUrl(next);
+          setError(null);
+        })
+        .catch((reason) => {
+          if (reason?.name !== "AbortError") setError(reason instanceof Error ? reason.message : String(reason));
+        })
+        .finally(() => setLoading(false));
+    }, 35);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [doorAngle, renderView, scene, size, variant]);
+
+  useEffect(() => () => {
+    if (imageRef.current) URL.revokeObjectURL(imageRef.current);
+  }, []);
+
+  const pointerDown = (event: PointerEvent<HTMLDivElement>) => {
+    if (!controls) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    drag.current = { x: event.clientX, y: event.clientY, yaw: view.yaw, pitch: view.pitch };
+  };
+  const pointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    if (!drag.current) return;
+    setView((old) => ({
+      ...old,
+      yaw: drag.current!.yaw - (event.clientX - drag.current!.x) * 0.24,
+      pitch: Math.max(-8, Math.min(70, drag.current!.pitch + (event.clientY - drag.current!.y) * 0.18)),
+    }));
+  };
+  const pointerUp = (event: PointerEvent<HTMLDivElement>) => {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    drag.current = null;
+  };
+  const wheel = (event: WheelEvent<HTMLDivElement>) => {
+    if (!controls) return;
+    setView((old) => ({ ...old, distance: Math.max(4, Math.min(28, old.distance + event.deltaY * 0.012)) }));
+  };
+
   return (
-    <div className={`viewport ${className ?? ""}`} style={style}>
-      <Canvas
-        shadows={shadows && !flat ? "basic" : false}
-        dpr={dpr}
-        camera={{ position: camera.position, fov: camera.fov ?? fov ?? 42 }}
-        gl={{
-          antialias: true,
-          toneMapping: flat ? THREE.NoToneMapping : THREE.ACESFilmicToneMapping,
-          toneMappingExposure: 1.2,
-          preserveDrawingBuffer: true,
-        }}
-        onPointerMissed={onPointerMissed}
-        style={{ background: variant === "depth" ? "#000000" : "#1A1A1A" }}
-      >
-        {flat ? (
-          <ambientLight intensity={1.5} />
-        ) : (
-          <>
-            <EnvSetup />
-            <hemisphereLight args={["#D0D0D0", "#262626", 0.55]} />
-            <directionalLight
-              position={[5.5, 7.5, 3.5]}
-              intensity={1.5}
-              castShadow
-              shadow-mapSize={[2048, 2048]}
-              shadow-camera-left={-8}
-              shadow-camera-right={8}
-              shadow-camera-top={8}
-              shadow-camera-bottom={-8}
-              shadow-bias={-0.00035}
-            />
-            <directionalLight position={[-4, 5, -2]} intensity={0.35} color="#C8C8C8" />
-            <pointLight position={[-1.8, 4.2, -1]} intensity={18} color="#E2E2E2" distance={12} decay={2} />
-            <pointLight position={[1.8, 4.2, -1]} intensity={18} color="#E2E2E2" distance={12} decay={2} />
-            <pointLight position={[0.5, 2.6, 2.5]} intensity={7} color="#DDD7D0" distance={9} decay={2} />
-          </>
-        )}
-        {children}
-        {grid && (
-          <Grid
-            position={[0, 0.001, 0]}
-            args={[17, 11]}
-            cellSize={0.5}
-            cellThickness={0.6}
-            cellColor="#282828"
-            sectionSize={2}
-            sectionThickness={1}
-            sectionColor="#383838"
-            fadeDistance={18}
-            fadeStrength={1.4}
-            infiniteGrid={false}
-          />
-        )}
-        {controls ? (
-          <OrbitControls
-            target={target}
-            makeDefault
-            enableDamping
-            dampingFactor={0.08}
-            minDistance={0.4}
-            maxDistance={14}
-            maxPolarAngle={Math.PI / 2 - 0.02}
-            autoRotate={autoRotate}
-            autoRotateSpeed={1.1}
-          />
-        ) : fly ? (
-          <FlyControls enabled />
-        ) : (
-          <CameraLookAt target={target} />
-        )}
-        {gizmo && (
-          <GizmoHelper alignment="bottom-left" margin={[52, 52]}>
-            <GizmoViewport axisColors={["#E5604F", "#5DBB63", "#4C8DFF"]} labelColor="#9AA5BA" />
-          </GizmoHelper>
-        )}
-      </Canvas>
+    <div
+      ref={host}
+      className={`viewport vulkan-viewport ${className ?? ""}`}
+      style={style}
+      onPointerDown={pointerDown}
+      onPointerMove={pointerMove}
+      onPointerUp={pointerUp}
+      onPointerCancel={pointerUp}
+      onDoubleClick={onPointerMissed}
+      onWheel={wheel}
+    >
+      {imageUrl && <img src={imageUrl} alt={`${scene} scene rendered by native Vulkan`} draggable={false} />}
+      {!imageUrl && !error && <div className="vulkan-empty">Initializing native Vulkan renderer…</div>}
+      {error && <div className="vulkan-error"><strong>Viewport unavailable</strong><span>{error}</span></div>}
+      <div className="vulkan-badge"><span className={`dot ${error ? "bad" : ""}`} /> {backend}</div>
+      {loading && imageUrl && <div className="vulkan-loading" aria-label="Rendering frame" />}
     </div>
   );
 }

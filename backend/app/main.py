@@ -13,11 +13,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import mujoco
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, select
@@ -47,7 +48,8 @@ from .models import (
 )
 from .telemetry import drain_loop, init_otel, signoz_exporting, span
 from .util import fmt_duration, new_id, rel_time
-from .services import agent, brightdata, catalog, evaluator, events, live, llm, pipeline, port, settings_store, simcore
+from .services import agent, brightdata, catalog, demo_scenarios, evaluator, events, live, llm, pipeline, port, settings_store, simcore, trellis, vulkan_renderer
+from .services.remote_policy import PolicyClient, PolicyConfig, PolicyError
 
 log = logging.getLogger(__name__)
 STARTED_AT = time.monotonic()
@@ -63,7 +65,7 @@ class AssetBuildIn(BaseModel):
     query: str = Field(min_length=2, max_length=240)
     kind: Literal["articulated", "rigid"] = "articulated"
     sourceId: str | None = None
-    generator: str = "parametric"
+    generator: Literal["parametric", "trellis2"] = "parametric"
     families: list[str] = []
     manualSpec: dict[str, Any] | None = None
 
@@ -82,6 +84,22 @@ class SourceIn(BaseModel):
             raise ValueError("enter a valid source domain")
         return value
 
+    @field_validator("collector")
+    @classmethod
+    def clean_collector(cls, value: str) -> str:
+        value = value.strip()
+        if value and not value.startswith("c_"):
+            raise ValueError("Scraper Studio collector IDs start with 'c_'")
+        return value
+
+
+class SourceRepairIn(BaseModel):
+    prompt: str = Field(
+        default="Repair the extractor so every row contains model, dimensions, source URL, and at least one product image.",
+        min_length=12,
+        max_length=1000,
+    )
+
 
 class VariantIn(BaseModel):
     name: str = Field(min_length=1, max_length=160)
@@ -97,12 +115,12 @@ class KeyIn(BaseModel):
     key: str = Field(min_length=1, max_length=8000)
 
 
-class TrainingIn(BaseModel):
-    policy: str = Field(default="bc-mlp-v1", max_length=120)
-    curriculum: str = Field(default="agent recommended", max_length=200)
-    worlds: int = Field(default=12, ge=1, le=10000)
-    iterations: int = Field(default=40, ge=1, le=10000)
-    skillId: str = "open-refrigerator"
+class EvalSessionIn(BaseModel):
+    evaluationType: Literal["asset_validation", "policy_evaluation"] = "asset_validation"
+
+
+class DemoRunIn(BaseModel):
+    seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
 
 
 async def _integration_config() -> dict[str, Any]:
@@ -118,7 +136,7 @@ async def _integration_config() -> dict[str, Any]:
             )
         ),
         "brightdata": bool(flat.get("integrations.brightdata.enabled") and flat.get("integrations.brightdata.apiKey")),
-        "signoz": bool(flat.get("integrations.signoz.enabled") and flat.get("integrations.signoz.ingestionKey")),
+        "signoz": bool(flat.get("integrations.signoz.enabled") and flat.get("integrations.signoz.endpoint")),
         "signozQuery": bool(flat.get("integrations.signoz.queryEndpoint") and flat.get("integrations.signoz.apiKey")),
         "model": bool(flat.get("models.openaiKey") or local_model),
     }
@@ -213,7 +231,7 @@ LOOP_STAGES = [
     {"icon": "sources", "title": "Query sources", "desc": "Retrieve product specifications and provenance"},
     {"icon": "cube", "title": "Compile asset", "desc": "Generate GLB, MJCF, and validated OpenUSD"},
     {"icon": "scale", "title": "Validate physics", "desc": "Load and test articulation in MuJoCo"},
-    {"icon": "training", "title": "Train or test", "desc": "Adapt the policy from successful trajectories"},
+    {"icon": "training", "title": "Attach policy", "desc": "Pin a compatible external VLA checkpoint; training stays disabled"},
     {"icon": "refresh", "title": "Re-evaluate", "desc": "Persist measured improvement and repeat"},
 ]
 
@@ -258,9 +276,8 @@ async def overview():
     ]
     configured = await _integration_config()
     integrations = [
-        {"key": "port", "name": "Port", "desc": "Catalog and lifecycle control", "status": "Configured" if configured["port"] else "Setup required", "meta": "local results stay durable"},
         {"key": "brightdata", "name": "Bright Data", "desc": "Real-world source collection", "status": "Configured" if configured["brightdata"] else "Setup required", "meta": "no synthetic source fallback"},
-        {"key": "signoz", "name": "SigNoz", "desc": "OpenTelemetry export and queries", "status": "Exporting" if signoz_exporting() else "Local mirror", "meta": "SQLite telemetry active"},
+        {"key": "signoz", "name": "SigNoz Community", "desc": "Self-hosted OpenTelemetry and queries", "status": "Enabled" if configured["signoz"] else "Local mirror", "meta": "use the live probe to verify delivery"},
     ]
     source_top = sorted(sources, key=lambda item: item.items, reverse=True)[:4]
     return {
@@ -357,7 +374,7 @@ async def _job_runner(job_id: str, work) -> None:
         async with SessionLocal() as db:
             row = await db.get(Job, job_id)
             if row:
-                row.status = "success"
+                row.status = "blocked" if isinstance(result, dict) and str(result.get("outcome", "")).startswith("awaiting_") else "success"
                 row.detail = {**row.detail, "result": result}
                 await db.commit()
 
@@ -371,6 +388,64 @@ async def _start_job(kind: str, detail: dict[str, Any], work) -> str:
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
     return job_id
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str):
+    async with SessionLocal() as db:
+        row = await db.get(Job, job_id)
+        if row is None:
+            raise HTTPException(404, "Job not found")
+        return {
+            "id": row.id,
+            "kind": row.kind,
+            "status": row.status,
+            "detail": row.detail,
+            "createdAt": row.created_at.isoformat(),
+            "updatedAt": row.updated_at.isoformat(),
+        }
+
+
+@app.get("/api/demo-scenarios")
+async def demo_scenario_definitions():
+    flat = await settings_store.get_flat()
+    try:
+        renderer = await asyncio.to_thread(vulkan_renderer.probe)
+    except vulkan_renderer.VulkanUnavailable as exc:
+        renderer = {"available": False, "error": str(exc)}
+    return {
+        "scenarios": demo_scenarios.definitions(),
+        "readiness": {
+            "vulkan": renderer,
+            "policyConfigured": bool(flat.get("models.policyEndpoint")),
+            "brightDataConfigured": bool(flat.get("integrations.brightdata.apiKey")),
+            "sigNozConfigured": bool(flat.get("integrations.signoz.enabled") and flat.get("integrations.signoz.endpoint")),
+            "trainingEnabled": False,
+        },
+    }
+
+
+@app.post("/api/demo-scenarios/{scenario_id}/runs", status_code=202)
+async def run_demo_scenario(scenario_id: str, payload: DemoRunIn = DemoRunIn()):
+    if scenario_id not in demo_scenarios.SCENARIOS:
+        raise HTTPException(404, "Acceptance scenario not found")
+    job_id = new_id("job")
+    scenario = demo_scenarios.SCENARIOS[scenario_id]
+    async with SessionLocal() as db:
+        db.add(Job(
+            id=job_id,
+            kind="acceptance_scenario",
+            status="pending",
+            detail={"name": scenario["name"], "scenarioId": scenario_id, "requestedSeed": payload.seed, "stages": []},
+        ))
+        await db.commit()
+    task = asyncio.create_task(
+        _job_runner(job_id, demo_scenarios.run(job_id, scenario_id, payload.seed)),
+        name=job_id,
+    )
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+    return {"jobId": job_id, "scenarioId": scenario_id, "status": "pending"}
 
 
 @app.post("/api/agent/run", status_code=202)
@@ -433,8 +508,6 @@ async def assets_list():
 
 @app.post("/api/assets/build", status_code=202)
 async def build_asset(payload: AssetBuildIn):
-    if payload.generator != "parametric":
-        raise HTTPException(501, "This build supports the validated parametric compiler only; no external mesh generator is being simulated.")
     asset_id = new_id("ast")
     async with SessionLocal() as session:
         session.add(
@@ -451,9 +524,9 @@ async def build_asset(payload: AssetBuildIn):
     job_id = await _start_job(
         "asset_build",
         {"name": payload.query, "assetId": asset_id, "stage": "source and compile"},
-        pipeline.build_asset(payload.query, payload.kind, payload.sourceId, payload.manualSpec, asset_id=asset_id),
+        pipeline.build_asset(payload.query, payload.kind, payload.sourceId, payload.manualSpec, payload.generator, asset_id=asset_id),
     )
-    return {"assetId": asset_id, "jobId": job_id, "compiler": "parametric-openusd-mujoco"}
+    return {"assetId": asset_id, "jobId": job_id, "generator": payload.generator, "compiler": "openusd-mujoco"}
 
 
 @app.get("/api/assets/{asset_id}")
@@ -480,9 +553,29 @@ async def asset_reevaluate(asset_id: str):
             "handle_height": float(spec.get("handle_height_m", 1.05)),
             "handle_orientation": "vertical",
             "max_open_deg": float(spec.get("max_open_deg", 110.0)),
-            "robot_base": (0.68, 1.05),
         }
-        result = await asyncio.to_thread(simcore.run_rollout, simcore.World(scenario), simcore.ScriptedController, record=False)
+        asset_spec = {
+            "width": float(spec.get("width_m", 0.7)),
+            "height": float(spec.get("height_m", 1.7)),
+            "depth": float(spec.get("depth_m", 0.65)),
+            "door_width": float(spec.get("door_width_m", 0.35)),
+            "hinge_side": str(spec.get("hinge_side", "left")),
+            "hinge_damping": 1.2,
+            "pos": [0.55, 0.0],
+            "handle": {
+                "height": float(spec.get("handle_height_m", 1.05)),
+                "orientation": "vertical",
+                "offset_from_edge": 0.06,
+                "protrude": 0.09,
+            },
+        }
+        scenario["robot_base"] = simcore.robot_base_for_asset(asset_spec)
+        result = await asyncio.to_thread(
+            simcore.run_rollout,
+            simcore.World(scenario, asset_spec),
+            simcore.ScriptedController,
+            record=False,
+        )
         async with SessionLocal() as db:
             row = await db.get(Asset, asset_id)
             if row:
@@ -581,6 +674,30 @@ async def run_checks():
     return {"physicsChecks": await asyncio.to_thread(_physics_checks)}
 
 
+@app.post("/api/worlds/cameras/probe")
+async def probe_policy_cameras():
+    """Render both learned-policy cameras through the packaged MuJoCo stack."""
+    def render() -> dict[str, Any]:
+        import hashlib
+
+        world = simcore.World(simcore.default_scenario_family(__import__("numpy").random.default_rng(11)))
+        try:
+            cameras = {}
+            for public_name, model_name in (("front", "debug"), ("wrist", "wrist")):
+                rgb = world.render_rgb(model_name, width=256, height=256)
+                cameras[public_name] = {
+                    "shape": list(rgb.shape),
+                    "dtype": str(rgb.dtype),
+                    "sha256": hashlib.sha256(rgb.tobytes()).hexdigest(),
+                    "nonzero": int(__import__("numpy").count_nonzero(rgb)),
+                }
+            return {"renderer": "MuJoCo offscreen", "cameras": cameras}
+        finally:
+            world.close()
+
+    return await asyncio.to_thread(render)
+
+
 @app.post("/api/worlds/variants")
 async def create_variant(payload: VariantIn):
     async with SessionLocal() as session:
@@ -651,34 +768,147 @@ async def source_detail(source_id: str):
         return await catalog.source_detail(session, row)
 
 
+def _source_detail_from_rows(row: Source, rows: list[dict[str, Any]]) -> tuple[dict[str, Any], float]:
+    """Normalize collector output without inventing values.
+
+    Raw rows are retained (bounded) as evidence.  Missing required physical
+    fields reduce completeness and remain missing for downstream validation.
+    """
+    first = rows[0] if rows else {}
+    product = next((first.get(k) for k in ("product", "product_name", "name", "title") if first.get(k)), row.query or row.domain)
+    model = next((first.get(k) for k in ("model", "model_number", "sku", "mpn") if first.get(k)), "—")
+    scalar_skip = {"product", "product_name", "name", "title", "images", "image", "image_url", "photos", "url", "source_url"}
+    specs = [[str(k), str(v)] for k, v in first.items() if k not in scalar_skip and isinstance(v, (str, int, float, bool))][:30]
+    image_values: list[str] = []
+    for key in ("images", "photos", "image", "image_url"):
+        value = first.get(key)
+        if isinstance(value, str):
+            image_values.append(value)
+        elif isinstance(value, list):
+            image_values.extend(str(item.get("url") if isinstance(item, dict) else item) for item in value)
+    image_values = [url for url in image_values if url.startswith(("http://", "https://"))][:8]
+    photos = [
+        {"id": i + 1, "url": url, "score": 100 if i == 0 else 80, "state": "selected" if i == 0 else "candidate", "front": 0, "background": 0, "isolation": 0, "identity": 0}
+        for i, url in enumerate(image_values)
+    ]
+    source_urls = []
+    for item in rows[:50]:
+        url = item.get("source_url") or item.get("url")
+        if isinstance(url, str) and url.startswith(("http://", "https://")) and url not in source_urls:
+            source_urls.append(url)
+    required_aliases = [
+        ("model", "model_number", "sku", "mpn"),
+        ("width_m", "width_cm", "width", "dimensions"),
+        ("height_m", "height_cm", "height", "dimensions"),
+        ("depth_m", "depth_cm", "depth", "dimensions"),
+        ("image", "image_url", "images", "photos"),
+        ("url", "source_url"),
+    ]
+    present = sum(any(first.get(key) not in (None, "", []) for key in aliases) for aliases in required_aliases)
+    completeness = round(100.0 * present / len(required_aliases), 1) if rows else 0.0
+    detail = {
+        "product": str(product),
+        "model": str(model),
+        "specs": specs,
+        "provenance": [["Scraper Studio collector", row.collector], ["Source", row.domain], *[["Row URL", url] for url in source_urls[:5]]],
+        "photos": photos,
+        "rawRows": rows[:50],
+    }
+    return detail, completeness
+
+
+async def _collect_source(source_id: str) -> dict[str, Any]:
+    async with SessionLocal() as db:
+        row = await db.get(Source, source_id)
+        if row is None:
+            raise KeyError("Source not found")
+        collector, domain = row.collector, row.domain
+    if not collector:
+        raise ValueError("This source has no custom Scraper Studio collector ID. Add its c_* ID before running it.")
+    rows = await brightdata.dca_run_and_wait(collector, [{"url": f"https://{domain}"}])
+    if not all(isinstance(item, dict) for item in rows):
+        raise brightdata.BrightDataError("Collector result must be an array of JSON objects.")
+    async with SessionLocal() as db:
+        row = await db.get(Source, source_id)
+        if row is None:
+            raise KeyError("Source not found")
+        detail, completeness = _source_detail_from_rows(row, rows)
+        row.items = len(rows)
+        row.completeness = completeness
+        row.health = "healthy" if rows and completeness >= 80 else "degraded"
+        row.last_run_at = datetime.now(timezone.utc)
+        row.detail = detail
+        await db.commit()
+    return {"items": len(rows), "completeness": completeness, "collector": collector}
+
+
 @app.post("/api/sources/{source_id}/run", status_code=202)
 async def run_source(source_id: str):
+    async with SessionLocal() as session:
+        row = await session.get(Source, source_id)
+        if row is None:
+            raise HTTPException(404, "Source not found")
+        if not row.collector:
+            raise HTTPException(422, "Configure this source's custom Scraper Studio c_* collector before running it.")
+    job_id = await _start_job("source_collection", {"name": source_id, "collector": row.collector}, _collect_source(source_id))
+    return {"jobId": job_id}
+
+
+@app.post("/api/sources/{source_id}/repair", status_code=202)
+async def repair_source(source_id: str, payload: SourceRepairIn):
+    async with SessionLocal() as session:
+        row = await session.get(Source, source_id)
+        if row is None:
+            raise HTTPException(404, "Source not found")
+        if not row.collector:
+            raise HTTPException(422, "A c_* Scraper Studio collector is required for self-healing.")
+        collector, url = row.collector, f"https://{row.domain}"
+
     async def work():
         async with SessionLocal() as db:
-            row = await db.get(Source, source_id)
-            if row is None:
-                raise KeyError("Source not found")
-            collector, domain, query = row.collector, row.domain, row.query
-        if collector:
-            results = await brightdata.dca_run_and_wait(collector, [{"url": f"https://{domain}"}])
-        else:
-            results = [await brightdata.google_search(query or domain)]
-        count = sum(len(item) if isinstance(item, list) else 1 for item in results)
-        async with SessionLocal() as db:
-            row = await db.get(Source, source_id)
-            if row:
-                row.items = count
-                row.completeness = 100.0 if count else 0.0
-                row.health = "healthy" if count else "degraded"
-                row.last_run_at = datetime.now(timezone.utc)
-                row.detail = {"product": row.query or row.domain, "model": "—", "specs": [], "provenance": [["Source", row.domain]], "photos": []}
+            source = await db.get(Source, source_id)
+            if source:
+                source.health = "repairing"
+                db.add(RepairEvent(source_id=source_id, time=datetime.now(timezone.utc).strftime("%H:%M:%S"), title="Schema failure confirmed", desc=payload.prompt, kind="detect"))
                 await db.commit()
-        return {"items": count}
+        await brightdata.dca_heal(collector, payload.prompt, url)
+        progress = await brightdata.dca_wait_for_heal(collector, stop_at_approval=True)
+        state = str(progress.get("status") or progress.get("state") or "awaiting approval")
+        async with SessionLocal() as db:
+            db.add(RepairEvent(source_id=source_id, time=datetime.now(timezone.utc).strftime("%H:%M:%S"), title="Repair preview ready", desc=f"Bright Data state: {state}. Human approval required.", kind="heal"))
+            await db.commit()
+        return {"collector": collector, "state": state, "approvalRequired": True}
 
+    job_id = await _start_job("source_repair", {"name": source_id, "collector": collector, "stage": "awaiting human approval"}, work())
+    return {"jobId": job_id, "approvalRequired": True}
+
+
+@app.post("/api/sources/{source_id}/repair/approve", status_code=202)
+async def approve_source_repair(source_id: str):
     async with SessionLocal() as session:
-        if await session.get(Source, source_id) is None:
+        row = await session.get(Source, source_id)
+        if row is None:
             raise HTTPException(404, "Source not found")
-    job_id = await _start_job("source_collection", {"name": source_id}, work())
+        if not row.collector:
+            raise HTTPException(422, "A c_* Scraper Studio collector is required for approval.")
+        collector = row.collector
+
+    async def work():
+        await brightdata.dca_approve(collector, True, auto_save=True)
+        progress = await brightdata.dca_wait_for_heal(collector, stop_at_approval=False)
+        state = str(progress.get("status") or progress.get("state") or "unknown").lower()
+        if state in {"failed", "error", "cancelled"}:
+            raise brightdata.BrightDataError(f"Collector repair ended in state '{state}'.")
+        async with SessionLocal() as db:
+            db.add(RepairEvent(source_id=source_id, time=datetime.now(timezone.utc).strftime("%H:%M:%S"), title="Repair approved and saved", desc=f"Bright Data state: {state}; rerunning the same collector.", kind="approve"))
+            await db.commit()
+        result = await _collect_source(source_id)
+        async with SessionLocal() as db:
+            db.add(RepairEvent(source_id=source_id, time=datetime.now(timezone.utc).strftime("%H:%M:%S"), title="Collector rerun validated", desc=f"{result['items']} rows; {result['completeness']:.1f}% required-field completeness.", kind="success"))
+            await db.commit()
+        return result
+
+    job_id = await _start_job("source_repair_approval", {"name": source_id, "collector": collector, "stage": "approved and validating"}, work())
     return {"jobId": job_id}
 
 
@@ -715,12 +945,8 @@ async def training_data():
 
 
 @app.post("/api/training/runs", status_code=202)
-async def queue_training(payload: TrainingIn):
-    try:
-        job_id = agent.start(payload.skillId, max(1, min(payload.worlds // 4, 12)))
-    except RuntimeError as exc:
-        raise HTTPException(409, str(exc)) from exc
-    return {"runId": job_id}
+async def queue_training():
+    raise HTTPException(409, "Training is disabled. Configure a pinned external VLA and run policy evaluation; RobotWorld will not train on this workstation.")
 
 
 async def _obs_stats() -> list[dict[str, Any]]:
@@ -884,8 +1110,127 @@ async def sync_port_catalog():
 
 
 @app.post("/api/eval/sessions", status_code=201)
-async def create_eval_session():
-    return live.info(live.create())
+async def create_eval_session(payload: EvalSessionIn = EvalSessionIn()):
+    policy_config = None
+    if payload.evaluationType == "policy_evaluation":
+        try:
+            policy_config = PolicyConfig.from_settings(await settings_store.get_flat())
+        except PolicyError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    return live.info(live.create(evaluation_type=payload.evaluationType, policy_config=policy_config))
+
+
+@app.post("/api/integrations/policy/probe")
+async def probe_policy():
+    """Check checkpoint/embodiment compatibility without running an episode."""
+    try:
+        config = PolicyConfig.from_settings(await settings_store.get_flat())
+        client = PolicyClient(config)
+        try:
+            capabilities = await asyncio.to_thread(client.probe)
+        finally:
+            client.close()
+    except PolicyError as exc:
+        raise HTTPException(502, {"code": exc.code, "message": str(exc)}) from exc
+    return {
+        "compatible": True,
+        "schemaVersion": capabilities["schemaVersion"],
+        "policyId": capabilities["policyId"],
+        "embodiment": capabilities["embodiment"],
+        "checkpointTrainedForEmbodiment": True,
+    }
+
+
+@app.post("/api/integrations/brightdata/probe")
+async def probe_brightdata():
+    """Make one real, billable SERP request and return only sanitized evidence."""
+    query = "robot refrigerator dimensions official"
+    try:
+        result = await brightdata.google_search(query)
+    except brightdata.NotConfigured as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except brightdata.BrightDataError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+    general = result.get("general", {}) if isinstance(result, dict) else {}
+    organic = result.get("organic", []) if isinstance(result, dict) else []
+    domains: list[str] = []
+    for item in organic if isinstance(organic, list) else []:
+        if not isinstance(item, dict):
+            continue
+        host = urlparse(str(item.get("link") or "")).hostname
+        if host and host not in domains:
+            domains.append(host)
+    if general.get("search_engine") != "google" or not domains:
+        raise HTTPException(502, "Bright Data responded, but no valid Google organic results were returned.")
+    return {
+        "connected": True,
+        "provider": "Bright Data SERP API",
+        "searchEngine": "google",
+        "queryMatched": general.get("query") == query,
+        "organicCount": len(organic),
+        "sampleDomains": domains[:5],
+    }
+
+
+@app.post("/api/integrations/trellis/probe")
+async def probe_trellis():
+    try:
+        capabilities = await trellis.probe()
+    except trellis.TrellisError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return {"compatible": True, **capabilities}
+
+
+@app.post("/api/integrations/signoz/probe")
+async def probe_signoz():
+    """Verify the configured Community UI and OTLP receiver."""
+    try:
+        return await signoz.probe()
+    except signoz.NotConfigured as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except signoz.SigNozError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/api/render/vulkan/probe")
+async def probe_vulkan_renderer():
+    try:
+        return await asyncio.to_thread(vulkan_renderer.probe)
+    except vulkan_renderer.VulkanUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.get("/api/render/vulkan/frame", response_class=Response)
+async def render_vulkan_frame(
+    scene: Literal["kitchen", "factory"] = "kitchen",
+    width: int = Query(default=960, ge=320, le=1600),
+    height: int = Query(default=540, ge=180, le=1000),
+    yaw: float = Query(default=34.0, ge=-360.0, le=360.0),
+    pitch: float = Query(default=24.0, ge=-10.0, le=75.0),
+    distance: float = Query(default=12.0, ge=4.0, le=28.0),
+    doorAngle: float = Query(default=0.0, ge=0.0, le=120.0),
+    variant: Literal["rgb", "seg"] = "rgb",
+):
+    request = vulkan_renderer.RenderRequest(
+        scene=scene,
+        width=width,
+        height=height,
+        yaw=yaw,
+        pitch=pitch,
+        distance=distance,
+        door_angle=doorAngle,
+        variant=variant,
+    )
+    try:
+        png = await asyncio.to_thread(vulkan_renderer.render_png, request)
+    except (vulkan_renderer.VulkanUnavailable, ValueError) as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store", "X-RobotWorld-Renderer": "Vulkan"},
+    )
 
 
 @app.get("/api/eval/sessions/{session_id}/replay")

@@ -6,8 +6,10 @@ Endpoint: POST {tenant}/api/v5/query_range with header SIGNOZ-API-KEY.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -21,6 +23,56 @@ class SigNozError(RuntimeError):
 class NotConfigured(SigNozError):
     def __init__(self, message: str | None = None) -> None:
         super().__init__(message or "SigNoz query API not configured — set the API key in Settings → Integrations.")
+
+
+async def probe() -> dict[str, Any]:
+    """Verify the Community UI and OTLP listener independently."""
+    flat = await settings_store.get_flat()
+    ui = str(flat.get("integrations.signoz.queryEndpoint") or "").strip().rstrip("/")
+    otlp = str(flat.get("integrations.signoz.endpoint") or "").strip().rstrip("/")
+    if not ui or not otlp:
+        raise NotConfigured("Set both the SigNoz UI and OTLP HTTP endpoints.")
+    for label, value in (("UI", ui), ("OTLP", otlp)):
+        if not value.startswith(("http://", "https://")):
+            raise NotConfigured(f"SigNoz {label} endpoint must use http:// or https://.")
+
+    try:
+        async with httpx.AsyncClient(timeout=4.0, trust_env=False) as client:
+            response = await client.get(f"{ui}/api/v1/health?live=1")
+    except httpx.HTTPError as exc:
+        raise SigNozError(f"SigNoz Community UI is unreachable at {ui}: {exc}") from exc
+    if response.status_code >= 400:
+        raise SigNozError(f"SigNoz health check failed ({response.status_code}).")
+
+    parsed = urlparse(otlp)
+    if not parsed.hostname:
+        raise NotConfigured("SigNoz OTLP endpoint has no hostname.")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        _reader, writer = await asyncio.wait_for(asyncio.open_connection(parsed.hostname, port), timeout=3.0)
+        writer.close()
+        await writer.wait_closed()
+    except (OSError, asyncio.TimeoutError) as exc:
+        raise SigNozError(f"SigNoz OTLP listener is unreachable at {parsed.hostname}:{port}.") from exc
+
+    version: Any = None
+    try:
+        async with httpx.AsyncClient(timeout=4.0, trust_env=False) as client:
+            version_response = await client.get(f"{ui}/api/v1/version")
+        if version_response.is_success:
+            body = version_response.json()
+            if isinstance(body, dict):
+                version = body.get("version") or body.get("data")
+    except (httpx.HTTPError, ValueError):
+        pass
+    return {
+        "connected": True,
+        "deployment": "community-self-hosted",
+        "uiEndpoint": ui,
+        "otlpEndpoint": otlp,
+        "version": version,
+        "queryKeyConfigured": bool(flat.get("integrations.signoz.apiKey")),
+    }
 
 
 async def _creds() -> tuple[str, str]:

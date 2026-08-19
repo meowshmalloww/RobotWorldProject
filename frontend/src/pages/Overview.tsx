@@ -5,7 +5,6 @@ import { Badge, StatusBadge } from "../components/ui/controls";
 import { StatCard } from "../components/ui/StatCard";
 import { Icon, type IconName } from "../components/ui/Icon";
 import { Viewport } from "../components/three/Viewport";
-import { WarehouseKitchen } from "../components/three/WarehouseKitchen";
 import { pctTone } from "../components/ui/helpers";
 import { useApi } from "../lib/useApi";
 import { EmptyState, ErrorState, Skeleton } from "../lib/states";
@@ -48,7 +47,7 @@ export default function Overview() {
       <div className="page-head">
         <div>
           <h1 className="page-title">Overview</h1>
-          <p className="page-sub">World generation and training pipeline status.</p>
+          <p className="page-sub">World generation, policy readiness, and measured evaluation status. Training is disabled.</p>
         </div>
         <div className="head-actions">
           <button className="btn btn-ghost btn-sm" onClick={refetch} title="Refresh"><Icon name="refresh" size={13} /> Refresh</button>
@@ -102,13 +101,11 @@ export default function Overview() {
               style={{ flex: 1, minHeight: 120 }}
               gizmo={false}
               dpr={[1, 1.5]}
-            >
-              <WarehouseKitchen />
-            </Viewport>
+            />
             <div className="row between" style={{ marginTop: 8 }}>
               <span className="small" style={{ fontWeight: 560 }}>Articulated Door Validation Lab</span>
               <span className="row" style={{ gap: 6 }}>
-                <Badge tone="grey">Three.js scene</Badge>
+                <Badge tone="grey">Native Vulkan</Badge>
                 <button className="btn btn-ghost btn-sm" onClick={() => nav("/worlds")}>
                   Open composer <Icon name="arrowRight" size={11} />
                 </button>

@@ -2,14 +2,13 @@
 
 Builds the compiled MJCF world, runs a real contact-physics episode of the
 mobile manipulator attempting to open the articulated door, records
-observation/action trajectories for behavior cloning, and classifies genuine
+observation/action evidence for replay, and classifies genuine
 failure modes (no_contact / grasp_slip / insufficient_pull / collision /
 timeout) from contact and joint telemetry.
 
-Two controllers:
-  - ScriptedController: state machine + damped-least-squares IK (the expert
-    that supplies demonstration trajectories).
-  - PolicyController:   a trained torch MLP (bc-mlp) evaluated the same way.
+The privileged ScriptedController is a state machine with damped-least-squares
+IK. It is used only for explicitly labelled asset solvability checks. Learned
+policy evaluation uses the separate fail-closed remote VLA boundary.
 """
 from __future__ import annotations
 
@@ -19,6 +18,7 @@ from typing import Any, Callable
 
 import mujoco
 import numpy as np
+from mujoco.rendering.classic.renderer import Renderer
 
 from .mjcf import ARM, build_world
 
@@ -93,6 +93,7 @@ class World:
         self.active_grasp: str | None = None
         self.hand_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand")
         self.door_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "door")
+        self._renderers: dict[tuple[int, int], Renderer] = {}
         self.reset()  # geometry queries must be valid right after construction
 
     # -- grasp assist (sticky grasp: site-to-site ball joint at the bar) ----
@@ -194,7 +195,10 @@ class World:
         cols = [self.model.jnt_dofadr[self.j[k]] for k in ("yaw", "shoulder", "elbow", "wrist")]
         saved_qpos = self.data.qpos.copy()
         pitch_w = 0.6
-        posture_w = 0.02  # tie-breaker only — must never fight the position task
+        # A true tie-breaker: at 0.02 the posture residual was large enough to
+        # trade away 4-8 cm of Cartesian accuracy on reachable handles.  The
+        # lower weight keeps branch preference without defeating the task.
+        posture_w = 0.002
         eye4 = posture_w * np.eye(4)
         pitch_row = np.array([[0.0, pitch_w, pitch_w, pitch_w]])
 
@@ -289,10 +293,13 @@ class World:
                 self.data.qpos[self.adr(k)] = q[i]
             mujoco.mj_forward(self.model, self.data)
             ferr = float(np.linalg.norm(target - self.data.site_xpos[self.ee_site]))
-            ncon = self.config_contacts(q)
-            if allow_handle_contact:
-                # subtract the intended handle contacts from the penalty
-                ncon = max(0, ncon - 2)
+            # A valid cage pose can contact the handle with several gripper
+            # geoms at once (both pads, hooks, and palm margin).  Treating
+            # "two contacts" as a magic allowance made the optimizer prefer
+            # a collision-free pose several centimetres away from the bar.
+            # Exclude every intended handle contact while continuing to score
+            # appliance/body collisions normally.
+            ncon = self.config_contacts(q, allow_handle=allow_handle_contact)
             score = ferr + 0.5 * ncon
             if score < best_score:
                 best_score, best_err, best_q = score, ferr, q.copy()
@@ -330,6 +337,25 @@ class World:
                     other_name = sorted(rest)[0]
         return handle_hit, force, others, other_name
 
+    def grasp_contact_sides(self) -> set[str]:
+        """Return the gripper sides in penetrating contact with the handle."""
+        sides: set[str] = set()
+        for i in range(self.data.ncon):
+            con = self.data.contact[i]
+            if con.dist > 0.0:
+                continue
+            names = {
+                mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, con.geom1) or "",
+                mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, con.geom2) or "",
+            }
+            if "handle" not in names:
+                continue
+            if any(name.startswith("finger_l") for name in names):
+                sides.add("left")
+            if any(name.startswith("finger_r") for name in names):
+                sides.add("right")
+        return sides
+
     def step(self) -> None:
         mujoco.mj_step(self.model, self.data)
 
@@ -337,8 +363,34 @@ class World:
         hp = self.handle_pos()
         return np.array([*self.arm_qpos(), self.grip(), self.door_rad(), *self.ee_pos(), *hp], dtype=np.float32)
 
+    def policy_state(self) -> np.ndarray:
+        """Non-privileged proprioception exposed to learned policies.
+
+        Door angle, end-effector pose, and handle pose are intentionally not
+        included.  They remain available to the simulator scorer and oracle
+        asset validator, never to the VLA policy gate.
+        """
+        return np.array([*self.arm_qpos(), self.grip()], dtype=np.float32)
+
+    def render_rgb(self, camera: str, *, width: int = 256, height: int = 256) -> np.ndarray:
+        """Render a real MuJoCo RGB observation from a named model camera."""
+        if camera not in {"debug", "wrist"}:
+            raise ValueError(f"unknown policy camera '{camera}'")
+        key = (width, height)
+        renderer = self._renderers.get(key)
+        if renderer is None:
+            renderer = Renderer(self.model, height=height, width=width)
+            self._renderers[key] = renderer
+        renderer.update_scene(self.data, camera=camera)
+        return np.asarray(renderer.render(), dtype=np.uint8).copy()
+
+    def close(self) -> None:
+        for renderer in self._renderers.values():
+            renderer.close()
+        self._renderers.clear()
+
     # -- planning-time collision queries (scratch FK, state restored) -------
-    def config_contacts(self, q: np.ndarray) -> int:
+    def config_contacts(self, q: np.ndarray, *, allow_handle: bool = False) -> int:
         """Robot-vs-world contact count at arm config q (scratch evaluation)."""
         saved = self.data.qpos.copy()
         for i, k in enumerate(("yaw", "shoulder", "elbow", "wrist")):
@@ -357,6 +409,13 @@ class World:
             g2 = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, con.geom2) or ""
             pair = {g1, g2}
             if not any(is_robot(g) for g in pair) or all(is_robot(g) for g in pair):
+                continue
+            if allow_handle and ("handle" in pair or "handle_mount" in pair):
+                continue
+            # The gripper carries a 2 cm collision margin.  During an
+            # intentional cage pose, positive-distance margin contacts with
+            # the door face are near misses, not physical penetration.
+            if allow_handle and con.dist >= -0.004:
                 continue
             if "floor_geom" in pair and any(g in floor_ok for g in pair):
                 continue
@@ -418,13 +477,20 @@ class ScriptedController:
         self.w = world
         handle = world.handle_pos()
         self.q_home = HOME.copy()
-        # position-only IK (posture-regularized): the pads clamp the bar in
-        # whatever orientation the arm reaches — the multi-site grasp connect
-        # then anchors the real contact point
-        self.q_cage, err_c = world.solve_ik_checked(handle + np.array([0.0, 0.0, 0.002]), None, allow_handle_contact=True)
-        # stand-off pose 15 cm out from the handle — free pitch in free space
+        # Keep the gripper's approach axis horizontal. A free-pitch solution
+        # could put the palm diagonally across the vertical handle, so the
+        # safety margin stopped the fingers several centimetres short.
+        grasp_pitch = math.pi / 2
+        self.q_cage, err_c = world.solve_ik_checked(
+            handle + np.array([0.0, 0.0, 0.002]), grasp_pitch, allow_handle_contact=True
+        )
+        self.q_press, err_p = world.solve_ik_checked(
+            handle + np.array([0.0, 0.0, -0.010]), grasp_pitch, allow_handle_contact=True
+        )
+        # The stand-off remains free-pitch; only the near-contact poses need
+        # the horizontal wrist constraint.
         self.q_approach, err_a = world.solve_ik_checked(handle + np.array([0.0, 0.0, 0.15]), None)
-        self.plan_error = float(max(err_a, err_c))
+        self.plan_error = float(max(err_a, err_c, err_p))
         self.pull_target = min(world.door_max * 0.92, math.radians(100))
         self.pull_path: list[np.ndarray] = []  # planned lazily at attach (needs the anchor)
         # collision-checked waypoint path home -> SAFE -> approach -> cage
@@ -437,12 +503,22 @@ class ScriptedController:
         self.pull_idx = 0
         self._lost_t = 0.0
         self._ref = self.q_home.copy()
+        self.q_release_backout = self.SAFE.copy()
 
     def _set(self, phase: str) -> None:
         self.phase = phase
         self.phase_t = 0.0
         if phase in ("press", "close", "pull"):
             # freeze the reference at the current physical pose for these phases
+            self._ref = self.w.arm_qpos().copy()
+        elif phase == "release":
+            # Plan a short Cartesian backout along the open door's outward
+            # normal. This clears the handle before the arm heads home and
+            # avoids sweeping the door shut with the open gripper.
+            door_rot = self.w.data.xmat[self.w.door_body].reshape(3, 3)
+            outward = door_rot[:, 2].copy()
+            target = self.w.ee_pos() + 0.14 * outward
+            self.q_release_backout = self.w.solve_ik_warm(self.w.arm_qpos(), target)
             self._ref = self.w.arm_qpos().copy()
 
     def _plan_pull(self) -> None:
@@ -504,7 +580,7 @@ class ScriptedController:
                 # caging is an insertion: gate on EE proximity to the bar, not
                 # joint error (pad contact resists the last centimeters)
                 d = float(np.linalg.norm(w.ee_pos() - w.handle_pos()))
-                done = done or d < 0.055
+                done = d < 0.055
             if done:
                 self.wp_idx += 1
                 self.phase_t = 0.0
@@ -513,17 +589,14 @@ class ScriptedController:
             elif self.phase_t > 8.0:
                 self._set("retract")  # path tracking stalled (contact blocked)
         elif self.phase == "press":
-            # compliant press-in: creep the site THROUGH the bar along the
-            # current approach direction so it seats deep between the pads
+            # Compliant press-in along the known appliance-normal approach.
+            # Recomputing the direction from the disturbed physical EE pose
+            # caused the target vector to rotate after first contact and the
+            # hand to back away from the bar.  The robot always approaches
+            # this compiled door from +Z, so a small -Z insertion is stable.
             handle = w.handle_pos()
-            ee = w.ee_pos()
-            direction = handle - ee
-            n = float(np.linalg.norm(direction))
-            direction = direction / n if n > 1e-6 else np.array([0.0, 0.0, -1.0])
-            press_target = handle + direction * 0.035  # 3.5 cm past the bar
-            q_ik = w.solve_ik(press_target, None)
             step = 0.35 * dt  # slow creep
-            self._ref = self._ref + np.clip(q_ik - self._ref, -step, step)
+            self._ref = self._ref + np.clip(self.q_press - self._ref, -step, step)
             q = self._ref.copy()
             d = float(np.linalg.norm(w.ee_pos() - handle))
             if d < 0.045:
@@ -535,12 +608,16 @@ class ScriptedController:
             q, _ = self._track(self.q_cage)
             # verification: fingers close onto the bar -> joint stalls early
             # with sustained contact force; air-closing reaches ~fully closed
-            if self.phase_t > 1.1:
+            if self.phase_t > 0.10:
                 hit, force, _, _ = w.contacts()
                 dmin = min(w.grasp_distances().values())
-                # pads on the bar (grip stalled mid-range) + a grasp site near
-                # the bar -> attach; the compliant connect seats the last cm
-                if 0.12 < w.grip() < 0.92 and hit and dmin < 0.07:
+                # Require bilateral penetrating finger contact, measurable
+                # contact force, and a nearby grasp site before enabling the
+                # sticky-grasp constraint. High-gain grippers can reach their
+                # position limit even while loaded, so joint stall alone is
+                # not a reliable contact signal.
+                bilateral = len(w.grasp_contact_sides()) == 2
+                if hit and force >= 5.0 and bilateral and dmin < 0.07:
                     w.attach()
                     self.grasp_verified = True
                     self._plan_pull()
@@ -563,56 +640,37 @@ class ScriptedController:
                     self._lost_t = 0.0
             else:
                 q = w.arm_qpos()
-            if w.door_rad() >= DOOR_SUCCESS_RAD or self.phase_t > 14.0 or (
+            # Do not release at the bare 60-degree scoring boundary: hinge
+            # damping can settle a few degrees after release. Continue to the
+            # planned pull target (or the physical time budget) so the final
+            # settled state, not a transient peak, determines success.
+            if self.phase_t > 14.0 or (
                 self.pull_idx >= len(self.pull_path) - 1 and w.door_rad() > 0.9 * self.pull_target
             ):
                 self._set("release")
         elif self.phase == "release":
-            if w.attached:
-                w.detach()
             grip = 0.0
-            if self.phase_t < 0.6 and w.grip() > 0.2:
-                # open the fingers fully BEFORE moving — a still-clamped hand
-                # retracting drags the door back shut
+            if self.phase_t < 1.2 and w.grip() > 0.2:
+                # Open while the grasp constraint still holds the handle at
+                # the palm. Detaching first lets the damped door push the
+                # loaded fingers farther closed before the actuator can clear
+                # them, which drags the door shut during retraction.
                 q = w.arm_qpos()
                 done = False
             else:
-                # back out via the tucked SAFE pose — up and away from the
-                # now-open door (the approach waypoint sits inside its sweep)
-                q, done = self._track(self.SAFE)
-            if done or self.phase_t > 3.5:
-                self._set("retract")
+                if w.attached:
+                    w.detach()
+                q, done = self._track(self.q_release_backout, rate=0.45)
+            if done or self.phase_t > 3.0:
+                # Terminal pose is the verified Cartesian backout. Returning
+                # home from here without a fresh open-door motion plan can
+                # sweep through the door; stopping clear is the safe outcome.
+                return q, 0.0, True
         else:  # retract
             q, done = self._track(self.q_home)
             if done or self.phase_t > 4.0:
                 return q, 0.0, True
         return q, grip, False
-
-
-class PolicyController:
-    """Trained BC policy: obs(12) -> action(5) = [d_arm(4), grip_target]."""
-
-    def __init__(self, world: World, model, clip: float = 0.06):
-        self.w = world
-        self.model = model
-        self.clip = clip
-        self.t = 0.0
-        self.done_after = 12.0
-
-    def act(self, dt: float) -> tuple[np.ndarray, float, bool]:
-        import torch
-
-        self.t += dt
-        obs = torch.from_numpy(self.w.observe()).unsqueeze(0)
-        with torch.no_grad():
-            a = self.model(obs).numpy()[0]
-        q = self.w.arm_qpos() + np.clip(a[:4], -self.clip, self.clip)
-        q[0] = np.clip(q[0], -3.0, 3.0)
-        q[1] = np.clip(q[1], 0.05, 1.9)
-        q[2] = np.clip(q[2], -2.8, 0.2)
-        q[3] = np.clip(q[3], -1.5, 2.2)
-        grip = float(np.clip(a[4], 0.0, 1.0))
-        return q, grip, self.t > self.done_after
 
 
 def run_rollout(
@@ -645,6 +703,7 @@ def run_rollout(
     steps_per_frame = max(1, int((1.0 / frame_hz) / DT_CTRL))
     step_i = 0
     done = False
+    success_hold_s = 0.0
     wall0 = _time.time()
 
     while t < max_s and not done:
@@ -667,6 +726,10 @@ def run_rollout(
         hit, force, others, _other = world.contacts()
         collisions_total += others
         door_peak = max(door_peak, world.door_rad())
+        if world.door_rad() >= DOOR_SUCCESS_RAD:
+            success_hold_s += DT_CTRL
+        else:
+            success_hold_s = 0.0
         contact_ever = contact_ever or hit
         if hit and world.grip() > 0.5:
             grasped_once = True
@@ -700,10 +763,17 @@ def run_rollout(
 
     door_deg = math.degrees(world.door_rad())
     peak_deg = math.degrees(door_peak)
-    success = world.door_rad() >= DOOR_SUCCESS_RAD
+    # Learned-policy success must be stable rather than a single-frame spike.
+    # The separately-labelled scripted oracle retains its original settled
+    # final-angle contract for backwards-compatible asset validation.
+    success = success_hold_s >= 0.5 if getattr(controller, "requires_success_hold", False) else world.door_rad() >= DOOR_SUCCESS_RAD
     failure_mode, failure_detail = None, None
     if not success:
-        if getattr(controller, "path_blocked", False):
+        policy_error = getattr(controller, "policy_error", None)
+        if policy_error:
+            failure_mode = str(getattr(policy_error, "code", "policy_error"))
+            failure_detail = str(policy_error)
+        elif getattr(controller, "path_blocked", False):
             failure_mode, failure_detail = "path_blocked", "No collision-free joint-space path to the handle exists."
         elif getattr(controller, "plan_error", 0.0) > 0.06 and not contact_ever:
             failure_mode = "plan_infeasible"
@@ -727,6 +797,9 @@ def run_rollout(
         else:
             failure_mode, failure_detail = "timeout", f"Door reached {door_deg:.0f} deg of the required 60 deg before the episode ended."
 
+    if hasattr(controller, "close"):
+        controller.close()
+    world.close()
     return RolloutResult(
         success=success,
         door_peak_deg=math.degrees(door_peak),
@@ -753,7 +826,7 @@ def default_scenario_family(rng: np.random.Generator | None = None) -> dict[str,
         "handle_orientation": "vertical",
         "max_open_deg": 110.0,
         # standoff: the compact arm (0.915 m) works at ~2/3 extension
-        "robot_base": (0.68, 1.05),
+        "robot_base": (0.80, 1.15),
     }
 
 
@@ -770,3 +843,26 @@ FRIDGE_SPEC: dict[str, Any] = {
     "max_open_deg": 110.0,
     "handle": {"height": 1.05, "orientation": "vertical", "offset_from_edge": 0.06, "protrude": 0.09},
 }
+
+
+def robot_base_for_asset(asset_spec: dict[str, Any]) -> tuple[float, float]:
+    """Place the compact arm at its validated standoff from an asset handle.
+
+    The returned X/Z position follows the same geometry equations as the MJCF
+    compiler.  This keeps a deeper or wider appliance from silently moving the
+    handle out of the robot workspace while preserving one fixed, documented
+    mounting offset relative to the task fixture.
+    """
+    width = float(asset_spec.get("width", FRIDGE_SPEC["width"]))
+    depth = float(asset_spec.get("depth", FRIDGE_SPEC["depth"]))
+    door_width = float(asset_spec.get("door_width", width * 0.5))
+    fx, fz = asset_spec.get("pos", FRIDGE_SPEC["pos"])
+    handle = asset_spec.get("handle", {})
+    offset = float(handle.get("offset_from_edge", 0.06))
+    protrude = float(handle.get("protrude", 0.045))
+    hinge_side = str(asset_spec.get("hinge_side", "left"))
+    hinge_x = -width / 2 if hinge_side == "left" else width / 2 - door_width
+    handle_x = float(fx) + hinge_x + door_width - offset
+    # door body front + handle-local front (door thickness is 4.5 cm)
+    handle_z = float(fz) + depth / 2 + 0.045 + 0.008 + protrude
+    return (round(handle_x + 0.31, 4), round(handle_z + 0.657, 4))

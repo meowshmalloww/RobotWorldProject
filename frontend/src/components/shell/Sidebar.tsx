@@ -21,7 +21,7 @@ const NAV: NavGroup[] = [
   {
     section: "Operate",
     items: [
-      { to: "/training", label: "Training", icon: "training" },
+      { to: "/training", label: "Policy readiness", icon: "training" },
       { to: "/observability/services", label: "Observability", icon: "observability" },
     ],
   },

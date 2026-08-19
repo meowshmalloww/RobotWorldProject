@@ -26,10 +26,16 @@ export interface SettingsData {
   integrations: {
     port: { enabled: boolean; endpoint: string; clientId: string; clientSecret: string; token: string };
     brightdata: { enabled: boolean; accountId: string; serpZone: string; unlockerZone: string; apiKey: string };
-    signoz: { enabled: boolean; endpoint: string; queryEndpoint: string; ingestionKey: string; apiKey: string; region: string };
+    signoz: { enabled: boolean; mode: string; endpoint: string; queryEndpoint: string; ingestionKey: string; apiKey: string; region: string };
   };
   simulation: { engine: string; gravity: number; timestepHz: number; renderer: string };
-  models: { planner: string; vlm: string; policy: string; openaiKey: string; openaiBaseUrl: string; provider: string; timeoutS: number };
+  models: {
+    planner: string; vlm: string; policy: string; openaiKey: string; openaiBaseUrl: string; provider: string; timeoutS: number;
+    policyEndpoint: string; policyApiKey: string; policyId: string; policyEmbodiment: string; policyInstruction: string;
+    policyModelRevision: string; policyModelSha256: string; policyNormalizationSha256: string; policyEnvironmentSha256: string;
+    policyTimeoutS: number; policyExecutionHorizon: number;
+    trellisEndpoint: string; trellisApiKey: string; trellisModel: string; trellisTimeoutS: number;
+  };
 }
 
 type Section = "general" | "appearance" | "integrations" | "simulation" | "models";
@@ -193,24 +199,41 @@ function AppearancePane({ draft, onChange }: { draft: SettingsData["appearance"]
 }
 
 function IntegrationsPane({ draft, onChange }: { draft: SettingsData["integrations"]; onChange: (p: Partial<SettingsData["integrations"]>) => void }) {
-  const setPort = (p: Partial<SettingsData["integrations"]["port"]>) => onChange({ port: { ...draft.port, ...p } });
+  const toast = useToast();
+  const [probingBrightData, setProbingBrightData] = useState(false);
+  const [probingSigNoz, setProbingSigNoz] = useState(false);
   const setBd = (p: Partial<SettingsData["integrations"]["brightdata"]>) => onChange({ brightdata: { ...draft.brightdata, ...p } });
   const setSz = (p: Partial<SettingsData["integrations"]["signoz"]>) => onChange({ signoz: { ...draft.signoz, ...p } });
+  const probeBrightData = async () => {
+    setProbingBrightData(true);
+    try {
+      const result = await api.post<{ organicCount: number; sampleDomains: string[] }>("/integrations/brightdata/probe", {});
+      toast.push("ok", "Bright Data verified", `${result.organicCount} live organic results · ${result.sampleDomains.join(", ")}`);
+    } catch (e) {
+      toast.push("err", "Bright Data verification failed", e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setProbingBrightData(false);
+    }
+  };
+  const probeSigNoz = async () => {
+    setProbingSigNoz(true);
+    try {
+      const result = await api.post<{ version: string | null; queryKeyConfigured: boolean }>("/integrations/signoz/probe", {});
+      const queryState = result.queryKeyConfigured ? "query API ready" : "create a local service-account key for agent queries";
+      toast.push("ok", "SigNoz Community verified", `${result.version ?? "local instance"} · OTLP receiver reachable · ${queryState}`);
+    } catch (e) {
+      toast.push("err", "SigNoz verification failed", e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setProbingSigNoz(false);
+    }
+  };
+  const openSigNoz = () => {
+    const url = draft.signoz.queryEndpoint.replace(/\/$/, "");
+    if (window.robotworld?.openExternal) void window.robotworld.openExternal(url);
+    else window.open(url, "_blank", "noopener,noreferrer");
+  };
   return (
     <div className="st-stack">
-      <Card
-        title={<span className="row" style={{ gap: 10 }}><span className="brand-ico brand-port" style={{ width: 26, height: 26, fontSize: 11 }}>P</span>Port</span>}
-        right={<Badge tone={draft.port.enabled ? "green" : "grey"}>{draft.port.enabled ? "Connected" : "Disabled"}</Badge>}
-      >
-        <p className="small t2" style={{ marginBottom: 12 }}>World/skill/asset catalog — entities, scorecards, governed agent actions</p>
-        <div className="st-grid">
-          <FormRow label="Org endpoint"><input className="input mono" value={draft.port.endpoint} onChange={(e) => setPort({ endpoint: e.target.value })} /></FormRow>
-          <FormRow label="Client ID"><input className="input mono" value={draft.port.clientId} onChange={(e) => setPort({ clientId: e.target.value })} /></FormRow>
-          <FormRow label="Client secret"><input className="input mono" value={draft.port.clientSecret} readOnly title="Rotate under API Keys" /></FormRow>
-          <FormRow label="Temporary token"><input className="input mono" value={draft.port.token} readOnly title="Optional short-lived token; rotate under API Keys" /></FormRow>
-        </div>
-        <ToggleRow label="Enabled" desc="Publish evaluation + promotion events to Port scorecards" checked={draft.port.enabled} onChange={(v) => setPort({ enabled: v })} />
-      </Card>
       <Card
         title={<span className="row" style={{ gap: 10 }}><span className="brand-ico brand-brightdata" style={{ width: 26, height: 26, fontSize: 11 }}>B</span>Bright Data</span>}
         right={<Badge tone={draft.brightdata.enabled ? "green" : "grey"}>{draft.brightdata.enabled ? "Active" : "Disabled"}</Badge>}
@@ -223,24 +246,30 @@ function IntegrationsPane({ draft, onChange }: { draft: SettingsData["integratio
           <FormRow label="API key"><input className="input mono" value={draft.brightdata.apiKey} readOnly title="Rotate under API Keys" /></FormRow>
         </div>
         <ToggleRow label="Enabled" desc="Allow collectors to run through Bright Data zones" checked={draft.brightdata.enabled} onChange={(v) => setBd({ enabled: v })} />
+        <div className="row" style={{ marginTop: 10 }}>
+          <button className="btn btn-secondary btn-sm" disabled={probingBrightData} onClick={probeBrightData} title="Sends one billable Google SERP request using the saved key and zone">
+            <Icon name="shield" size={12} /> {probingBrightData ? "Checking live SERP…" : "Run paid SERP check"}
+          </button>
+          <span className="small t3">Save settings first. One live request.</span>
+        </div>
       </Card>
       <Card
         title={<span className="row" style={{ gap: 10 }}><span className="brand-ico brand-signoz" style={{ width: 26, height: 26, fontSize: 11 }}>S</span>SigNoz</span>}
-        right={<Badge tone={draft.signoz.enabled ? "green" : "grey"}>{draft.signoz.enabled ? "Live" : "Disabled"}</Badge>}
+        right={<Badge tone={draft.signoz.enabled ? "green" : "grey"}>{draft.signoz.enabled ? "Community" : "Disabled"}</Badge>}
       >
-        <p className="small t2" style={{ marginBottom: 12 }}>OpenTelemetry traces, metrics, and logs for every pipeline stage</p>
+        <p className="small t2" style={{ marginBottom: 12 }}>Self-hosted SigNoz Community. OTLP ingestion is keyless; agent queries use a service-account key created inside your local SigNoz.</p>
         <div className="st-grid">
-          <FormRow label="Ingestion endpoint"><input className="input mono" value={draft.signoz.endpoint} onChange={(e) => setSz({ endpoint: e.target.value })} /></FormRow>
-          <FormRow label="Query endpoint"><input className="input mono" value={draft.signoz.queryEndpoint} onChange={(e) => setSz({ queryEndpoint: e.target.value })} placeholder="https://your-workspace.us.signoz.cloud" /></FormRow>
-          <FormRow label="Region">
-            <select className="select" value={draft.signoz.region} onChange={(e) => setSz({ region: e.target.value })}>
-              <option value="us">US</option><option value="eu">EU</option><option value="in">IN</option>
-            </select>
-          </FormRow>
-          <FormRow label="Ingestion key"><input className="input mono" value={draft.signoz.ingestionKey} readOnly title="Rotate under API Keys" /></FormRow>
+          <FormRow label="Deployment"><input className="input mono" value="Community · self-hosted" readOnly /></FormRow>
+          <FormRow label="OTLP HTTP endpoint"><input className="input mono" value={draft.signoz.endpoint} onChange={(e) => setSz({ endpoint: e.target.value })} placeholder="http://127.0.0.1:4318" /></FormRow>
+          <FormRow label="SigNoz UI"><input className="input mono" value={draft.signoz.queryEndpoint} onChange={(e) => setSz({ queryEndpoint: e.target.value })} placeholder="http://127.0.0.1:8080" /></FormRow>
           <FormRow label="Query API key"><input className="input mono" value={draft.signoz.apiKey} readOnly title="Rotate under API Keys" /></FormRow>
         </div>
         <ToggleRow label="Enabled" desc="Export OpenTelemetry pipelines to this SigNoz instance" checked={draft.signoz.enabled} onChange={(v) => setSz({ enabled: v })} />
+        <div className="row" style={{ marginTop: 10 }}>
+          <button className="btn btn-secondary btn-sm" disabled={probingSigNoz} onClick={probeSigNoz}><Icon name="shield" size={12} /> {probingSigNoz ? "Checking local stack…" : "Verify local SigNoz"}</button>
+          <button className="btn btn-ghost btn-sm" onClick={openSigNoz}><Icon name="external" size={12} /> Open SigNoz UI</button>
+        </div>
+        <p className="micro t3" style={{ marginTop: 8 }}>After enabling or changing OTLP settings, restart RobotWorld so traces, logs, and metrics attach together.</p>
       </Card>
       <Card>
         <SaveSection section="integrations" draft={draft} />
@@ -260,7 +289,7 @@ function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]
           <FormRow label="Gravity (m/s²)"><input className="input mono" value={draft.gravity} onChange={(e) => onChange({ gravity: Number(e.target.value) || 0 })} /></FormRow>
           <FormRow label="Timestep (Hz)"><input className="input mono" value={draft.timestepHz} onChange={(e) => onChange({ timestepHz: Number(e.target.value) || 0 })} /></FormRow>
           <FormRow label="Renderer">
-            <input className="input mono" value="MuJoCo offscreen / Three.js preview" readOnly aria-label="Renderer" />
+            <input className="input mono" value="Native Vulkan viewport / MuJoCo physics" readOnly aria-label="Renderer" />
           </FormRow>
         </div>
         <SaveSection section="simulation" draft={draft} />
@@ -270,6 +299,19 @@ function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]
 }
 
 function ModelsPane({ draft, onChange }: { draft: SettingsData["models"]; onChange: (p: Partial<SettingsData["models"]>) => void }) {
+  const toast = useToast();
+  const [probing, setProbing] = useState<string | null>(null);
+  const probe = async (kind: "policy" | "trellis") => {
+    setProbing(kind);
+    try {
+      await api.post(`/integrations/${kind}/probe`, {});
+      toast.push("ok", `${kind === "policy" ? "VLA" : "TRELLIS.2"} contract verified`, "Remote model and configured identity are compatible");
+    } catch (e) {
+      toast.push("err", "Model verification failed", e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setProbing(null);
+    }
+  };
   return (
     <div className="st-stack">
       <Card title="Language models">
@@ -286,14 +328,38 @@ function ModelsPane({ draft, onChange }: { draft: SettingsData["models"]; onChan
           <FormRow label="API key"><input className="input mono" value={draft.openaiKey} readOnly title="Rotate under API Keys" /></FormRow>
         </div>
       </Card>
-      <Card title="Policy">
+      <Card title="Learned robot policy">
+        <p className="small t2" style={{ marginBottom: 12 }}>Separate closed-loop VLA gate: MuJoCo front/wrist RGB + 5-D proprioception + language. No scripted fallback.</p>
         <div className="st-grid">
-          <FormRow label="Architecture">
+          <FormRow label="Default evaluation">
             <select className="select" value={draft.policy} onChange={(e) => onChange({ policy: e.target.value })}>
-              <option value="vla3b">VLA 3B (Jetson Orin Nano)</option><option value="vlm3b">VLM 3B</option>
+              <option value="asset-validation">Asset validation (scripted oracle)</option>
+              <option value="remote-vla">Remote VLA policy evaluation</option>
             </select>
           </FormRow>
+          <FormRow label="Gateway URL"><input className="input mono" value={draft.policyEndpoint} onChange={(e) => onChange({ policyEndpoint: e.target.value })} placeholder="https://vla-gateway.internal" /></FormRow>
+          <FormRow label="Checkpoint ID"><input className="input mono" value={draft.policyId} onChange={(e) => onChange({ policyId: e.target.value })} /></FormRow>
+          <FormRow label="Embodiment"><input className="input mono" value={draft.policyEmbodiment} onChange={(e) => onChange({ policyEmbodiment: e.target.value })} /></FormRow>
+          <FormRow label="Model revision"><input className="input mono" value={draft.policyModelRevision} onChange={(e) => onChange({ policyModelRevision: e.target.value })} placeholder="Pinned git/Hugging Face revision" /></FormRow>
+          <FormRow label="Model SHA-256"><input className="input mono" value={draft.policyModelSha256} onChange={(e) => onChange({ policyModelSha256: e.target.value })} placeholder="64 hex characters" /></FormRow>
+          <FormRow label="Normalization SHA-256"><input className="input mono" value={draft.policyNormalizationSha256} onChange={(e) => onChange({ policyNormalizationSha256: e.target.value })} placeholder="statistics/config hash" /></FormRow>
+          <FormRow label="Environment SHA-256"><input className="input mono" value={draft.policyEnvironmentSha256} onChange={(e) => onChange({ policyEnvironmentSha256: e.target.value })} placeholder="frozen MJCF + evaluation manifest hash" /></FormRow>
+          <FormRow label="Instruction"><input className="input" value={draft.policyInstruction} onChange={(e) => onChange({ policyInstruction: e.target.value })} /></FormRow>
+          <FormRow label="Timeout (s)"><input className="input mono" type="number" min={1} max={120} value={draft.policyTimeoutS} onChange={(e) => onChange({ policyTimeoutS: Number(e.target.value) || 10 })} /></FormRow>
+          <FormRow label="Execution horizon"><input className="input mono" type="number" min={1} max={40} value={draft.policyExecutionHorizon} onChange={(e) => onChange({ policyExecutionHorizon: Number(e.target.value) || 8 })} /></FormRow>
+          <FormRow label="Gateway token"><input className="input mono" value={draft.policyApiKey} readOnly title="Rotate under API Keys" /></FormRow>
         </div>
+        <div className="row" style={{ marginTop: 10 }}><button className="btn btn-secondary btn-sm" disabled={probing === "policy"} onClick={() => probe("policy")}><Icon name="shield" size={12} /> {probing === "policy" ? "Verifying…" : "Verify VLA contract"}</button></div>
+      </Card>
+      <Card title="TRELLIS.2 visual mesh generator">
+        <p className="small t2" style={{ marginBottom: 12 }}>Real image-to-PBR-GLB gateway. RobotWorld separately authors articulation, colliders, mass, and USD physics.</p>
+        <div className="st-grid">
+          <FormRow label="Gateway URL"><input className="input mono" value={draft.trellisEndpoint} onChange={(e) => onChange({ trellisEndpoint: e.target.value })} placeholder="https://trellis-private.example" /></FormRow>
+          <FormRow label="Model"><input className="input mono" value={draft.trellisModel} onChange={(e) => onChange({ trellisModel: e.target.value })} /></FormRow>
+          <FormRow label="Timeout (s)"><input className="input mono" type="number" min={30} max={1800} value={draft.trellisTimeoutS} onChange={(e) => onChange({ trellisTimeoutS: Number(e.target.value) || 300 })} /></FormRow>
+          <FormRow label="Gateway token"><input className="input mono" value={draft.trellisApiKey} readOnly title="Rotate under API Keys" /></FormRow>
+        </div>
+        <div className="row" style={{ marginTop: 10 }}><button className="btn btn-secondary btn-sm" disabled={probing === "trellis"} onClick={() => probe("trellis")}><Icon name="shield" size={12} /> {probing === "trellis" ? "Verifying…" : "Verify TRELLIS.2 contract"}</button></div>
         <SaveSection section="models" draft={draft} />
       </Card>
     </div>
@@ -302,11 +368,10 @@ function ModelsPane({ draft, onChange }: { draft: SettingsData["models"]; onChan
 
 const KEY_SERVICES: { service: string; label: string; read: (s: SettingsData) => string }[] = [
   { service: "openai", label: "OpenAI API", read: (s) => s.models.openaiKey },
+  { service: "policy", label: "VLA gateway token", read: (s) => s.models.policyApiKey },
+  { service: "trellis", label: "TRELLIS.2 gateway token", read: (s) => s.models.trellisApiKey },
   { service: "brightdata", label: "Bright Data", read: (s) => s.integrations.brightdata.apiKey },
-  { service: "signoz", label: "SigNoz ingestion", read: (s) => s.integrations.signoz.ingestionKey },
   { service: "signoz_api", label: "SigNoz query API", read: (s) => s.integrations.signoz.apiKey },
-  { service: "port_client_secret", label: "Port client secret", read: (s) => s.integrations.port.clientSecret },
-  { service: "port", label: "Port temporary token", read: (s) => s.integrations.port.token },
 ];
 
 function ApiKeysPane({ settings }: { settings: SettingsData }) {
@@ -376,7 +441,7 @@ function AboutPane() {
         </div>
         <hr className="divider" style={{ margin: "16px 0" }} />
         <div className="st-grid">
-          <FormRow label="Sponsors"><span className="row" style={{ gap: 6 }}><Badge tone="blue">Port</Badge><Badge tone="teal">Bright Data</Badge><Badge tone="orange">SigNoz</Badge></span></FormRow>
+          <FormRow label="Integrations"><span className="row" style={{ gap: 6 }}><Badge tone="teal">Bright Data</Badge><Badge tone="orange">SigNoz Community</Badge></span></FormRow>
           <FormRow label="API status"><span className="mono">{health ? health.status : "unreachable"}</span></FormRow>
         </div>
       </Card>

@@ -1,4 +1,4 @@
-"""Telemetry: OpenTelemetry -> SigNoz Cloud (OTLP http/protobuf) + local mirror.
+"""Telemetry: OpenTelemetry -> self-hosted SigNoz (OTLP HTTP/protobuf) + local mirror.
 
 Every span/log/metric is written to the local SQLite store (powering the
 Observability console and the agent's failure-analysis queries) AND exported
@@ -101,8 +101,8 @@ def init_otel(signoz_endpoint: str | None = None, signoz_key: str | None = None)
 
     _logger_provider = LoggerProvider(resource=_resource())
 
-    if signoz_endpoint and signoz_key:
-        headers = {"signoz-ingestion-key": signoz_key}
+    if signoz_endpoint:
+        headers = {"signoz-ingestion-key": signoz_key} if signoz_key else {}
         base = signoz_endpoint.rstrip("/")
         _tracer_provider.add_span_processor(
             BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{base}/v1/traces", headers=headers))
@@ -131,10 +131,10 @@ async def configure_signoz(endpoint: str | None, ingestion_key: str | None) -> b
     """Attach trace/log OTLP exporters at runtime (metrics reader attaches on
     next process start — a MeterProvider limitation in OTel Python)."""
     global _otlp_attached
-    if _otlp_attached or not endpoint or not ingestion_key:
+    if _otlp_attached or not endpoint:
         return _otlp_attached
     init_otel()
-    headers = {"signoz-ingestion-key": ingestion_key}
+    headers = {"signoz-ingestion-key": ingestion_key} if ingestion_key else {}
     base = endpoint.rstrip("/")
     try:
         _tracer_provider.add_span_processor(

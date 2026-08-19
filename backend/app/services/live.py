@@ -14,6 +14,7 @@ from ..db import SessionLocal
 from ..models import Evaluation
 from ..util import new_id
 from . import events, simcore
+from .remote_policy import PolicyConfig, RemotePolicyController
 
 
 STEPS = ["Initialize physics", "Approach handle", "Close gripper", "Pull articulated door", "Settle and score"]
@@ -29,6 +30,9 @@ class LiveSession:
     session_id: str
     run_id: str
     scenario: dict[str, Any]
+    evaluation_type: str = "asset_validation"
+    policy_name: str = "scripted-oracle-v1"
+    policy_config: PolicyConfig | None = None
     created_at: float = field(default_factory=time.time)
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=128))
     pause: threading.Event = field(default_factory=threading.Event)
@@ -43,22 +47,34 @@ class LiveSession:
 _sessions: dict[str, LiveSession] = {}
 
 
-def create() -> LiveSession:
+def create(*, evaluation_type: str = "asset_validation", policy_config: PolicyConfig | None = None) -> LiveSession:
     rng = np.random.default_rng()
     # A live session must be streamable: sample inside the domain-randomized
     # band until the kinematic planner confirms a feasible approach. Hard
     # scenarios still fail honestly during physics; they just do not end on
     # the first control tick before the viewer receives a frame.
     scenario: dict[str, Any] | None = None
-    for _ in range(12):
-        candidate = simcore.default_scenario_family(rng)
-        controller = simcore.ScriptedController(simcore.World(candidate))
-        if not controller.path_blocked and controller.plan_error <= 0.06:
-            scenario = candidate
-            break
+    if evaluation_type == "asset_validation":
+        for _ in range(12):
+            candidate = simcore.default_scenario_family(rng)
+            controller = simcore.ScriptedController(simcore.World(candidate))
+            if not controller.path_blocked and controller.plan_error <= 0.06:
+                scenario = candidate
+                break
+    else:
+        # Never use the oracle to select easy seeds for policy evaluation.
+        scenario = simcore.default_scenario_family(rng)
     if scenario is None:
         scenario = simcore.default_scenario_family(np.random.default_rng(0))
-    session = LiveSession(session_id=new_id("ses"), run_id=new_id("run"), scenario=scenario)
+    policy_name = "scripted-oracle-v1" if evaluation_type == "asset_validation" else policy_config.policy_id if policy_config else "remote-vla"
+    session = LiveSession(
+        session_id=new_id("ses"),
+        run_id=new_id("run"),
+        scenario=scenario,
+        evaluation_type=evaluation_type,
+        policy_name=policy_name,
+        policy_config=policy_config,
+    )
     _sessions[session.session_id] = session
     return session
 
@@ -73,9 +89,14 @@ def info(session: LiveSession) -> dict[str, Any]:
         "runId": session.run_id,
         "scenario": {
             "name": "Open refrigerator — nominal randomized evaluation",
-            "desc": "MuJoCo rollout using persisted domain-randomized physical parameters",
+            "desc": (
+                "MuJoCo asset-solvability check using a privileged scripted oracle"
+                if session.evaluation_type == "asset_validation"
+                else "Closed-loop VLA test using MuJoCo RGB, proprioception, and language"
+            ),
             "world": "Articulated Door Validation Lab",
-            "policy": "scripted-v1",
+            "policy": session.policy_name,
+            "evaluationType": session.evaluation_type,
             "variations": 1,
             "randomization": True,
         },
@@ -135,7 +156,7 @@ async def _persist(session: LiveSession, result: simcore.RolloutResult) -> None:
                 id=new_id("ev"),
                 run_id=session.run_id,
                 skill_id="open-refrigerator",
-                policy="scripted-v1",
+                policy=session.policy_name,
                 success=result.success,
                 door_angle_deg=result.door_angle_deg,
                 collisions=result.collisions,
@@ -182,10 +203,15 @@ async def run(session: LiveSession) -> None:
             return True
 
         world = simcore.World(session.scenario)
+        controller_factory = (
+            simcore.ScriptedController
+            if session.evaluation_type == "asset_validation"
+            else lambda w: RemotePolicyController(w, session.policy_config)  # type: ignore[arg-type]
+        )
         result = await asyncio.to_thread(
             simcore.run_rollout,
             world,
-            simcore.ScriptedController,
+            controller_factory,
             on_frame=on_frame,
             frame_hz=20.0,
             record=False,

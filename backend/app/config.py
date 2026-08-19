@@ -41,6 +41,15 @@ class EnvSettings(BaseSettings):
     openai_base_url: str | None = None
     openai_model: str = "gpt-4o"
 
+    policy_endpoint: str | None = None
+    policy_api_key: str | None = None
+    policy_model_revision: str | None = None
+    policy_model_sha256: str | None = None
+    policy_normalization_sha256: str | None = None
+    policy_environment_sha256: str | None = None
+    trellis_endpoint: str | None = None
+    trellis_api_key: str | None = None
+
     brightdata_api_key: str | None = None
     brightdata_account_id: str | None = None
     brightdata_serp_zone: str = "serp"
@@ -68,6 +77,8 @@ SECRET_KEYS = {
     "integrations.signoz.ingestionKey",
     "integrations.signoz.apiKey",
     "models.openaiKey",
+    "models.policyApiKey",
+    "models.trellisApiKey",
 }
 
 DEFAULT_SETTINGS: dict = {
@@ -94,12 +105,13 @@ DEFAULT_SETTINGS: dict = {
             "apiKey": env.brightdata_api_key or "",
         },
         "signoz": {
-            "enabled": True,
-            "endpoint": env.signoz_endpoint or f"https://ingest.{env.signoz_region}.signoz.cloud:443",
-            "queryEndpoint": env.signoz_query_endpoint or "",
+            "enabled": False,
+            "mode": "self_hosted",
+            "endpoint": env.signoz_endpoint or "http://127.0.0.1:4318",
+            "queryEndpoint": env.signoz_query_endpoint or "http://127.0.0.1:8080",
             "ingestionKey": env.signoz_ingestion_key or "",
             "apiKey": env.signoz_api_key or "",
-            "region": env.signoz_region,
+            "region": "local",
         },
     },
     "simulation": {
@@ -111,7 +123,25 @@ DEFAULT_SETTINGS: dict = {
     "models": {
         "planner": env.openai_model,
         "vlm": env.openai_model,
-        "policy": "bc-mlp-v1",
+        # Asset validation and learned-policy evaluation are deliberately
+        # separate.  The former may use the privileged scripted oracle; the
+        # latter must use rendered pixels and an external embodied checkpoint.
+        "policy": "asset-validation",
+        "policyEndpoint": env.policy_endpoint or "",
+        "policyApiKey": env.policy_api_key or "",
+        "policyId": "unconfigured",
+        "policyEmbodiment": "robotworld-4dof-v1",
+        "policyModelRevision": env.policy_model_revision or "",
+        "policyModelSha256": env.policy_model_sha256 or "",
+        "policyNormalizationSha256": env.policy_normalization_sha256 or "",
+        "policyEnvironmentSha256": env.policy_environment_sha256 or "",
+        "policyInstruction": "Open the refrigerator door.",
+        "policyTimeoutS": 10,
+        "policyExecutionHorizon": 8,
+        "trellisEndpoint": env.trellis_endpoint or "",
+        "trellisApiKey": env.trellis_api_key or "",
+        "trellisModel": "microsoft/TRELLIS.2-4B",
+        "trellisTimeoutS": 300,
         "openaiKey": env.openai_api_key or "",
         "openaiBaseUrl": env.openai_base_url or "https://api.openai.com/v1",
         "provider": "openai-compatible",

@@ -5,6 +5,7 @@ import time
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services import brightdata
 
 
 def test_primary_read_contract() -> None:
@@ -48,6 +49,31 @@ def test_write_only_secrets_survive_section_save() -> None:
         assert client.get("/api/health").json()["openai"] in {"not_configured", "checking", "degraded"}
 
 
+def test_brightdata_probe_returns_only_sanitized_evidence(monkeypatch) -> None:
+    async def search(query: str):
+        return {
+            "general": {"search_engine": "google", "query": query},
+            "organic": [
+                {"title": "One", "link": "https://example.com/product", "secret": "raw-provider-field"},
+                {"title": "Two", "link": "https://docs.example.org/item"},
+            ],
+        }
+
+    monkeypatch.setattr(brightdata, "google_search", search)
+    with TestClient(app) as client:
+        response = client.post("/api/integrations/brightdata/probe", json={})
+        assert response.status_code == 200
+        assert response.json() == {
+            "connected": True,
+            "provider": "Bright Data SERP API",
+            "searchEngine": "google",
+            "queryMatched": True,
+            "organicCount": 2,
+            "sampleDomains": ["example.com", "docs.example.org"],
+        }
+        assert "raw-provider-field" not in response.text
+
+
 def test_world_mutations_and_checks() -> None:
     with TestClient(app) as client:
         scene = client.get("/api/worlds/scene").json()
@@ -55,9 +81,53 @@ def test_world_mutations_and_checks() -> None:
         assert client.put("/api/worlds/scene", json={"sceneTree": scene["sceneTree"], "variants": scene["variants"]}).status_code == 200
         checks = client.post("/api/worlds/checks/run", json={}).json()["physicsChecks"]
         assert checks and all(item["status"] in {"pass", "warn", "fail"} for item in checks)
+        camera_probe = client.post("/api/worlds/cameras/probe", json={})
+        assert camera_probe.status_code == 200
+        for camera in camera_probe.json()["cameras"].values():
+            assert camera["shape"] == [256, 256, 3]
+            assert camera["dtype"] == "uint8"
+            assert camera["nonzero"] > 0
         variant = client.post("/api/worlds/variants", json={"name": "Test clearance", "desc": "API contract test"})
         assert variant.status_code == 200
         assert client.post(f"/api/worlds/variants/{variant.json()['id']}/activate", json={}).status_code == 200
+
+
+def test_native_vulkan_frame_and_acceptance_run_fail_closed_without_policy() -> None:
+    with TestClient(app) as client:
+        probe = client.get("/api/render/vulkan/probe")
+        assert probe.status_code == 200, probe.text
+        assert probe.json()["backend"] == "Vulkan"
+        assert probe.json()["browser3dApi"] == "none"
+
+        frame = client.get("/api/render/vulkan/frame?scene=kitchen&width=480&height=270")
+        assert frame.status_code == 200, frame.text
+        assert frame.headers["content-type"] == "image/png"
+        assert frame.headers["x-robotworld-renderer"] == "Vulkan"
+        assert frame.content.startswith(b"\x89PNG\r\n\x1a\n")
+
+        catalog = client.get("/api/demo-scenarios")
+        assert catalog.status_code == 200
+        assert {item["id"] for item in catalog.json()["scenarios"]} == {"kitchen-juice", "factory-sort"}
+        assert catalog.json()["readiness"]["trainingEnabled"] is False
+
+        for scenario_id, seed in (("kitchen-juice", 1048576), ("factory-sort", 2097152)):
+            queued = client.post(f"/api/demo-scenarios/{scenario_id}/runs", json={"seed": seed})
+            assert queued.status_code == 202, queued.text
+            job_id = queued.json()["jobId"]
+            job = None
+            for _ in range(120):
+                response = client.get(f"/api/jobs/{job_id}")
+                assert response.status_code == 200, response.text
+                job = response.json()
+                if job["status"] in {"success", "failed", "blocked"}:
+                    break
+                time.sleep(0.1)
+            assert job is not None
+            assert job["status"] == "blocked", job
+            assert job["detail"]["result"]["taskSuccess"] is None
+            assert job["detail"]["result"]["reason"] == "policy_not_configured"
+            assert [stage["status"] for stage in job["detail"]["stages"][:3]] == ["passed", "passed", "passed"]
+            assert "joints" in job["detail"]["stages"][1]["detail"]
 
 
 def test_real_asset_compile_and_openusd_download() -> None:
@@ -77,7 +147,8 @@ def test_real_asset_compile_and_openusd_download() -> None:
                 break
             time.sleep(0.1)
         assert asset is not None
-        assert asset["status"] in {"ready", "testing"}, asset
+        assert asset["status"] == "ready", asset
+        assert asset["lastEvalResult"] == "passed", asset
         assert any(item["file"] == "asset.usda" for item in asset["artifacts"])
         usd = client.get(f"/api/assets/{asset_id}/files/asset.usda")
         assert usd.status_code == 200

@@ -9,7 +9,7 @@ import { useToast } from "../components/ui/Toast";
 import { api, ApiError } from "../lib/api";
 import { useApi } from "../lib/useApi";
 import { EmptyState, ErrorState, Skeleton } from "../lib/states";
-import type { Asset, Stat } from "../data/types";
+import type { Asset, Source, Stat } from "../data/types";
 
 const KIND_LABEL = { articulated: "Articulated", rigid: "Rigid", environment: "Environment" } as const;
 const KIND_ICON = { articulated: "joint", rigid: "cube", environment: "worlds" } as const;
@@ -20,10 +20,13 @@ interface AssetsData {
   stats: Stat[];
 }
 
+interface BuildSourcesData { sources: Source[] }
+
 export default function Assets() {
   const nav = useNavigate();
   const toast = useToast();
   const { data, error, loading, refetch } = useApi<AssetsData>("/assets");
+  const { data: sourceData } = useApi<BuildSourcesData>("/sources");
   const [q, setQ] = useState("");
   const [kind, setKind] = useState("All types");
   const [status, setStatus] = useState("All status");
@@ -49,6 +52,7 @@ export default function Assets() {
   const queryRef = useRef<HTMLInputElement>(null);
   const [buildKind, setBuildKind] = useState<"articulated" | "rigid">("articulated");
   const [generator, setGenerator] = useState("parametric");
+  const [sourceId, setSourceId] = useState("");
   const familiesRef = useRef<HTMLInputElement>(null);
 
   const startBuild = async () => {
@@ -63,10 +67,11 @@ export default function Assets() {
         query,
         kind: buildKind,
         generator,
+        sourceId: sourceId || null,
         families: familiesRef.current?.value.split(",").map((s) => s.trim()).filter(Boolean) ?? [],
       });
       setNewBuild(false);
-      toast.push("ok", "Asset build queued", `Source search → mesh generation → SimReady compile`);
+      toast.push("ok", "Asset build queued", `Validated source → mesh generation → OpenUSD + MuJoCo compile`);
       // poll until the asset leaves the building state
       const poll = async (attempt = 0) => {
         if (attempt >= 120) {
@@ -99,7 +104,7 @@ export default function Assets() {
       <div className="page-head">
         <div>
           <h1 className="page-title">Assets</h1>
-          <p className="page-sub">SimReady objects compiled from real-world source data — geometry, physics, joints, semantics.</p>
+          <p className="page-sub">OpenUSD/MuJoCo objects compiled from provenance-bearing source data — geometry, physics, joints, semantics.</p>
         </div>
         <div className="head-actions">
           <button className="btn btn-secondary" disabled={assets.length === 0} onClick={() => {
@@ -123,6 +128,13 @@ export default function Assets() {
         >
           <div className="col" style={{ gap: 12 }}>
             <div className="field"><label>Object query</label><input ref={queryRef} className="input" placeholder="e.g. Samsung RF28T5001SR refrigerator" autoFocus /></div>
+            <div className="field">
+              <label>Validated Scraper Studio source</label>
+              <select className="select" value={sourceId} onChange={(e) => setSourceId(e.target.value)}>
+                <option value="">None · use reference catalog or live SERP discovery</option>
+                {(sourceData?.sources ?? []).map((s) => <option key={s.id} value={s.id}>{s.domain} · {s.collector} · {s.completeness}%</option>)}
+              </select>
+            </div>
             <div className="row" style={{ gap: 10 }}>
               <div className="field grow">
                 <label>Asset type</label>
@@ -135,10 +147,12 @@ export default function Assets() {
                 <label>Generator</label>
                 <select className="select" value={generator} onChange={(e) => setGenerator(e.target.value)}>
                   <option value="parametric">Parametric physical compiler</option>
+                  <option value="trellis2">TRELLIS.2 PBR visual + physical proxy compiler</option>
                 </select>
               </div>
             </div>
             <div className="field"><label>Scenario families</label><input ref={familiesRef} className="input" placeholder="e.g. left hinge, heavy door, low handle" /></div>
+            {generator === "trellis2" && <div className="empty-note">TRELLIS.2 produces the visual PBR mesh only. RobotWorld still authors and validates articulation, collision proxies, mass, and joint physics from the selected structured source.</div>}
           </div>
         </Modal>
       )}

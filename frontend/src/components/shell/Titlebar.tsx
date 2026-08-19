@@ -39,7 +39,7 @@ const SEARCHABLE: { label: string; path: string; icon: string }[] = [
   { label: "Worlds — Scene Editor", path: "/worlds", icon: "worlds" },
   { label: "Worlds — Live Evaluation", path: "/worlds?mode=live", icon: "play" },
   { label: "Sources", path: "/sources", icon: "sources" },
-  { label: "Training & Evaluation", path: "/training", icon: "training" },
+  { label: "Policy readiness", path: "/training", icon: "training" },
   { label: "Observability", path: "/observability/services", icon: "observability" },
   { label: "Settings", path: "/settings", icon: "settings" },
   { label: "API Keys", path: "/settings?tab=apikeys", icon: "lock" },
@@ -127,12 +127,16 @@ export function Titlebar() {
           <MenuItem icon="worlds" onClick={() => nav("/worlds")}>Scene composer</MenuItem>
           <MenuItem icon="observability" onClick={() => nav("/observability/services")}>Observability</MenuItem>
           <div className="menu-sep" />
-          <MenuItem icon="grid" onClick={() => toast.push("info", "Reset layout", "Panels restored to defaults")}>Reset layout</MenuItem>
+          <MenuItem icon="grid" onClick={() => {
+            ["robotworld.worlds.leftW", "robotworld.worlds.rightW", "robotworld.worlds.shelfH"].forEach((key) => window.localStorage.removeItem(key));
+            window.dispatchEvent(new Event("robotworld:reset-layout"));
+            toast.push("ok", "Layout reset", "Hierarchy, viewport, console, and inspector restored");
+          }}>Reset layout</MenuItem>
         </Menu>
         <Menu width={220} trigger={(open) => <button className={`tb-menu-btn ${open ? "open" : ""}`}>Run</button>}>
           <MenuItem icon="play" onClick={() => nav("/worlds?mode=live")}>Start live evaluation</MenuItem>
-          <MenuItem icon="robot" onClick={runAgent}>Run agent on top skill gap</MenuItem>
-          <MenuItem icon="refresh" onClick={runAgent}>Re-run agent iteration</MenuItem>
+          <MenuItem icon="robot" onClick={runAgent}>Run diagnostics agent</MenuItem>
+          <MenuItem icon="refresh" onClick={() => nav("/worlds")}>Open acceptance scenarios</MenuItem>
         </Menu>
         <Menu width={190} trigger={(open) => <button className={`tb-menu-btn ${open ? "open" : ""}`}>Help</button>}>
           <MenuItem icon="book" onClick={() => toast.push("info", "Documentation", "Docs ship with the backend integration")}>Documentation</MenuItem>
@@ -283,7 +287,7 @@ export function StatusBar() {
       <span className="sep" />
       <span className="sb-item">Articulated Door Validation Lab</span>
       <span className="grow" />
-      <span className="sb-item"><Icon name="cube" size={11} /> Three.js preview</span>
+      <span className="sb-item"><Icon name="cube" size={11} /> Native Vulkan viewport</span>
       <span className="sep" />
       <span className="sb-item"><Icon name="chip" size={11} /> {health ? `${health.simulation.engine} ${health.simulation.version} · ${health.simulation.timestepHz} Hz` : "Simulator offline"}</span>
       <span className="sep" />

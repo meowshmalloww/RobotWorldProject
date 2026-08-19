@@ -1,5 +1,5 @@
 /** RobotWorld Electron host: owns the loopback API and loads one trusted origin. */
-const { app, BrowserWindow, dialog, ipcMain, session } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, session, shell } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 
@@ -105,6 +105,12 @@ ipcMain.on("win:toggle-maximize", () => {
 });
 ipcMain.on("win:close", () => win?.close());
 ipcMain.handle("win:is-maximized", () => win?.isMaximized() ?? false);
+ipcMain.handle("shell:open-external", async (_event, value) => {
+  const url = new URL(String(value));
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Only HTTP(S) links can be opened.");
+  await shell.openExternal(url.toString());
+  return true;
+});
 
 app.whenReady().then(async () => {
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));

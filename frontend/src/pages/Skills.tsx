@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Card, CardLink, Progress } from "../components/ui/Card";
+import { Card, Progress } from "../components/ui/Card";
 import { Icon, type IconName } from "../components/ui/Icon";
 import { Delta, Pagination, SearchBox, StatusBadge } from "../components/ui/controls";
 import { useToast } from "../components/ui/Toast";
@@ -119,7 +119,6 @@ export default function Skills() {
                 <option value="weak">Weak</option>
                 <option value="not_started">Not Started</option>
               </select>
-              <button className="btn btn-ghost btn-icon btn-sm" title="Table options"><Icon name="filter" size={13} /></button>
             </span>
           }
         >
@@ -270,7 +269,7 @@ export default function Skills() {
 
           <div className="sk-bottom" style={{ marginTop: 0, gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)" }}>
             {/* Recommended next skills */}
-            <Card title="Recommended next skills" info right={<CardLink>View all</CardLink>} flush>
+            <Card title="Recommended next skills" info flush>
               {loading && !data ? (
                 <Skeleton rows={3} />
               ) : data && data.recommended.length > 0 ? (

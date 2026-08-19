@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld("robotworld", {
   toggleMaximize: () => ipcRenderer.send("win:toggle-maximize"),
   close: () => ipcRenderer.send("win:close"),
   isMaximized: () => ipcRenderer.invoke("win:is-maximized"),
+  openExternal: (url) => ipcRenderer.invoke("shell:open-external", url),
   onMaximizedChange: (cb) => {
     const handler = (_e, v) => cb(v);
     ipcRenderer.on("win:maximized", handler);

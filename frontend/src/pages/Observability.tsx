@@ -169,6 +169,7 @@ function ServiceMap({ services }: { services: ServiceRow[] }) {
 /* ---- Traces (waterfall) ------------------------------------------------------ */
 function TracesTab() {
   const toast = useToast();
+  const { data: settings } = useApi<{ integrations: { signoz: { queryEndpoint: string } } }>("/settings");
   const { data: list, error, loading, refetch } = useApi<{ traces: TraceMeta[] }>("/observability/traces");
   const [selected, setSelected] = useState<string | null>(null);
   const traces = list?.traces ?? [];
@@ -176,6 +177,15 @@ function TracesTab() {
   const { data: detail, error: detailError, loading: detailLoading } = useApi<TraceDetail>(
     activeId ? `/observability/traces/${activeId}` : null,
   );
+  const openSigNoz = () => {
+    const url = settings?.integrations.signoz.queryEndpoint?.replace(/\/$/, "");
+    if (!url) {
+      toast.push("info", "SigNoz is not configured", "Set the local Community UI endpoint under Settings → Integrations.");
+      return;
+    }
+    if (window.robotworld?.openExternal) void window.robotworld.openExternal(url);
+    else window.open(url, "_blank", "noopener,noreferrer");
+  };
 
   if (loading && !list) return <div className="card"><Skeleton rows={6} /></div>;
   if (error) return <div className="card"><ErrorState message={error.message} onRetry={refetch} /></div>;
@@ -236,7 +246,7 @@ function TracesTab() {
               </span>
             }
             flush
-            right={<button className="btn btn-ghost btn-sm" onClick={() => toast.push("info", "SigNoz", "Deep-link opens when the SigNoz endpoint is configured")}>View in SigNoz <Icon name="external" size={11} /></button>}
+            right={<button className="btn btn-ghost btn-sm" onClick={openSigNoz}>Open SigNoz Community <Icon name="external" size={11} /></button>}
           >
             <div className="row" style={{ gap: 14, padding: "8px 14px", borderBottom: "1px solid var(--border)", flexWrap: "wrap" }}>
               <span className="micro t3">Iteration ID <span className="mono t2">{detail.meta.iterationId}</span></span>
@@ -407,7 +417,7 @@ function AlertsTab() {
   const { data: alerts, error, loading, refetch } = useApi<Alert[]>("/observability/alerts");
   return (
     <div className="col" style={{ gap: 10 }}>
-      <Card title="Alert rules" right={<CardLink>Manage alert policies</CardLink>} flush>
+      <Card title="Alert rules" flush>
         {error ? (
           <ErrorState message={error.message} onRetry={refetch} />
         ) : loading && !alerts ? (

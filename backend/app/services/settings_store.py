@@ -89,6 +89,8 @@ async def put_key(service: str, value: str) -> None:
         "signoz": "integrations.signoz.ingestionKey",
         "signoz_api": "integrations.signoz.apiKey",
         "openai": "models.openaiKey",
+        "policy": "models.policyApiKey",
+        "trellis": "models.trellisApiKey",
     }
     if service not in mapping:
         raise KeyError(f"unknown key service '{service}'")
@@ -105,6 +107,8 @@ async def secret_status() -> dict[str, bool]:
     flat = await get_flat()
     return {
         "openai": bool(flat.get("models.openaiKey")),
+        "policy": bool(flat.get("models.policyApiKey")),
+        "trellis": bool(flat.get("models.trellisApiKey")),
         "brightdata": bool(flat.get("integrations.brightdata.apiKey")),
         "signoz": bool(flat.get("integrations.signoz.ingestionKey")),
         "signoz_api": bool(flat.get("integrations.signoz.apiKey")),

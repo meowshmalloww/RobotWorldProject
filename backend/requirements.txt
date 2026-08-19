@@ -8,7 +8,7 @@ aiosqlite==0.22.1
 httpx==0.28.1
 python-dotenv==1.2.3
 
-# Telemetry -> SigNoz Cloud (OTLP http/protobuf)
+# Telemetry -> self-hosted SigNoz Community (OTLP HTTP/protobuf)
 opentelemetry-sdk==1.44.0
 opentelemetry-exporter-otlp-proto-http==1.44.0
 opentelemetry-instrumentation-fastapi==0.65b0
@@ -20,7 +20,8 @@ trimesh==5.0.0
 numpy==2.4.6
 scipy==1.17.1
 pillow==12.3.0
-torch==2.13.0
+wgpu==0.32.0
+pygfx==0.17.0
 pygltflib==1.16.5
 usd-core==26.8
 

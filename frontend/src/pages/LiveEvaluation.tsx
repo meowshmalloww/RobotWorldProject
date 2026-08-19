@@ -1,25 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import { Canvas } from "@react-three/fiber";
-import { OrbitControls } from "@react-three/drei";
-import * as THREE from "three";
 import { Card, Progress } from "../components/ui/Card";
 import { Icon } from "../components/ui/Icon";
 import { Badge, Segmented } from "../components/ui/controls";
-import { Viewport } from "../components/three/Viewport";
-import { WarehouseKitchen } from "../components/three/WarehouseKitchen";
+import { Viewport, type RenderVariant } from "../components/three/Viewport";
 import { useToast } from "../components/ui/Toast";
 import { downloadFile } from "../components/ui/Modal";
 import { api, ApiError } from "../lib/api";
 import { useWs } from "../lib/useWs";
-import type { RenderVariant } from "../components/three/materials";
-import type { ArmPose } from "../components/three/RobotArm";
 
 /* ---- API contracts (backend/app/schemas.py) ------------------------------- */
 
 interface SessionInfo {
   sessionId: string;
   runId: string;
-  scenario: { name: string; desc: string; world: string; policy: string; variations: number; randomization: boolean };
+  scenario: { name: string; desc: string; world: string; policy: string; evaluationType: "asset_validation" | "policy_evaluation"; variations: number; randomization: boolean };
   durationS: number;
 }
 
@@ -59,7 +53,7 @@ type LiveMsg = LiveMeta | LiveFrame | LiveEnd;
 /**
  * Live Evaluation — the robot executes the scenario in real time on the
  * backend. Frames arrive over WS /ws/live/{sessionId}; `live` ref carries
- * the latest pose+door into every render of the shared procedural world
+ * the latest pose+door into every render of the presentation world
  * (no per-frame React renders); DOM panels sample state at 5 Hz.
  */
 export default function LiveEvaluation({ embedded = false }: { embedded?: boolean }) {
@@ -67,6 +61,7 @@ export default function LiveEvaluation({ embedded = false }: { embedded?: boolea
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [startedAt, setStartedAt] = useState<string>("");
   const [starting, setStarting] = useState(false);
+  const [evaluationType, setEvaluationType] = useState<"asset_validation" | "policy_evaluation">("asset_validation");
   const [wsState, setWsState] = useState<"idle" | "connecting" | "open" | "closed">("idle");
   const [paused, setPaused] = useState(false);
   const [ended, setEnded] = useState(false);
@@ -76,13 +71,13 @@ export default function LiveEvaluation({ embedded = false }: { embedded?: boolea
   const [frame, setFrame] = useState<LiveFrame | null>(null);
   const [, setTick] = useState(0);
 
-  // per-frame drive into the 3D world (never triggers React renders)
-  const live = useRef<{ pose: ArmPose; door: number }>({ pose: { yaw: 0.62, shoulder: 0.55, elbow: -1.5, wrist: 0.7, grip: 0, door: 0 }, door: 0 });
+  // Latest physical joint state sampled into the native Vulkan sensor tiles.
+  const live = useRef<{ door: number }>({ door: 0 });
 
   const startSession = async () => {
     setStarting(true);
     try {
-      const s = await api.post<SessionInfo>("/eval/sessions", {});
+      const s = await api.post<SessionInfo>("/eval/sessions", { evaluationType });
       setSession(s);
       setStartedAt(new Date().toLocaleTimeString());
       setMeta(null);
@@ -90,7 +85,7 @@ export default function LiveEvaluation({ embedded = false }: { embedded?: boolea
       setPaused(false);
       setEnded(false);
       setEndSummary(null);
-      live.current = { pose: { yaw: 0.62, shoulder: 0.55, elbow: -1.5, wrist: 0.7, grip: 0, door: 0 }, door: 0 };
+      live.current = { door: 0 };
     } catch (e) {
       toast.push("err", "Could not start evaluation", e instanceof ApiError ? e.message : String(e));
     } finally {
@@ -105,7 +100,7 @@ export default function LiveEvaluation({ embedded = false }: { embedded?: boolea
       if (msg.type === "meta") {
         setMeta(msg);
       } else if (msg.type === "frame") {
-        live.current = { pose: { ...msg.pose, door: msg.door }, door: msg.door };
+        live.current = { door: msg.door };
         setFrame(msg);
         if (msg.done) setEnded(true);
       } else if (msg.type === "end") {
@@ -163,9 +158,15 @@ export default function LiveEvaluation({ embedded = false }: { embedded?: boolea
       {/* run controls */}
       <div className="dockbar">
         {!session ? (
-          <button className="btn btn-primary btn-sm" onClick={startSession} disabled={starting}>
-            <Icon name="play" size={12} /> {starting ? "Starting…" : "Start run"}
-          </button>
+          <>
+            <select className="select" style={{ width: 245 }} value={evaluationType} onChange={(e) => setEvaluationType(e.target.value as typeof evaluationType)} aria-label="Evaluation type">
+              <option value="asset_validation">Asset validation · scripted oracle</option>
+              <option value="policy_evaluation">VLA policy evaluation · no fallback</option>
+            </select>
+            <button className="btn btn-primary btn-sm" onClick={startSession} disabled={starting}>
+              <Icon name="play" size={12} /> {starting ? "Starting…" : "Start run"}
+            </button>
+          </>
         ) : (
           <>
             {paused ? (
@@ -262,9 +263,8 @@ export default function LiveEvaluation({ embedded = false }: { embedded?: boolea
                 target={[0.8, 1.1, -3.0]}
                 style={{ flex: 1, minHeight: 0 }}
                 gizmo={false}
-              >
-                <WarehouseKitchen liveRef={live} />
-              </Viewport>
+                doorAngle={frame?.doorAngleDeg ?? 0}
+              />
               {!session && (
                 <div className="vp-overlay" style={{ inset: 0, display: "grid", placeItems: "center", background: "rgba(20,22,27,0.55)", borderRadius: "var(--r-md)" }}>
                   <div className="col center" style={{ gap: 10 }}>
@@ -288,13 +288,7 @@ export default function LiveEvaluation({ embedded = false }: { embedded?: boolea
                 <span className="vp-chip">Camera: Third Person <Icon name="chevronDown" size={11} /></span>
               </div>
               <div className="vp-overlay" style={{ bottom: 12, right: 12 }}>
-                <div className="vp-toolbar">
-                  <button title="Screenshot"><Icon name="camera" size={13} /></button>
-                  <button title="Overlays" className="on"><Icon name="grid" size={13} /></button>
-                  <button title="Markers"><Icon name="target" size={13} /></button>
-                  <button title="Settings"><Icon name="settings" size={13} /></button>
-                  <button title="Fullscreen"><Icon name="maximize" size={12} /></button>
-                </div>
+                <span className="vp-chip">Native Vulkan · drag to orbit</span>
               </div>
             </div>
 
@@ -306,7 +300,6 @@ export default function LiveEvaluation({ embedded = false }: { embedded?: boolea
                 <SensorView label="Wrist Camera" dotColor="var(--green)" variant="rgb" cam={[0.9, 1.35, -2.2]} tgt={[1.2, 1.25, -3.0]} live={live} fov={58} />
                 <SensorView label="Segmentation" dotColor="var(--purple)" variant="seg" cam={[2.6, 1.9, 0.4]} tgt={[0.7, 1.1, -3.0]} live={live} />
                 <SensorView label="Depth" dotColor="#8A94A6" variant="depth" cam={[0.4, 1.7, 0.9]} tgt={[0.8, 1.1, -3.0]} live={live} />
-                <button className="add-view" title="Add view"><Icon name="plus" size={14} /></button>
               </div>
             </div>
           </Card>
@@ -466,10 +459,6 @@ function KV({ k, v }: { k: string; v: React.ReactNode }) {
 }
 
 /** World bound to the live frame ref inside a sensor tile. */
-function AnimatedWorld({ live, variant }: { live: React.MutableRefObject<{ pose: ArmPose; door: number }>; variant: RenderVariant }) {
-  return <WarehouseKitchen variant={variant} liveRef={live} />;
-}
-
 /** One live sensor tile — its own small render of the shared world. */
 function SensorView({
   label, dotColor, variant, cam, tgt, live, fov,
@@ -479,29 +468,20 @@ function SensorView({
   variant: RenderVariant;
   cam: [number, number, number];
   tgt: [number, number, number];
-  live: React.MutableRefObject<{ pose: ArmPose; door: number }>;
+  live: React.MutableRefObject<{ door: number }>;
   fov?: number;
 }) {
   return (
     <div className="thumb clickable">
-      <Canvas
-        dpr={[0.5, 0.9]}
+      <Viewport
         camera={{ position: cam, fov: fov ?? 46 }}
-        gl={{ antialias: false, toneMapping: variant === "rgb" ? THREE.ACESFilmicToneMapping : THREE.NoToneMapping, preserveDrawingBuffer: true }}
-        style={{ position: "absolute", inset: 0 }}
-      >
-        {variant === "rgb" ? (
-          <>
-            <hemisphereLight args={["#B8C4D6", "#26282D", 0.7]} />
-            <directionalLight position={[5.5, 7.5, 3.5]} intensity={1.4} />
-            <pointLight position={[0, 3.5, -1]} intensity={16} color="#DCE9F5" distance={12} decay={2} />
-          </>
-        ) : (
-          <ambientLight intensity={1.5} />
-        )}
-        <AnimatedWorld live={live} variant={variant} />
-        <OrbitControls target={tgt} enableDamping={false} enablePan={false} enableZoom={false} enableRotate={false} />
-      </Canvas>
+        target={tgt}
+        variant={variant}
+        controls={false}
+        gizmo={false}
+        doorAngle={live.current.door * 180 / Math.PI}
+        style={{ position: "absolute", inset: 0, borderRadius: 0 }}
+      />
       <span className="thumb-label"><span className="dot" style={{ background: dotColor }} /> {label}</span>
     </div>
   );
