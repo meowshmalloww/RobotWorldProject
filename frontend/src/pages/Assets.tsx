@@ -33,6 +33,7 @@ export default function Assets() {
   const [page, setPage] = useState(1);
   const [newBuild, setNewBuild] = useState(false);
   const [building, setBuilding] = useState(false);
+  const [smokeRunning, setSmokeRunning] = useState(false);
 
   const assets = useMemo(() => data?.assets ?? [], [data]);
   const filtered = useMemo(
@@ -99,6 +100,47 @@ export default function Assets() {
     }
   };
 
+  const waitForAsset = async (assetId: string, onDone?: (asset: Asset) => void) => {
+    for (let attempt = 0; attempt < 160; attempt++) {
+      try {
+        const asset = await api.get<Asset>(`/assets/${assetId}`);
+        if (asset.status !== "building" && asset.status !== "draft") {
+          if (onDone) onDone(asset);
+          return asset;
+        }
+      } catch {
+        // keep polling on transient read failures
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+    }
+    throw new Error("Build did not finish within the smoke-test timeout window.");
+  };
+
+  const startTrellisSmokeTest = async () => {
+    setSmokeRunning(true);
+    try {
+      const { assetId } = await api.post<{ assetId: string }>("/assets/build", {
+        query: "kitchen blender",
+        kind: "rigid",
+        generator: "trellis2",
+        sourceId: null,
+        families: ["smoke-test", "trellis2"],
+      });
+      toast.push("ok", "TRELLIS smoke run started", `asset ${assetId} is running one-image TRELLIS generation`);
+      const asset = await waitForAsset(assetId, (a) => {
+        if (a.status === "ready" || a.status === "testing" || a.status === "blocked") {
+          toast.push("ok", "TRELLIS smoke run complete", `${a.name} â€” ${a.status}`);
+        }
+      });
+      refetch();
+      nav(`/assets/${asset.id}`);
+    } catch (e) {
+      toast.push("err", "TRELLIS smoke run failed", e instanceof Error ? e.message : e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setSmokeRunning(false);
+    }
+  };
+
   return (
     <div className="page">
       <div className="page-head">
@@ -111,6 +153,9 @@ export default function Assets() {
             downloadFile("asset-catalog.json", JSON.stringify(assets.map(({ id, name, kind: k, status: st, readiness, source }) => ({ id, name, kind: k, status: st, readiness, source })), null, 2));
             toast.push("ok", "Catalog exported", `asset-catalog.json · ${assets.length} assets`);
           }}><Icon name="download" size={13} /> Export catalog</button>
+          <button className="btn btn-secondary" disabled={smokeRunning} onClick={startTrellisSmokeTest}>
+            <Icon name="spark" size={13} /> {smokeRunning ? "TRELLIS smoke in progress..." : "Run TRELLIS smoke build"}
+          </button>
           <button className="btn btn-primary" onClick={() => setNewBuild(true)}><Icon name="plus" size={13} /> New asset build</button>
         </div>
       </div>
@@ -201,7 +246,7 @@ export default function Assets() {
                 <thead>
                   <tr>
                     <th>Asset</th><th>Type</th><th>Readiness</th><th>Physics validity</th><th>Scale conf.</th>
-                    <th>Source</th><th>Status</th><th style={{ textAlign: "right" }}>Last evaluation</th><th style={{ width: 30 }} />
+                    <th>Live source</th><th>Status</th><th style={{ textAlign: "right" }}>Last evaluation</th><th style={{ width: 30 }} />
                   </tr>
                 </thead>
                 <tbody>
@@ -230,7 +275,23 @@ export default function Assets() {
                       </td>
                       <td className="mono t2">{a.physicsValidity.toFixed(1)}%</td>
                       <td className="mono t2">{a.scaleConfidence.toFixed(2)}</td>
-                      <td className="t-muted">{a.source}</td>
+                      <td>
+                        <div className="row" style={{ gap: 8, minWidth: 180 }}>
+                          {a.sourceImage ? (
+                            <img
+                              src={a.sourceImage}
+                              alt={`Bright Data source for ${a.name}`}
+                              style={{ width: 38, height: 30, borderRadius: 4, objectFit: "cover", border: "1px solid var(--border)" }}
+                            />
+                          ) : (
+                            <span className="cell-ico"><Icon name="sources" size={13} /></span>
+                          )}
+                          <span className="col" style={{ gap: 1, minWidth: 0 }}>
+                            <span className="t-muted" style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 180 }}>{a.source}</span>
+                            <span className="micro t3">{a.sourceImage ? "Bright Data image acquired" : "No image evidence"}</span>
+                          </span>
+                        </div>
+                      </td>
                       <td><StatusBadge status={a.status} /></td>
                       <td className="t-muted mono" style={{ textAlign: "right", fontSize: "var(--fs-small)" }}>{a.lastEval}</td>
                       <td><button className="icon-btn btn-sm" onClick={(e) => e.stopPropagation()}><Icon name="dots" size={13} /></button></td>

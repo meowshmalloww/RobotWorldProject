@@ -6,6 +6,7 @@ training runs, asset rows and telemetry. Empty DB yields honest zero states.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from typing import Any
 
 from sqlalchemy import func, select
@@ -27,6 +28,7 @@ from ..models import (
     Variant,
     World,
 )
+from ..config import ASSETS_DIR
 from ..util import fmt_duration, fmt_size, rel_time
 
 
@@ -134,16 +136,31 @@ async def skill_detail(session: AsyncSession, skill: Skill) -> dict:
 
     families = []
     for f in m["fams"]:
-        scens = (await session.execute(select(func.count(Scenario.id)).where(Scenario.family_id == f.id))).scalar() or 0
+        scenario_rows = (await session.execute(select(Scenario).where(Scenario.family_id == f.id))).scalars().all()
+        scens = len(scenario_rows)
         fam_evals = [e for e in evals if e.family_id == f.id]
         fsucc = 100.0 * sum(1 for e in fam_evals if e.success) / len(fam_evals) if fam_evals else 0.0
+        evaluated_ids = {e.scenario_id for e in fam_evals if e.scenario_id}
+        # Difficulty is computed from persisted physical parameters. Quartile
+        # coverage is the fraction of unique scenario definitions that have a
+        # recorded evaluation; no repeated placeholder value is emitted.
+        ordered = sorted(
+            scenario_rows,
+            key=lambda row: float((row.params or {}).get("door_mass", 0)) + 2.0 * float((row.params or {}).get("hinge_friction", 0)),
+        )
+        buckets: list[list[Scenario]] = [[] for _ in range(4)]
+        for index, scenario in enumerate(ordered):
+            bucket_index = min(3, index * 4 // max(len(ordered), 1))
+            buckets[bucket_index].append(scenario)
+        coverage_bands = [round(100.0 * sum(row.id in evaluated_ids for row in bucket) / len(bucket), 1) if bucket else 0.0 for bucket in buckets]
         families.append(
             {
                 "id": f.id,
                 "family": f.family.replace("_", " ").title(),
                 "count": scens,
                 "success": round(fsucc, 1),
-                "coverage": round(100.0 * min(1, len(fam_evals) / max(scens, 1)), 0),
+                "coverage": round(100.0 * len(evaluated_ids) / max(scens, 1), 1),
+                "bands": coverage_bands,
                 "source": f.source,
                 "status": "healthy" if fsucc >= 70 else "at_risk" if fsucc >= 40 else "needs_data" if not fam_evals else "needs_attention",
                 "updated": rel_time(f.created_at),
@@ -212,6 +229,7 @@ async def asset_out(session: AsyncSession, a: Asset) -> dict:
         await session.execute(select(CompileStage).where(CompileStage.asset_id == a.id).order_by(CompileStage.idx))
     ).scalars().all()
     readiness = round(0.4 * a.physics_validity + 0.3 * a.scale_confidence + 0.3 * a.articulation, 1)
+    spec_payload = _asset_spec_payload(a.id)
     return {
         "id": a.id,
         "name": a.name,
@@ -224,14 +242,42 @@ async def asset_out(session: AsyncSession, a: Asset) -> dict:
         "lastEval": rel_time(a.last_eval_at),
         "lastEvalResult": a.last_eval_result,
         "source": a.source,
+        "sourceImage": spec_payload.get("sourceImage"),
+        "sourcePhotos": spec_payload.get("photos", []),
         "parts": a.parts,
         "artifacts": [
             {"type": ar.type, "file": ar.file, "size": fmt_size(ar.size_bytes), "generated": rel_time(ar.created_at)}
             for ar in artifacts
         ],
-        "compile": [{"name": s.name, "duration": fmt_duration(s.duration_s), "status": s.status} for s in stages],
+        "compile": [{"name": s.name, "duration": fmt_duration(s.duration_s), "durationSeconds": round(s.duration_s, 3), "status": s.status} for s in stages],
         "properties": a.properties,
         "tags": a.tags,
+    }
+
+
+def _asset_spec_payload(asset_id: str) -> dict[str, Any]:
+    spec_file = ASSETS_DIR / asset_id / "spec.json"
+    if not spec_file.exists():
+        return {}
+    try:
+        payload = json.loads(spec_file.read_text(encoding="utf8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    photos = payload.get("photos")
+    source_image = None
+    if isinstance(photos, list):
+        for item in photos:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("url")
+            if isinstance(value, str) and value:
+                source_image = value
+                break
+    return {
+        "photos": photos if isinstance(photos, list) else [],
+        "sourceImage": source_image,
     }
 
 

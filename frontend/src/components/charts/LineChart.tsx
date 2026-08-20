@@ -2,7 +2,8 @@ import { useMemo, useRef, useState } from "react";
 
 export interface LineSeries {
   name: string;
-  data: number[];
+  /** A live API may publish a partial series while a job is still running. */
+  data: Array<number | null | undefined>;
   color: string;
   dashed?: boolean;
   /** emphasize end point with a value chip */
@@ -43,24 +44,39 @@ export function LineChart({
   const iw = W - padL - padR;
   const ih = H - padT - padB;
 
-  const all = series.flatMap((s) => s.data);
-  const lo = yMin ?? Math.min(...all);
-  const hi = yMax ?? Math.max(...all);
+  // Do not assume the backend has completed every metric series.  During a
+  // refresh, one curve can be shorter or include a gap; SVG must omit that
+  // point rather than letting `undefined` reach a formatter or `toFixed`.
+  const isNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+  const all = series.flatMap((s) => s.data).filter(isNumber);
+  const lo = yMin ?? (all.length ? Math.min(...all) : 0);
+  const hi = yMax ?? (all.length ? Math.max(...all) : 1);
   const range = hi - lo || 1;
-  const n = Math.max(...series.map((s) => s.data.length));
+  const n = Math.max(2, ...series.map((s) => s.data.length));
 
   const px = (i: number) => padL + (i / (n - 1)) * iw;
   const py = (v: number) => padT + ih - ((v - lo) / range) * ih;
+  const format = (value: unknown) => isNumber(value) ? yFormat(value) : "—";
 
   const ticks = useMemo(
     () => Array.from({ length: yTicks + 1 }, (_, i) => lo + (range * i) / yTicks),
     [lo, range, yTicks],
   );
 
-  const paths = series.map((s) => ({
-    ...s,
-    d: s.data.map((v, i) => `${i === 0 ? "M" : "L"}${px(i).toFixed(1)},${py(v).toFixed(1)}`).join(" "),
-  }));
+  const paths = series.map((s) => {
+    let hasPreviousPoint = false;
+    const d = s.data.map((value, i) => {
+      if (!isNumber(value)) {
+        hasPreviousPoint = false;
+        return "";
+      }
+      const command = hasPreviousPoint ? "L" : "M";
+      hasPreviousPoint = true;
+      return `${command}${px(i).toFixed(1)},${py(value).toFixed(1)}`;
+    }).filter(Boolean).join(" ");
+    const lastIndex = s.data.reduce<number | null>((last, value, index) => isNumber(value) ? index : last, null);
+    return { ...s, d, lastIndex };
+  });
 
   const onMove = (e: React.MouseEvent) => {
     const rect = ref.current?.getBoundingClientRect();
@@ -78,13 +94,13 @@ export function LineChart({
           <g key={t}>
             <line x1={padL} x2={W - padR} y1={py(t)} y2={py(t)} stroke="rgba(148,170,220,0.09)" strokeDasharray={t === lo ? "" : "3 4"} strokeWidth={1} />
             <text x={padL - 7} y={py(t) + 3} textAnchor="end" fontSize={9.5} fill="var(--text-3)" fontFamily="var(--font-mono)">
-              {yFormat(t)}
+              {format(t)}
             </text>
           </g>
         ))}
         {/* x labels */}
         {xLabels?.map((l, i) => (
-          <text key={l} x={padL + (i / (xLabels.length - 1)) * iw} y={H - 9} textAnchor="middle" fontSize={9.5} fill="var(--text-3)">
+          <text key={`${l}-${i}`} x={padL + (i / Math.max(1, xLabels.length - 1)) * iw} y={H - 9} textAnchor="middle" fontSize={9.5} fill="var(--text-3)">
             {l}
           </text>
         ))}
@@ -104,11 +120,11 @@ export function LineChart({
               strokeLinejoin="round"
               opacity={s.dashed ? 0.85 : 1}
             />
-            {!s.dashed && (
-              <circle cx={px(s.data.length - 1)} cy={py(s.data[s.data.length - 1])} r={3} fill={s.color} stroke="#0D1017" strokeWidth={1.4} />
+            {!s.dashed && s.lastIndex !== null && (
+              <circle cx={px(s.lastIndex)} cy={py(s.data[s.lastIndex] as number)} r={3} fill={s.color} stroke="#0D1017" strokeWidth={1.4} />
             )}
-            {endBadges && s.endLabel && (
-              <g transform={`translate(${px(s.data.length - 1) + 6}, ${py(s.data[s.data.length - 1]) - 9})`}>
+            {endBadges && s.endLabel && s.lastIndex !== null && (
+              <g transform={`translate(${px(s.lastIndex) + 6}, ${py(s.data[s.lastIndex] as number) - 9})`}>
                 <rect width={40} height={18} rx={4} fill={s.dashed ? "#283042" : s.color} opacity={s.dashed ? 0.9 : 1} />
                 <text x={20} y={12.5} textAnchor="middle" fontSize={10} fontWeight={650} fill={s.dashed ? "var(--text-2)" : "#fff"} fontFamily="var(--font-mono)">
                   {s.endLabel}
@@ -121,9 +137,9 @@ export function LineChart({
         {hover !== null && (
           <g>
             <line x1={px(hover)} x2={px(hover)} y1={padT} y2={H - padB} stroke="rgba(148,170,220,0.3)" strokeWidth={1} />
-            {paths.map((s) => (
-              <circle key={s.name} cx={px(hover)} cy={py(s.data[hover])} r={3.4} fill={s.color} stroke="#0D1017" strokeWidth={1.6} />
-            ))}
+            {paths.map((s) => isNumber(s.data[hover]) ? (
+              <circle key={s.name} cx={px(hover)} cy={py(s.data[hover] as number)} r={3.4} fill={s.color} stroke="#0D1017" strokeWidth={1.6} />
+            ) : null)}
           </g>
         )}
       </svg>
@@ -133,7 +149,7 @@ export function LineChart({
             <div key={s.name} className="row" style={{ gap: 7 }}>
               <i style={{ width: 8, height: 8, borderRadius: 2, background: s.color, display: "block" }} />
               <span className="t2">{s.name}</span>
-              <b className="mono">{yFormat(s.data[hover])}</b>
+              <b className="mono">{format(s.data[hover])}</b>
             </div>
           ))}
           {xLabels && <div className="micro t3" style={{ marginTop: 3 }}>{xLabels[hover]}</div>}

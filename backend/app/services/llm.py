@@ -90,6 +90,13 @@ async def plan(system: str, user: str, *, span_name: str = "chat planner") -> tu
         return None, "heuristic:provider-circuit-open"
 
     _state.update(status="checking", lastAttemptAt=time.time(), lastError=None, lastRequestId=None)
+    flat = await settings_store.get_flat()
+    effort = str(flat.get("models.reasoningEffort") or "high")
+    if effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
+        effort = "high"
+    verbosity = str(flat.get("models.verbosity") or "medium")
+    if verbosity not in {"low", "medium", "high"}:
+        verbosity = "medium"
     with span(
         span_name,
         **{
@@ -99,20 +106,38 @@ async def plan(system: str, user: str, *, span_name: str = "chat planner") -> tu
         },
     ) as sp:
         try:
-            resp = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-            )
-            request_id = getattr(resp, "_request_id", None)
-            usage = resp.usage
+            if (urlparse(base).hostname or "").lower() == "api.openai.com":
+                resp = await client.responses.create(
+                    model=model,
+                    instructions=system,
+                    input=user,
+                    store=False,
+                    reasoning={"effort": effort},
+                    text={"verbosity": verbosity, "format": {"type": "json_object"}},
+                )
+                request_id = getattr(resp, "_request_id", None)
+                usage = resp.usage
+                text = resp.output_text
+                input_tokens = getattr(usage, "input_tokens", None) if usage else None
+                output_tokens = getattr(usage, "output_tokens", None) if usage else None
+            else:
+                resp = await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    response_format={"type": "json_object"},
+                    temperature=0.2,
+                )
+                request_id = getattr(resp, "_request_id", None)
+                usage = resp.usage
+                text = resp.choices[0].message.content or ""
+                input_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+                output_tokens = getattr(usage, "completion_tokens", None) if usage else None
             if request_id:
                 sp.set_attribute("gen_ai.response.id", request_id)
-            if usage:
-                sp.set_attribute("gen_ai.usage.input_tokens", usage.prompt_tokens)
-                sp.set_attribute("gen_ai.usage.output_tokens", usage.completion_tokens)
-            text = resp.choices[0].message.content or ""
+            if input_tokens is not None:
+                sp.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+            if output_tokens is not None:
+                sp.set_attribute("gen_ai.usage.output_tokens", output_tokens)
             parsed = _json_object(text)
             _state.update(status="healthy", circuitOpen=False, lastError=None, lastRequestId=request_id)
             return parsed, f"llm:{_state['provider']}"

@@ -23,23 +23,24 @@ DATA_DIR = Path(os.environ.get("ROBOTWORLD_DATA_DIR", BASE_DIR / "data")).resolv
 ASSETS_DIR = DATA_DIR / "assets"
 DEMOS_DIR = DATA_DIR / "demos"
 MODELS_DIR = DATA_DIR / "models"
+WORLDS_DIR = DATA_DIR / "worlds"
 DB_PATH = DATA_DIR / "robotworld.db"
 
-for _d in (DATA_DIR, ASSETS_DIR, DEMOS_DIR, MODELS_DIR):
+for _d in (DATA_DIR, ASSETS_DIR, DEMOS_DIR, MODELS_DIR, WORLDS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
 class EnvSettings(BaseSettings):
     """Bootstrap-only environment overrides (DB settings take precedence)."""
 
-    model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), extra="ignore")
+    model_config = SettingsConfigDict(env_file=(str(BASE_DIR.parent / ".env"), str(BASE_DIR / ".env")), extra="ignore")
 
     host: str = "127.0.0.1"
     port: int = 8000
 
     openai_api_key: str | None = None
     openai_base_url: str | None = None
-    openai_model: str = "gpt-4o"
+    openai_model: str = "gpt-5.6-luna"
 
     policy_endpoint: str | None = None
     policy_api_key: str | None = None
@@ -123,13 +124,19 @@ DEFAULT_SETTINGS: dict = {
     "models": {
         "planner": env.openai_model,
         "vlm": env.openai_model,
+        # Evidence extraction is an explicit, audited action.  It is not the
+        # planner and it never runs during an asset build by default.
+        "assetAnalysisModel": "gpt-5.6-luna",
+        "reasoningEffort": "high",
+        "verbosity": "medium",
         # Asset validation and learned-policy evaluation are deliberately
         # separate.  The former may use the privileged scripted oracle; the
         # latter must use rendered pixels and an external embodied checkpoint.
         "policy": "asset-validation",
         "policyEndpoint": env.policy_endpoint or "",
         "policyApiKey": env.policy_api_key or "",
-        "policyId": "unconfigured",
+        "policyId": "lerobot/VLA-JEPA-Pretrain",
+        "policyPath": r"D:\VLA-JEPA-Pretrain",
         "policyEmbodiment": "robotworld-4dof-v1",
         "policyModelRevision": env.policy_model_revision or "",
         "policyModelSha256": env.policy_model_sha256 or "",
@@ -141,6 +148,10 @@ DEFAULT_SETTINGS: dict = {
         "trellisEndpoint": env.trellis_endpoint or "",
         "trellisApiKey": env.trellis_api_key or "",
         "trellisModel": "microsoft/TRELLIS.2-4B",
+        "trellisRuntime": "native",
+        "trellisResolution": 1024,
+        "trellisNativePath": r"D:\TRELLIS.2-4B",
+        "trellisGgufPath": r"D:\TRELLIS.2-4B-Quant-GGUF",
         "trellisTimeoutS": 300,
         "openaiKey": env.openai_api_key or "",
         "openaiBaseUrl": env.openai_base_url or "https://api.openai.com/v1",

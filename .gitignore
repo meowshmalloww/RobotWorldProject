@@ -26,3 +26,8 @@ frontend/electron-dist/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local service launch/runtime logs
+*.log
+*.out
+*.err

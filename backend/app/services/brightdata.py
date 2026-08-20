@@ -146,7 +146,11 @@ async def google_images(query: str, *, country: str = "us", language: str = "en"
         creds = await _creds()
         url = (
             f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}"
-            f"&hl={language}&gl={country}&udm=2"
+            # Bright Data only returns the documented ``images`` array when
+            # Google parsing is explicitly requested.  ``udm=2`` switches the
+            # Google surface to Images; ``brd_json=1`` asks the SERP zone for
+            # the structured schema rather than an HTML response wrapper.
+            f"&hl={language}&gl={country}&udm=2&brd_json=1"
             + ("&tbs=isz:l" if large else "")
         )
         data = await _request(creds["serp_zone"], url)

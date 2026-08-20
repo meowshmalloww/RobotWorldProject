@@ -98,7 +98,7 @@ export interface Artifact {
   generated: string;
 }
 
-export interface CompileStage { name: string; duration: string; status: "passed" | "failed" | "running" }
+export interface CompileStage { name: string; duration: string; durationSeconds: number; status: "passed" | "failed" | "running" }
 
 export interface Asset {
   id: string;
@@ -112,6 +112,8 @@ export interface Asset {
   lastEval: string;
   lastEvalResult: "passed" | "failed" | "pending";
   source: string;
+  sourceImage?: string;
+  sourcePhotos?: PhotoCandidate[];
   parts: AssetPart[];
   artifacts: Artifact[];
   compile: CompileStage[];
@@ -125,6 +127,7 @@ export interface Asset {
 /* ---- Worlds / scene composer ------------------------------------------- */
 export interface SceneNode {
   id: string;
+  assetId?: string;
   name: string;
   icon: string;
   visible?: boolean;
@@ -251,4 +254,4 @@ export interface PipelineActivity {
 
 export interface SkillGap { icon: string; name: string; family: string; success: number; coverage: number }
 
-export interface RecentCandidate { name: string; status: "promoted" | "blocked" }
+export interface RecentCandidate { id: string; name: string; status: "promoted" | "blocked" }

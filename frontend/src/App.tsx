@@ -1,5 +1,6 @@
 import { Suspense, lazy, useState } from "react";
 import { HashRouter, Navigate, Route, Routes } from "react-router-dom";
+import { AppErrorBoundary } from "./components/ErrorBoundary";
 import { Sidebar } from "./components/shell/Sidebar";
 import { StatusBar, Titlebar } from "./components/shell/Titlebar";
 import { ToastProvider } from "./components/ui/Toast";
@@ -20,12 +21,13 @@ export default function App() {
   return (
     <HashRouter>
       <ToastProvider>
-        <div className={`app-shell ${collapsed ? "collapsed" : ""}`}>
-          <Titlebar />
-          <Sidebar collapsed={collapsed} onToggle={() => setCollapsed(!collapsed)} />
-          <main className="main">
-            <Suspense fallback={<div className="page" style={{ color: "var(--text-3)", fontSize: "var(--fs-body)" }}>Loading…</div>}>
-              <Routes>
+        <AppErrorBoundary>
+          <div className={`app-shell ${collapsed ? "collapsed" : ""}`}>
+            <Titlebar />
+            <Sidebar collapsed={collapsed} onToggle={() => setCollapsed(!collapsed)} />
+            <main className="main">
+              <Suspense fallback={<div className="page" style={{ color: "var(--text-3)", fontSize: "var(--fs-body)" }}>Loading...</div>}>
+                <Routes>
                   <Route path="/" element={<Overview />} />
                   <Route path="/skills" element={<Skills />} />
                   <Route path="/skills/:skillId" element={<SkillDetail />} />
@@ -40,10 +42,11 @@ export default function App() {
                   <Route path="/settings" element={<Settings />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>
-            </Suspense>
-          </main>
-          <StatusBar />
-        </div>
+              </Suspense>
+            </main>
+            <StatusBar />
+          </div>
+        </AppErrorBoundary>
       </ToastProvider>
     </HashRouter>
   );

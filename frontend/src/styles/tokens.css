@@ -60,7 +60,7 @@
   --r-sm: 6px;
   --r-md: 8px;
   --r-lg: 12px;
-  --titlebar-h: 40px;
+  --titlebar-h: 44px;
   --statusbar-h: 26px;
   --sidebar-w: 212px;
   --sidebar-w-collapsed: 52px;
@@ -69,4 +69,12 @@
   --shadow-modal: 0 24px 64px rgba(0, 0, 0, 0.55), 0 4px 16px rgba(0, 0, 0, 0.4);
   --shadow-viewport: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
   --ease: cubic-bezier(0.33, 0.6, 0.2, 1);
+  
+  --z-base: 0;
+  --z-chart-tip: 20;
+  --z-vp-overlay: 40;
+  --z-panel-overlay: 45;
+  --z-menu: 120;
+  --z-modal: 180;
+  --z-toast: 220;
 }

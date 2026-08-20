@@ -27,9 +27,21 @@ interface TrainingData {
   } | null;
 }
 
+interface LocalVlaStatus {
+  available: boolean;
+  modelId?: string;
+  path: string;
+  modelBytes?: number;
+  tensorCount?: number;
+  checkpoint?: { dtype: string; backbone: string; cameras: string[]; stateSize: number; actionSize: number; actionHorizon: number };
+  robotWorldContract?: { compatible: boolean; blockers: string[] };
+  runtime?: { resident: boolean; idleUnloadSeconds: number; lerobotInstalledInBackend: boolean; loadAllowed: boolean };
+}
+
 export default function Training() {
   const toast = useToast();
   const { data, error, loading, refetch } = useApi<TrainingData>("/training");
+  const { data: localVla, error: localVlaError, loading: localVlaLoading } = useApi<LocalVlaStatus>("/models/vla-jepa/status");
   // needed for the "run the agent" button when there is no decision yet
   const { data: skillsData } = useApi<{ skills: Skill[] }>("/skills");
   const [runningAgent, setRunningAgent] = useState(false);
@@ -74,6 +86,29 @@ export default function Training() {
           <button className="btn btn-secondary" disabled title="RobotWorld will not train until a separate training environment is explicitly authorized"><Icon name="lock" size={13} /> Training disabled</button>
         </div>
       </div>
+
+      <Card
+        title="Local VLA-JEPA checkpoint"
+        right={<StatusBadge status={localVla?.robotWorldContract?.compatible ? "ready" : localVla?.available ? "blocked" : "offline"} />}
+        style={{ marginBottom: 10 }}
+      >
+        {localVlaLoading ? <Skeleton rows={3} /> : localVlaError ? <ErrorState message={localVlaError.message} /> : localVla ? (
+          <div className="col" style={{ gap: 8 }}>
+            <div className="st-grid">
+              <div className="kv-row"><span className="kv-k">Checkpoint</span><span className="kv-v mono">{localVla.modelId ?? "unavailable"}</span></div>
+              <div className="kv-row"><span className="kv-k">Weights</span><span className="kv-v mono">{localVla.modelBytes ? `${(localVla.modelBytes / 1e9).toFixed(2)} GB · ${localVla.tensorCount} tensors` : "missing"}</span></div>
+              <div className="kv-row"><span className="kv-k">Runtime residency</span><span className="kv-v mono">{localVla.runtime?.resident ? "loaded" : `offloaded · ${localVla.runtime?.idleUnloadSeconds ?? 300}s policy`}</span></div>
+              <div className="kv-row"><span className="kv-k">I/O contract</span><span className="kv-v mono">{localVla.checkpoint ? `${localVla.checkpoint.cameras.length} cameras · state ${localVla.checkpoint.stateSize} · action ${localVla.checkpoint.actionSize}×${localVla.checkpoint.actionHorizon}` : "unknown"}</span></div>
+            </div>
+            {localVla.robotWorldContract && !localVla.robotWorldContract.compatible && (
+              <div className="callout callout-warn" style={{ margin: 0 }}>
+                <Icon name="warning" size={13} />
+                <span><b>Execution blocked by embodiment contract.</b> {localVla.robotWorldContract.blockers.join("; ")}.</span>
+              </div>
+            )}
+          </div>
+        ) : null}
+      </Card>
 
       <div className="tr-stats">
         {loading && !data

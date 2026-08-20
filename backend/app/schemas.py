@@ -273,6 +273,7 @@ class SkillGap(BaseModel):
 
 
 class RecentCandidate(BaseModel):
+    id: str
     name: str
     status: Literal["promoted", "blocked"]
 

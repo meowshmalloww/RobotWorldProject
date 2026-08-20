@@ -9,13 +9,12 @@ import { api, ApiError } from "../lib/api";
 import { useApi } from "../lib/useApi";
 import { ErrorState, Skeleton } from "../lib/states";
 
-const NAV: { id: string; label: string; icon: IconName }[] = [
+const NAV: { id: Section; label: string; icon: IconName }[] = [
   { id: "general", label: "General", icon: "settings" },
-  { id: "appearance", label: "Appearance", icon: "sun" },
+  { id: "models", label: "Models", icon: "robot" },
   { id: "integrations", label: "Integrations", icon: "link" },
   { id: "simulation", label: "Simulation", icon: "worlds" },
-  { id: "models", label: "Models", icon: "agent" },
-  { id: "apikeys", label: "API Keys", icon: "lock" },
+  { id: "appearance", label: "Appearance", icon: "sun" },
   { id: "about", label: "About", icon: "info" },
 ];
 
@@ -30,15 +29,21 @@ export interface SettingsData {
   };
   simulation: { engine: string; gravity: number; timestepHz: number; renderer: string };
   models: {
-    planner: string; vlm: string; policy: string; openaiKey: string; openaiBaseUrl: string; provider: string; timeoutS: number;
+    planner: string; vlm: string; assetAnalysisModel: string; reasoningEffort: string; verbosity: string;
+    policy: string; openaiKey: string; openaiBaseUrl: string; provider: string; timeoutS: number;
     policyEndpoint: string; policyApiKey: string; policyId: string; policyEmbodiment: string; policyInstruction: string;
+    policyPath: string;
     policyModelRevision: string; policyModelSha256: string; policyNormalizationSha256: string; policyEnvironmentSha256: string;
     policyTimeoutS: number; policyExecutionHorizon: number;
     trellisEndpoint: string; trellisApiKey: string; trellisModel: string; trellisTimeoutS: number;
+    trellisRuntime: string; trellisResolution: number; trellisNativePath: string; trellisGgufPath: string;
   };
 }
 
-type Section = "general" | "appearance" | "integrations" | "simulation" | "models";
+type Section = "general" | "appearance" | "integrations" | "models" | "simulation" | "about";
+type EditableSection = "general" | "appearance" | "integrations" | "models" | "simulation";
+
+const TAB_IDS: Section[] = ["general", "models", "integrations", "simulation", "appearance", "about"];
 
 const ACCENTS: Record<string, string> = { graphite: "#E5E5E5", orange: "#B77B55", teal: "#629A9A", purple: "#8E82B5" };
 
@@ -60,8 +65,9 @@ function applyAppearance(a: SettingsData["appearance"]) {
 
 export default function Settings() {
   const [params, setParams] = useSearchParams();
-  const tab = params.get("tab") ?? "general";
-  const setTab = (t: string) => setParams(t === "general" ? {} : { tab: t }, { replace: true });
+  const rawTab = params.get("tab");
+  const tab = (rawTab && TAB_IDS.includes(rawTab as Section) ? (rawTab as Section) : "general");
+  const setTab = (t: Section) => setParams(t === "general" ? {} : { tab: t }, { replace: true });
   const { data, error, loading, refetch } = useApi<SettingsData>("/settings");
   const [draft, setDraft] = useState<SettingsData | null>(null);
 
@@ -75,7 +81,7 @@ export default function Settings() {
     if (data) applyAppearance(data.appearance);
   }, [data]);
 
-  const update = <S extends Section>(section: S, patch: Partial<SettingsData[S]>) =>
+  const update = <S extends EditableSection>(section: S, patch: Partial<SettingsData[S]>) =>
     setDraft((d) => (d ? { ...d, [section]: { ...d[section], ...patch } } : d));
 
   return (
@@ -83,7 +89,7 @@ export default function Settings() {
       <div className="page-head">
         <div>
           <h1 className="page-title">Settings</h1>
-          <p className="page-sub">Configure RobotWorld, integrations, and the simulation pipeline.</p>
+          <p className="page-sub">Configure the editor, appearance, runtime, and local workspace behavior.</p>
         </div>
       </div>
 
@@ -102,11 +108,10 @@ export default function Settings() {
 
           <div className="st-content">
             {tab === "general" && <GeneralPane draft={draft.general} onChange={(p) => update("general", p)} />}
-            {tab === "appearance" && <AppearancePane draft={draft.appearance} onChange={(p) => update("appearance", p)} />}
-            {tab === "integrations" && <IntegrationsPane draft={draft.integrations} onChange={(p) => update("integrations", p)} />}
-            {tab === "simulation" && <SimulationPane draft={draft.simulation} onChange={(p) => update("simulation", p)} />}
             {tab === "models" && <ModelsPane draft={draft.models} onChange={(p) => update("models", p)} />}
-            {tab === "apikeys" && <ApiKeysPane settings={draft} />}
+            {tab === "integrations" && <IntegrationsPane draft={draft.integrations} onChange={(p) => update("integrations", p)} />}
+            {tab === "appearance" && <AppearancePane draft={draft.appearance} onChange={(p) => update("appearance", p)} />}
+            {tab === "simulation" && <SimulationPane draft={draft.simulation} onChange={(p) => update("simulation", p)} />}
             {tab === "about" && <AboutPane />}
           </div>
         </div>
@@ -143,7 +148,7 @@ function SaveSection({ section, draft, extra }: { section: Section; draft: unkno
   return (
     <div className="row" style={{ marginTop: 14, justifyContent: "flex-end" }}>
       <button className="btn btn-primary btn-sm" onClick={save} disabled={saving}>
-        <Icon name="check" size={12} /> {saving ? "Saving…" : "Save changes"}
+        <Icon name="check" size={12} /> {saving ? "Saving..." : "Save changes"}
       </button>
     </div>
   );
@@ -179,7 +184,7 @@ function AppearancePane({ draft, onChange }: { draft: SettingsData["appearance"]
       <div className="st-grid">
         <FormRow label="Theme">
           <select className="select" value={draft.theme} onChange={(e) => set({ theme: e.target.value })}>
-            <option value="dark">Dark — Editor</option><option value="darker">Dark — Neutral</option>
+            <option value="dark">Dark - Editor</option><option value="darker">Dark - Neutral</option>
           </select>
         </FormRow>
         <FormRow label="Accent color">
@@ -198,7 +203,7 @@ function AppearancePane({ draft, onChange }: { draft: SettingsData["appearance"]
   );
 }
 
-function IntegrationsPane({ draft, onChange }: { draft: SettingsData["integrations"]; onChange: (p: Partial<SettingsData["integrations"]>) => void }) {
+export function IntegrationsPane({ draft, onChange }: { draft: SettingsData["integrations"]; onChange: (p: Partial<SettingsData["integrations"]>) => void }) {
   const toast = useToast();
   const [probingBrightData, setProbingBrightData] = useState(false);
   const [probingSigNoz, setProbingSigNoz] = useState(false);
@@ -208,7 +213,7 @@ function IntegrationsPane({ draft, onChange }: { draft: SettingsData["integratio
     setProbingBrightData(true);
     try {
       const result = await api.post<{ organicCount: number; sampleDomains: string[] }>("/integrations/brightdata/probe", {});
-      toast.push("ok", "Bright Data verified", `${result.organicCount} live organic results · ${result.sampleDomains.join(", ")}`);
+      toast.push("ok", "Bright Data verified", `${result.organicCount} live organic results - ${result.sampleDomains.join(", ")}`);
     } catch (e) {
       toast.push("err", "Bright Data verification failed", e instanceof ApiError ? e.message : String(e));
     } finally {
@@ -220,7 +225,7 @@ function IntegrationsPane({ draft, onChange }: { draft: SettingsData["integratio
     try {
       const result = await api.post<{ version: string | null; queryKeyConfigured: boolean }>("/integrations/signoz/probe", {});
       const queryState = result.queryKeyConfigured ? "query API ready" : "create a local service-account key for agent queries";
-      toast.push("ok", "SigNoz Community verified", `${result.version ?? "local instance"} · OTLP receiver reachable · ${queryState}`);
+      toast.push("ok", "SigNoz Community verified", `${result.version ?? "local instance"} - OTLP receiver reachable - ${queryState}`);
     } catch (e) {
       toast.push("err", "SigNoz verification failed", e instanceof ApiError ? e.message : String(e));
     } finally {
@@ -238,17 +243,16 @@ function IntegrationsPane({ draft, onChange }: { draft: SettingsData["integratio
         title={<span className="row" style={{ gap: 10 }}><span className="brand-ico brand-brightdata" style={{ width: 26, height: 26, fontSize: 11 }}>B</span>Bright Data</span>}
         right={<Badge tone={draft.brightdata.enabled ? "green" : "grey"}>{draft.brightdata.enabled ? "Active" : "Disabled"}</Badge>}
       >
-        <p className="small t2" style={{ marginBottom: 12 }}>Scraper Studio — collector lifecycle: run → heal → approve → rerun</p>
+        <p className="small t2" style={{ marginBottom: 12 }}>Scraper Studio - collector lifecycle: run, heal, approve, rerun</p>
         <div className="st-grid">
           <FormRow label="Account ID"><input className="input mono" value={draft.brightdata.accountId} onChange={(e) => setBd({ accountId: e.target.value })} /></FormRow>
           <FormRow label="SERP zone"><input className="input mono" value={draft.brightdata.serpZone} onChange={(e) => setBd({ serpZone: e.target.value })} /></FormRow>
           <FormRow label="Unlocker zone"><input className="input mono" value={draft.brightdata.unlockerZone} onChange={(e) => setBd({ unlockerZone: e.target.value })} /></FormRow>
-          <FormRow label="API key"><input className="input mono" value={draft.brightdata.apiKey} readOnly title="Rotate under API Keys" /></FormRow>
         </div>
         <ToggleRow label="Enabled" desc="Allow collectors to run through Bright Data zones" checked={draft.brightdata.enabled} onChange={(v) => setBd({ enabled: v })} />
         <div className="row" style={{ marginTop: 10 }}>
           <button className="btn btn-secondary btn-sm" disabled={probingBrightData} onClick={probeBrightData} title="Sends one billable Google SERP request using the saved key and zone">
-            <Icon name="shield" size={12} /> {probingBrightData ? "Checking live SERP…" : "Run paid SERP check"}
+            <Icon name="shield" size={12} /> {probingBrightData ? "Checking live SERP..." : "Run paid SERP check"}
           </button>
           <span className="small t3">Save settings first. One live request.</span>
         </div>
@@ -259,14 +263,13 @@ function IntegrationsPane({ draft, onChange }: { draft: SettingsData["integratio
       >
         <p className="small t2" style={{ marginBottom: 12 }}>Self-hosted SigNoz Community. OTLP ingestion is keyless; agent queries use a service-account key created inside your local SigNoz.</p>
         <div className="st-grid">
-          <FormRow label="Deployment"><input className="input mono" value="Community · self-hosted" readOnly /></FormRow>
+          <FormRow label="Deployment"><input className="input mono" value="Community - self-hosted" readOnly /></FormRow>
           <FormRow label="OTLP HTTP endpoint"><input className="input mono" value={draft.signoz.endpoint} onChange={(e) => setSz({ endpoint: e.target.value })} placeholder="http://127.0.0.1:4318" /></FormRow>
           <FormRow label="SigNoz UI"><input className="input mono" value={draft.signoz.queryEndpoint} onChange={(e) => setSz({ queryEndpoint: e.target.value })} placeholder="http://127.0.0.1:8080" /></FormRow>
-          <FormRow label="Query API key"><input className="input mono" value={draft.signoz.apiKey} readOnly title="Rotate under API Keys" /></FormRow>
         </div>
         <ToggleRow label="Enabled" desc="Export OpenTelemetry pipelines to this SigNoz instance" checked={draft.signoz.enabled} onChange={(v) => setSz({ enabled: v })} />
         <div className="row" style={{ marginTop: 10 }}>
-          <button className="btn btn-secondary btn-sm" disabled={probingSigNoz} onClick={probeSigNoz}><Icon name="shield" size={12} /> {probingSigNoz ? "Checking local stack…" : "Verify local SigNoz"}</button>
+          <button className="btn btn-secondary btn-sm" disabled={probingSigNoz} onClick={probeSigNoz}><Icon name="shield" size={12} /> {probingSigNoz ? "Checking local stack..." : "Verify local SigNoz"}</button>
           <button className="btn btn-ghost btn-sm" onClick={openSigNoz}><Icon name="external" size={12} /> Open SigNoz UI</button>
         </div>
         <p className="micro t3" style={{ marginTop: 8 }}>After enabling or changing OTLP settings, restart RobotWorld so traces, logs, and metrics attach together.</p>
@@ -278,6 +281,165 @@ function IntegrationsPane({ draft, onChange }: { draft: SettingsData["integratio
   );
 }
 
+interface ModelStatusData {
+  vlaJepa: { available: boolean; robotWorldContract?: { compatible: boolean; blockers: string[] } };
+  trellis: Array<{ id: string; label: string; path: string; precision: string; weightsBytes: number; status: string; blockers?: string[] }>;
+  generationHistory: Array<{ assetId: string; name: string; runtime: string; resolution: number; totalSeconds: number }>;
+  benchmarkComparable: boolean;
+  benchmarkBlocker: string;
+}
+
+export function ModelsPane({ draft, onChange }: { draft: SettingsData["models"]; onChange: (p: Partial<SettingsData["models"]>) => void }) {
+  const toast = useToast();
+  const [probingTrellis, setProbingTrellis] = useState(false);
+  const [openaiKey, setOpenaiKey] = useState("");
+  const [savingKey, setSavingKey] = useState(false);
+  const { data: status, error: statusError, refetch: refetchStatus } = useApi<ModelStatusData>("/models/status");
+  const setModel = (patch: Partial<SettingsData["models"]>) => onChange(patch);
+
+  const rotateOpenAIKey = async () => {
+    if (!openaiKey.trim()) return;
+    setSavingKey(true);
+    try {
+      await api.put("/settings/keys/openai", { key: openaiKey.trim() });
+      setOpenaiKey("");
+      toast.push("ok", "OpenAI credential updated", "Stored server-side; the editor cannot read it back.");
+    } catch (e) {
+      toast.push("err", "Could not update OpenAI key", e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setSavingKey(false);
+    }
+  };
+
+  const probeTrellis = async () => {
+    setProbingTrellis(true);
+    try {
+      const result = await api.post<{ model: string; precision: string; supportedResolutions: number[] }>("/integrations/trellis/probe", {});
+      toast.push("ok", "TRELLIS endpoint verified", `${result.model} - ${result.precision} - ${result.supportedResolutions.join(" / ")}`);
+    } catch (e) {
+      toast.push("err", "TRELLIS contract check failed", e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setProbingTrellis(false);
+    }
+  };
+
+  const incompatible = status?.vlaJepa.robotWorldContract && !status.vlaJepa.robotWorldContract.compatible;
+  return <div className="st-stack">
+    <Card title="OpenAI reasoning">
+      <div className="st-grid">
+        <FormRow label="Planner model"><input className="input mono" value={draft.planner} onChange={(e) => setModel({ planner: e.target.value })} /></FormRow>
+        <FormRow label="VLM / orchestrator"><input className="input mono" value={draft.vlm} onChange={(e) => setModel({ vlm: e.target.value })} /></FormRow>
+        <FormRow label="Evidence model"><input className="input mono" value={draft.assetAnalysisModel} onChange={(e) => setModel({ assetAnalysisModel: e.target.value })} /></FormRow>
+        <FormRow label="Provider"><select className="select" value={draft.provider} onChange={(e) => setModel({ provider: e.target.value })}><option value="openai-compatible">OpenAI / compatible</option><option value="openai">OpenAI official</option><option value="local">Local compatible endpoint</option></select></FormRow>
+        <FormRow label="Reasoning effort"><select className="select" value={draft.reasoningEffort} onChange={(e) => setModel({ reasoningEffort: e.target.value })}>{["none", "low", "medium", "high", "xhigh", "max"].map((value) => <option value={value} key={value}>{value}</option>)}</select></FormRow>
+        <FormRow label="Response detail"><select className="select" value={draft.verbosity} onChange={(e) => setModel({ verbosity: e.target.value })}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></FormRow>
+        <FormRow label="OpenAI base URL"><input className="input mono" value={draft.openaiBaseUrl} onChange={(e) => setModel({ openaiBaseUrl: e.target.value })} /></FormRow>
+        <FormRow label="Timeout (s)"><input className="input mono" type="number" value={draft.timeoutS} onChange={(e) => setModel({ timeoutS: Number(e.target.value) || 0 })} /></FormRow>
+      </div>
+      <div className="st-secret-row"><div><b>OpenAI API key</b><span className="micro t3">Stored: {draft.openaiKey ? "yes" : "no"}. Write-only.</span></div><input className="input mono" type="password" autoComplete="new-password" value={openaiKey} onChange={(e) => setOpenaiKey(e.target.value)} placeholder="Paste replacement key" /><button className="btn btn-secondary btn-sm" disabled={savingKey || !openaiKey.trim()} onClick={rotateOpenAIKey}>{savingKey ? "Saving..." : "Update key"}</button></div>
+    </Card>
+
+    <Card title="Robot policy / VLA-JEPA" right={<Badge tone={incompatible ? "amber" : "teal"}>{incompatible ? "Adaptation required" : "Detected"}</Badge>}>
+      <div className="st-grid">
+        <FormRow label="Default checkpoint"><input className="input mono" value={draft.policyId} onChange={(e) => setModel({ policyId: e.target.value })} /></FormRow>
+        <FormRow label="Local checkpoint"><input className="input mono" value={draft.policyPath} onChange={(e) => setModel({ policyPath: e.target.value })} /></FormRow>
+        <FormRow label="Policy endpoint"><input className="input mono" value={draft.policyEndpoint} onChange={(e) => setModel({ policyEndpoint: e.target.value })} /></FormRow>
+        <FormRow label="Policy revision"><input className="input mono" value={draft.policyModelRevision} onChange={(e) => setModel({ policyModelRevision: e.target.value })} /></FormRow>
+        <FormRow label="Execution timeout"><input className="input mono" type="number" value={draft.policyTimeoutS} onChange={(e) => setModel({ policyTimeoutS: Number(e.target.value) || 0 })} /></FormRow>
+        <FormRow label="Action horizon"><input className="input mono" type="number" value={draft.policyExecutionHorizon} onChange={(e) => setModel({ policyExecutionHorizon: Number(e.target.value) || 0 })} /></FormRow>
+      </div>
+      {incompatible && <div className="st-blocker"><b>Execution remains safety-blocked</b>{status?.vlaJepa.robotWorldContract?.blockers.map((value) => <span key={value}>{value}</span>)}<span>Fine-tune or reinitialize the camera, state, and action adapters for this robot before control is enabled.</span></div>}
+    </Card>
+
+    <Card title="Microsoft TRELLIS.2" right={<Badge tone={draft.trellisRuntime === "native" ? "teal" : "amber"}>{draft.trellisRuntime === "native" ? "Native" : "GGUF"}</Badge>}>
+      <div className="st-grid">
+        <FormRow label="Runtime"><select className="select" value={draft.trellisRuntime} onChange={(e) => setModel({ trellisRuntime: e.target.value })}><option value="native">Microsoft native BF16/FP16</option><option value="gguf">GGUF / trellis.cpp</option></select></FormRow>
+        <FormRow label="Resolution"><select className="select" value={draft.trellisResolution} onChange={(e) => setModel({ trellisResolution: Number(e.target.value) })}><option value={512}>512 - preview</option><option value={1024}>1024 - balanced</option><option value={1536}>1536 - maximum</option></select></FormRow>
+        <FormRow label="Gateway endpoint"><input className="input mono" value={draft.trellisEndpoint} onChange={(e) => setModel({ trellisEndpoint: e.target.value })} /></FormRow>
+        <FormRow label="Model"><input className="input mono" value={draft.trellisModel} onChange={(e) => setModel({ trellisModel: e.target.value })} /></FormRow>
+        <FormRow label="Native weights"><input className="input mono" value={draft.trellisNativePath} onChange={(e) => setModel({ trellisNativePath: e.target.value })} /></FormRow>
+        <FormRow label="GGUF weights"><input className="input mono" value={draft.trellisGgufPath} onChange={(e) => setModel({ trellisGgufPath: e.target.value })} /></FormRow>
+        <FormRow label="Timeout (s)"><input className="input mono" type="number" value={draft.trellisTimeoutS} onChange={(e) => setModel({ trellisTimeoutS: Number(e.target.value) || 0 })} /></FormRow>
+      </div>
+      <p className="small t2" style={{ marginTop: 10 }}>Official modes are 512, 1024, and 1536. The requested 500/1584 choices map to supported 512/1536 modes.</p>
+      <div className="row" style={{ marginTop: 10 }}><button className="btn btn-secondary btn-sm" disabled={probingTrellis} onClick={probeTrellis}><Icon name="shield" size={12} /> {probingTrellis ? "Checking..." : "Verify endpoint"}</button></div>
+    </Card>
+
+    <Card title="Installed runtimes" right={<button className="btn btn-ghost btn-sm" onClick={refetchStatus}><Icon name="refresh" size={12} /> Rescan</button>}>
+      {statusError && <span className="small" style={{ color: "var(--red)" }}>{statusError.message}</span>}
+      {status?.trellis.map((runtime) => <div className="st-runtime" key={runtime.id}><div><b>{runtime.label}</b><span className="mono micro t3">{runtime.path}</span></div><span className="mono small">{runtime.precision} - {(runtime.weightsBytes / 1024 ** 3).toFixed(1)} GB</span><Badge tone={runtime.status.startsWith("ready") ? "teal" : "amber"}>{runtime.status.replaceAll("_", " ")}</Badge>{runtime.blockers?.map((value) => <span className="micro t3 st-runtime-note" key={value}>{value}</span>)}</div>)}
+      {status && !status.benchmarkComparable && <div className="st-blocker"><b>Quantized comparison not runnable</b><span>{status.benchmarkBlocker}</span><span>The native rows below are measured compile timings; no quantized number is fabricated.</span></div>}
+      {status?.generationHistory.length ? <div className="table-scroll" style={{ marginTop: 10 }}><table className="table"><thead><tr><th>Asset</th><th>Runtime</th><th>Resolution</th><th style={{ textAlign: "right" }}>Total</th></tr></thead><tbody>{status.generationHistory.slice(0, 8).map((row) => <tr key={row.assetId}><td>{row.name}</td><td className="mono">{row.runtime}</td><td className="mono">{row.resolution}</td><td className="mono" style={{ textAlign: "right" }}>{row.totalSeconds.toFixed(1)} s</td></tr>)}</tbody></table></div> : null}
+    </Card>
+    <Card><SaveSection section="models" draft={draft} /></Card>
+  </div>;
+}
+
+function LegacyModelsPane({ draft, onChange }: { draft: SettingsData["models"]; onChange: (p: Partial<SettingsData["models"]>) => void }) {
+  const toast = useToast();
+  const [probingTrellis, setProbingTrellis] = useState(false);
+
+  const setModel = (p: Partial<SettingsData["models"]>) => onChange(p);
+
+  const probeTrellis = async () => {
+    setProbingTrellis(true);
+    try {
+      const result = await api.post<{ compatible: boolean; schemaVersion: string; model: string; output: string; articulation: boolean; pbr: boolean }>(
+        "/integrations/trellis/probe",
+        {},
+      );
+      toast.push("ok", "TRELLIS contract", `${result.model} • ${result.output} • schema ${result.schemaVersion}`);
+    } catch (e) {
+      toast.push("err", "TRELLIS contract check failed", e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setProbingTrellis(false);
+    }
+  };
+
+  return (
+    <div className="st-stack">
+      <Card title="Planning and policies">
+        <div className="st-grid">
+          <FormRow label="Planner model"><input className="input mono" value={draft.planner} onChange={(e) => setModel({ planner: e.target.value })} /></FormRow>
+          <FormRow label="VLM / orchestration model"><input className="input mono" value={draft.vlm} onChange={(e) => setModel({ vlm: e.target.value })} /></FormRow>
+          <FormRow label="OpenAI base URL"><input className="input mono" value={draft.openaiBaseUrl} onChange={(e) => setModel({ openaiBaseUrl: e.target.value })} /></FormRow>
+          <FormRow label="OpenAI API key"><input className="input mono" value={draft.openaiKey} onChange={(e) => setModel({ openaiKey: e.target.value })} /></FormRow>
+          <FormRow label="Model timeout (s)"><input className="input mono" type="number" value={draft.timeoutS} onChange={(e) => setModel({ timeoutS: Number(e.target.value) || 0 })} /></FormRow>
+        </div>
+      </Card>
+      <Card title="Policy / VLA settings">
+        <div className="st-grid">
+          <FormRow label="Policy endpoint"><input className="input mono" value={draft.policyEndpoint} onChange={(e) => setModel({ policyEndpoint: e.target.value })} /></FormRow>
+          <FormRow label="Policy API key"><input className="input mono" value={draft.policyApiKey} onChange={(e) => setModel({ policyApiKey: e.target.value })} /></FormRow>
+          <FormRow label="Policy revision"><input className="input mono" value={draft.policyModelRevision} onChange={(e) => setModel({ policyModelRevision: e.target.value })} /></FormRow>
+          <FormRow label="Policy execution timeout (s)"><input className="input mono" type="number" value={draft.policyTimeoutS} onChange={(e) => setModel({ policyTimeoutS: Number(e.target.value) || 0 })} /></FormRow>
+          <FormRow label="Policy horizon"><input className="input mono" type="number" value={draft.policyExecutionHorizon} onChange={(e) => setModel({ policyExecutionHorizon: Number(e.target.value) || 0 })} /></FormRow>
+        </div>
+      </Card>
+      <Card title="TRELLIS.2 visual generator">
+        <div className="st-grid">
+          <FormRow label="Gateway endpoint">
+            <input className="input mono" value={draft.trellisEndpoint} onChange={(e) => setModel({ trellisEndpoint: e.target.value })} />
+          </FormRow>
+          <FormRow label="Gateway token"><input className="input mono" value={draft.trellisApiKey} onChange={(e) => setModel({ trellisApiKey: e.target.value })} /></FormRow>
+          <FormRow label="Model"><input className="input mono" value={draft.trellisModel} onChange={(e) => setModel({ trellisModel: e.target.value })} /></FormRow>
+          <FormRow label="Timeout (s)"><input className="input mono" type="number" value={draft.trellisTimeoutS} onChange={(e) => setModel({ trellisTimeoutS: Number(e.target.value) || 0 })} /></FormRow>
+        </div>
+        <div className="row" style={{ marginTop: 10 }}>
+          <button className="btn btn-secondary btn-sm" disabled={probingTrellis} onClick={probeTrellis}>
+            <Icon name="shield" size={12} /> {probingTrellis ? "Checking TRELLIS ..." : "Verify TRELLIS endpoint"}
+          </button>
+          <span className="small t3">Checks the gateway schema + compatibility before a real TRELLIS build.</span>
+        </div>
+      </Card>
+      <Card>
+        <SaveSection section="models" draft={draft} />
+      </Card>
+    </div>
+  );
+}
+void LegacyModelsPane;
+
 function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]; onChange: (p: Partial<SettingsData["simulation"]>) => void }) {
   return (
     <div className="st-stack">
@@ -286,7 +448,7 @@ function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]
           <FormRow label="Simulator">
             <input className="input mono" value="MuJoCo" readOnly aria-label="Simulator" />
           </FormRow>
-          <FormRow label="Gravity (m/s²)"><input className="input mono" value={draft.gravity} onChange={(e) => onChange({ gravity: Number(e.target.value) || 0 })} /></FormRow>
+            <FormRow label="Gravity (m/s2)"><input className="input mono" value={draft.gravity} onChange={(e) => onChange({ gravity: Number(e.target.value) || 0 })} /></FormRow>
           <FormRow label="Timestep (Hz)"><input className="input mono" value={draft.timestepHz} onChange={(e) => onChange({ timestepHz: Number(e.target.value) || 0 })} /></FormRow>
           <FormRow label="Renderer">
             <input className="input mono" value="Native Vulkan viewport / MuJoCo physics" readOnly aria-label="Renderer" />
@@ -298,131 +460,6 @@ function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]
   );
 }
 
-function ModelsPane({ draft, onChange }: { draft: SettingsData["models"]; onChange: (p: Partial<SettingsData["models"]>) => void }) {
-  const toast = useToast();
-  const [probing, setProbing] = useState<string | null>(null);
-  const probe = async (kind: "policy" | "trellis") => {
-    setProbing(kind);
-    try {
-      await api.post(`/integrations/${kind}/probe`, {});
-      toast.push("ok", `${kind === "policy" ? "VLA" : "TRELLIS.2"} contract verified`, "Remote model and configured identity are compatible");
-    } catch (e) {
-      toast.push("err", "Model verification failed", e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setProbing(null);
-    }
-  };
-  return (
-    <div className="st-stack">
-      <Card title="Language models">
-        <div className="st-grid">
-          <FormRow label="Provider"><input className="input mono" value="OpenAI-compatible" readOnly /></FormRow>
-          <FormRow label="Planner model">
-            <input className="input mono" value={draft.planner} onChange={(e) => onChange({ planner: e.target.value })} placeholder="gpt-4.1-mini or local model ID" />
-          </FormRow>
-          <FormRow label="Part-graph VLM">
-            <input className="input mono" value={draft.vlm} onChange={(e) => onChange({ vlm: e.target.value })} placeholder="Vision-capable model ID" />
-          </FormRow>
-          <FormRow label="API base URL"><input className="input mono" value={draft.openaiBaseUrl} onChange={(e) => onChange({ openaiBaseUrl: e.target.value })} placeholder="OpenAI, Ollama, or vLLM /v1 endpoint" /></FormRow>
-          <FormRow label="Request timeout (s)"><input className="input mono" type="number" min={5} max={600} value={draft.timeoutS} onChange={(e) => onChange({ timeoutS: Number(e.target.value) || 60 })} /></FormRow>
-          <FormRow label="API key"><input className="input mono" value={draft.openaiKey} readOnly title="Rotate under API Keys" /></FormRow>
-        </div>
-      </Card>
-      <Card title="Learned robot policy">
-        <p className="small t2" style={{ marginBottom: 12 }}>Separate closed-loop VLA gate: MuJoCo front/wrist RGB + 5-D proprioception + language. No scripted fallback.</p>
-        <div className="st-grid">
-          <FormRow label="Default evaluation">
-            <select className="select" value={draft.policy} onChange={(e) => onChange({ policy: e.target.value })}>
-              <option value="asset-validation">Asset validation (scripted oracle)</option>
-              <option value="remote-vla">Remote VLA policy evaluation</option>
-            </select>
-          </FormRow>
-          <FormRow label="Gateway URL"><input className="input mono" value={draft.policyEndpoint} onChange={(e) => onChange({ policyEndpoint: e.target.value })} placeholder="https://vla-gateway.internal" /></FormRow>
-          <FormRow label="Checkpoint ID"><input className="input mono" value={draft.policyId} onChange={(e) => onChange({ policyId: e.target.value })} /></FormRow>
-          <FormRow label="Embodiment"><input className="input mono" value={draft.policyEmbodiment} onChange={(e) => onChange({ policyEmbodiment: e.target.value })} /></FormRow>
-          <FormRow label="Model revision"><input className="input mono" value={draft.policyModelRevision} onChange={(e) => onChange({ policyModelRevision: e.target.value })} placeholder="Pinned git/Hugging Face revision" /></FormRow>
-          <FormRow label="Model SHA-256"><input className="input mono" value={draft.policyModelSha256} onChange={(e) => onChange({ policyModelSha256: e.target.value })} placeholder="64 hex characters" /></FormRow>
-          <FormRow label="Normalization SHA-256"><input className="input mono" value={draft.policyNormalizationSha256} onChange={(e) => onChange({ policyNormalizationSha256: e.target.value })} placeholder="statistics/config hash" /></FormRow>
-          <FormRow label="Environment SHA-256"><input className="input mono" value={draft.policyEnvironmentSha256} onChange={(e) => onChange({ policyEnvironmentSha256: e.target.value })} placeholder="frozen MJCF + evaluation manifest hash" /></FormRow>
-          <FormRow label="Instruction"><input className="input" value={draft.policyInstruction} onChange={(e) => onChange({ policyInstruction: e.target.value })} /></FormRow>
-          <FormRow label="Timeout (s)"><input className="input mono" type="number" min={1} max={120} value={draft.policyTimeoutS} onChange={(e) => onChange({ policyTimeoutS: Number(e.target.value) || 10 })} /></FormRow>
-          <FormRow label="Execution horizon"><input className="input mono" type="number" min={1} max={40} value={draft.policyExecutionHorizon} onChange={(e) => onChange({ policyExecutionHorizon: Number(e.target.value) || 8 })} /></FormRow>
-          <FormRow label="Gateway token"><input className="input mono" value={draft.policyApiKey} readOnly title="Rotate under API Keys" /></FormRow>
-        </div>
-        <div className="row" style={{ marginTop: 10 }}><button className="btn btn-secondary btn-sm" disabled={probing === "policy"} onClick={() => probe("policy")}><Icon name="shield" size={12} /> {probing === "policy" ? "Verifying…" : "Verify VLA contract"}</button></div>
-      </Card>
-      <Card title="TRELLIS.2 visual mesh generator">
-        <p className="small t2" style={{ marginBottom: 12 }}>Real image-to-PBR-GLB gateway. RobotWorld separately authors articulation, colliders, mass, and USD physics.</p>
-        <div className="st-grid">
-          <FormRow label="Gateway URL"><input className="input mono" value={draft.trellisEndpoint} onChange={(e) => onChange({ trellisEndpoint: e.target.value })} placeholder="https://trellis-private.example" /></FormRow>
-          <FormRow label="Model"><input className="input mono" value={draft.trellisModel} onChange={(e) => onChange({ trellisModel: e.target.value })} /></FormRow>
-          <FormRow label="Timeout (s)"><input className="input mono" type="number" min={30} max={1800} value={draft.trellisTimeoutS} onChange={(e) => onChange({ trellisTimeoutS: Number(e.target.value) || 300 })} /></FormRow>
-          <FormRow label="Gateway token"><input className="input mono" value={draft.trellisApiKey} readOnly title="Rotate under API Keys" /></FormRow>
-        </div>
-        <div className="row" style={{ marginTop: 10 }}><button className="btn btn-secondary btn-sm" disabled={probing === "trellis"} onClick={() => probe("trellis")}><Icon name="shield" size={12} /> {probing === "trellis" ? "Verifying…" : "Verify TRELLIS.2 contract"}</button></div>
-        <SaveSection section="models" draft={draft} />
-      </Card>
-    </div>
-  );
-}
-
-const KEY_SERVICES: { service: string; label: string; read: (s: SettingsData) => string }[] = [
-  { service: "openai", label: "OpenAI API", read: (s) => s.models.openaiKey },
-  { service: "policy", label: "VLA gateway token", read: (s) => s.models.policyApiKey },
-  { service: "trellis", label: "TRELLIS.2 gateway token", read: (s) => s.models.trellisApiKey },
-  { service: "brightdata", label: "Bright Data", read: (s) => s.integrations.brightdata.apiKey },
-  { service: "signoz_api", label: "SigNoz query API", read: (s) => s.integrations.signoz.apiKey },
-];
-
-function ApiKeysPane({ settings }: { settings: SettingsData }) {
-  const toast = useToast();
-  const [rotating, setRotating] = useState<string | null>(null);
-
-  const rotate = async (service: string, label: string) => {
-    const key = window.prompt(`Paste the new ${label} key (stored write-only, never shown again):`);
-    if (!key) return;
-    setRotating(service);
-    try {
-      await api.put(`/settings/keys/${service}`, { key });
-      toast.push("ok", "Key updated", `${label} · stored write-only`);
-    } catch (e) {
-      toast.push("err", "Could not store key", e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setRotating(null);
-    }
-  };
-
-  return (
-    <Card title="API Keys" flush>
-      <table className="table">
-        <thead><tr><th>Service</th><th>Key</th><th style={{ width: 60 }} /></tr></thead>
-        <tbody>
-          {KEY_SERVICES.map(({ service, label, read }) => (
-            <tr key={service}>
-              <td style={{ fontWeight: 580 }}>{label}</td>
-              <td className="mono t2" style={{ fontSize: "var(--fs-small)" }}>{read(settings) || "—"}</td>
-              <td>
-                <span className="row" style={{ gap: 2 }}>
-                  <button
-                    className="icon-btn btn-sm"
-                    title="Rotate key"
-                    disabled={rotating === service}
-                    onClick={() => rotate(service, label)}
-                  >
-                    <Icon name="refresh" size={12} className={rotating === service ? "spin" : undefined} />
-                  </button>
-                </span>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <div style={{ padding: "10px 14px", borderTop: "1px solid var(--border)" }}>
-        <span className="micro t3">Keys are stored write-only on the backend and always shown masked.</span>
-      </div>
-    </Card>
-  );
-}
 
 function AboutPane() {
   const { data: health } = useApi<{ status: string; version: string; uptimeS: number }>("/health");
@@ -436,7 +473,7 @@ function AboutPane() {
           <div className="col" style={{ gap: 3 }}>
             <b style={{ fontSize: "var(--fs-title)" }}>RobotWorld {health ? `v${health.version}` : ""}</b>
             <span className="small t2">Autonomous world-building and curriculum engine for physical AI</span>
-            <span className="micro t3 mono" style={{ marginTop: 2 }}>Backend {health ? `v${health.version} · ${health.status}` : "offline"}</span>
+            <span className="micro t3 mono" style={{ marginTop: 2 }}>Backend {health ? `v${health.version} - ${health.status}` : "offline"}</span>
           </div>
         </div>
         <hr className="divider" style={{ margin: "16px 0" }} />
@@ -449,6 +486,7 @@ function AboutPane() {
   );
 }
 
+
 function ToggleRow({ label, desc, checked, onChange }: { label: string; desc?: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
     <div className="field-row">
@@ -460,3 +498,4 @@ function ToggleRow({ label, desc, checked, onChange }: { label: string; desc?: s
     </div>
   );
 }
+

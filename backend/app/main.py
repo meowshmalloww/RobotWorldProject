@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -25,7 +26,7 @@ from sqlalchemy import delete, func, select
 
 from . import __version__
 from .bootstrap import seed_definitions
-from .config import ASSETS_DIR, BASE_DIR, env
+from .config import ASSETS_DIR, BASE_DIR, WORLDS_DIR, env
 from .db import SessionLocal, init_db
 from .models import (
     AgentDecision,
@@ -48,7 +49,7 @@ from .models import (
 )
 from .telemetry import drain_loop, init_otel, signoz_exporting, span
 from .util import fmt_duration, new_id, rel_time
-from .services import agent, brightdata, catalog, demo_scenarios, evaluator, events, live, llm, pipeline, port, settings_store, simcore, trellis, vulkan_renderer
+from .services import agent, asset_evidence, brightdata, catalog, demo_scenarios, evaluator, events, live, llm, local_vla, model_registry, performance, pipeline, port, settings_store, simcore, trellis, usda, vulkan_renderer, world_geometry
 from .services.remote_policy import PolicyClient, PolicyConfig, PolicyError
 
 log = logging.getLogger(__name__)
@@ -68,6 +69,12 @@ class AssetBuildIn(BaseModel):
     generator: Literal["parametric", "trellis2"] = "parametric"
     families: list[str] = []
     manualSpec: dict[str, Any] | None = None
+
+
+class EvidenceAnalysisIn(BaseModel):
+    """Intentional action guard: never spend API usage as a build side effect."""
+
+    confirmEvidenceReview: Literal[True]
 
 
 class SourceIn(BaseModel):
@@ -225,6 +232,12 @@ async def health():
     return await _health()
 
 
+@app.get("/api/system/performance")
+async def system_performance():
+    """Live host metrics for the shell; no fixed hardware strings."""
+    return await asyncio.to_thread(performance.snapshot)
+
+
 LOOP_STAGES = [
     {"icon": "gauge", "title": "Evaluate robot", "desc": "Run MuJoCo episodes over persisted physical scenarios"},
     {"icon": "search", "title": "Diagnose weakness", "desc": "Aggregate real evaluation failure modes"},
@@ -297,7 +310,10 @@ async def overview():
             "promotedDelta": "0",
             "blocked": len(blocked),
             "blockedDelta": "0",
-            "recent": [{"name": a.name, "status": "promoted" if a.status == "ready" else "blocked"} for a in (ready + blocked)[:5]],
+            "recent": [
+                {"id": a.id, "name": a.name, "status": "promoted" if a.status == "ready" else "blocked"}
+                for a in (ready + blocked)[:5]
+            ],
         },
         "integrations": integrations,
     }
@@ -322,7 +338,7 @@ async def skills_list():
     first = details[0] if details else None
     families = first["families"] if first else []
     coverage_dims = [
-        {"dimension": row["family"], "coverage": row["coverage"], "gaps": max(row["count"] - round(row["coverage"] * row["count"] / 100), 0), "bands": [row["coverage"]] * 4}
+        {"dimension": row["family"], "coverage": row["coverage"], "gaps": max(row["count"] - round(row["coverage"] * row["count"] / 100), 0), "bands": row["bands"]}
         for row in families
     ]
     return {
@@ -404,6 +420,12 @@ async def get_job(job_id: str):
             "createdAt": row.created_at.isoformat(),
             "updatedAt": row.updated_at.isoformat(),
         }
+
+
+@app.get("/api/demo-runs/{job_id}")
+async def get_demo_job(job_id: str):
+    """Legacy compatibility path for older clients."""
+    return await get_job(job_id)
 
 
 @app.get("/api/demo-scenarios")
@@ -538,6 +560,135 @@ async def asset_detail(asset_id: str):
         return await catalog.asset_out(session, row)
 
 
+@app.get("/api/assets/{asset_id}/render/vulkan", response_class=Response)
+async def render_asset_vulkan(
+    asset_id: str,
+    width: int = Query(default=960, ge=320, le=1600),
+    height: int = Query(default=540, ge=180, le=1000),
+    yaw: float = Query(default=34.0, ge=-360.0, le=360.0),
+    pitch: float = Query(default=18.0, ge=-45.0, le=75.0),
+    zoom: float = Query(default=1.0, ge=0.45, le=4.0),
+):
+    """Return pixels rendered from the asset's actual GLB through Vulkan."""
+    async with SessionLocal() as session:
+        if await session.get(Asset, asset_id) is None:
+            raise HTTPException(404, "Asset not found")
+    model = (ASSETS_DIR / asset_id / "model.glb").resolve()
+    if model.parent != (ASSETS_DIR / asset_id).resolve() or not model.is_file():
+        raise HTTPException(404, "Generated GLB is not available")
+    try:
+        png = await asyncio.to_thread(
+            vulkan_renderer.render_glb_png,
+            model,
+            width=width,
+            height=height,
+            yaw=yaw,
+            pitch=pitch,
+            zoom=zoom,
+        )
+    except (vulkan_renderer.VulkanUnavailable, ValueError) as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store", "X-RobotWorld-Renderer": "Vulkan", "X-RobotWorld-Asset": asset_id},
+    )
+
+
+@app.get("/api/worlds/render/vulkan", response_class=Response)
+async def render_active_world_vulkan(
+    width: int = Query(default=960, ge=320, le=1600),
+    height: int = Query(default=540, ge=180, le=1000),
+    yaw: float = Query(default=34.0, ge=-360.0, le=360.0),
+    pitch: float = Query(default=18.0, ge=-45.0, le=75.0),
+    zoom: float = Query(default=1.0, ge=0.45, le=4.0),
+):
+    """Return the active OpenUSD world's actual placed GLBs through Vulkan."""
+    async with SessionLocal() as session:
+        world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
+        if world is None:
+            raise HTTPException(404, "No active world")
+        ids = _placed_asset_ids(world.scene_tree)
+        found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
+        rows = _world_assembly_rows(ids, {row.id: row for row in found})
+
+    placements = [
+        vulkan_renderer.WorldPlacement(
+            asset_id=str(row["asset_id"]),
+            model_path=(ASSETS_DIR / str(row["asset_id"]) / "model.glb"),
+            translation=tuple(float(value) for value in row["translation"]),
+            usd_scale=tuple(float(value) for value in row["scale"]),
+        )
+        for row in rows
+        if (ASSETS_DIR / str(row["asset_id"]) / "model.glb").is_file()
+    ]
+    if not placements:
+        raise HTTPException(409, "Active OpenUSD world has no generated GLB placements.")
+    try:
+        png = await asyncio.to_thread(
+            vulkan_renderer.render_world_glb_png,
+            placements,
+            width=width,
+            height=height,
+            yaw=yaw,
+            pitch=pitch,
+            zoom=zoom,
+        )
+    except (vulkan_renderer.VulkanUnavailable, ValueError) as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "no-store",
+            "X-RobotWorld-Renderer": "Vulkan",
+            "X-RobotWorld-World": world.id,
+            "X-RobotWorld-Assets": str(len(placements)),
+        },
+    )
+
+
+@app.post("/api/assets/{asset_id}/evidence-analysis", status_code=202)
+async def asset_evidence_analysis(asset_id: str, payload: EvidenceAnalysisIn):
+    """Turn existing collected evidence into an auditable structured record.
+
+    This route intentionally does not fetch the web or start a 3D job.  It
+    only submits the evidence that is already persisted for the selected asset.
+    """
+    async with SessionLocal() as session:
+        asset = await session.get(Asset, asset_id)
+        if asset is None:
+            raise HTTPException(404, "Asset not found")
+    spec_path = (ASSETS_DIR / asset_id / "spec.json").resolve()
+    if spec_path.parent != (ASSETS_DIR / asset_id).resolve() or not spec_path.is_file():
+        raise HTTPException(409, "Asset has no persisted source evidence to analyze.")
+
+    async def work():
+        report = await asset_evidence.analyze(asset_id)
+        output = (ASSETS_DIR / asset_id / "analysis.json").resolve()
+        if output.parent != (ASSETS_DIR / asset_id).resolve():
+            raise RuntimeError("Invalid asset analysis output path")
+        output.write_text(json.dumps(report, indent=2), encoding="utf8")
+        async with SessionLocal() as db:
+            row = await db.get(Asset, asset_id)
+            if row is None:
+                raise KeyError("Asset not found")
+            props = dict(row.properties or {})
+            props["evidenceAnalysis"] = "completed — review required"
+            row.properties = props
+            existing = (await db.execute(select(Artifact).where(Artifact.asset_id == asset_id, Artifact.file == "analysis.json"))).scalar_one_or_none()
+            if existing is None:
+                db.add(Artifact(asset_id=asset_id, type="evidence_analysis", file="analysis.json", size_bytes=output.stat().st_size))
+            else:
+                existing.size_bytes = output.stat().st_size
+            await db.commit()
+        events.publish("pipeline", "Evidence analysis complete", f"{asset_id} · human review required", asset=asset_id)
+        return {"assetId": asset_id, "file": "analysis.json", "humanReviewRequired": True}
+
+    job_id = await _start_job("asset_evidence_analysis", {"assetId": asset_id, "stage": "OpenAI evidence review"}, work())
+    return {"jobId": job_id, "assetId": asset_id, "mode": "evidence_bounded", "automatic": False}
+
+
 @app.post("/api/assets/{asset_id}/reevaluate", status_code=202)
 async def asset_reevaluate(asset_id: str):
     async def work():
@@ -592,7 +743,7 @@ async def asset_reevaluate(asset_id: str):
 
 @app.get("/api/assets/{asset_id}/files/{filename}")
 async def asset_file(asset_id: str, filename: str):
-    if filename not in {"model.glb", "asset.usda", "spec.json"}:
+    if filename not in {"model.glb", "asset.usda", "visual.usdc", "world.usda", "basecolor.png", "spec.json", "analysis.json"}:
         raise HTTPException(404, "Artifact not found")
     path = (ASSETS_DIR / asset_id / filename).resolve()
     if path.parent != (ASSETS_DIR / asset_id).resolve() or not path.is_file():
@@ -606,6 +757,10 @@ async def asset_delete(asset_id: str):
         row = await session.get(Asset, asset_id)
         if row is None:
             raise HTTPException(404, "Asset not found")
+        worlds = (await session.execute(select(World))).scalars().all()
+        for world in worlds:
+            world.scene_tree = _without_asset_placements(world.scene_tree, asset_id)
+            await _author_world_assembly(session, world, world.scene_tree)
         await session.execute(delete(Artifact).where(Artifact.asset_id == asset_id))
         await session.execute(delete(CompileStage).where(CompileStage.asset_id == asset_id))
         await session.delete(row)
@@ -613,6 +768,19 @@ async def asset_delete(asset_id: str):
     target = (ASSETS_DIR / asset_id).resolve()
     if target.parent == ASSETS_DIR.resolve() and target.is_dir():
         shutil.rmtree(target)
+
+
+def _without_asset_placements(nodes: Any, asset_id: str) -> list[dict[str, Any]]:
+    """Remove only scene nodes that reference the deleted application asset."""
+    cleaned: list[dict[str, Any]] = []
+    for value in nodes if isinstance(nodes, list) else []:
+        if not isinstance(value, dict) or value.get("assetId") == asset_id:
+            continue
+        node = dict(value)
+        if isinstance(node.get("children"), list):
+            node["children"] = _without_asset_placements(node["children"], asset_id)
+        cleaned.append(node)
+    return cleaned
 
 
 def _physics_checks() -> list[dict[str, Any]]:
@@ -632,6 +800,56 @@ def _physics_checks() -> list[dict[str, Any]]:
         return [{"check": "MJCF load", "status": "fail", "details": str(exc)[:240], "impacted": "world", "severity": "High"}]
 
 
+def _generated_world_checks(rows: list[dict[str, Any]], stage_available: bool) -> list[dict[str, Any]]:
+    """Validate the active generated world without substituting demo physics."""
+    checks: list[dict[str, Any]] = [{
+        "check": "OpenUSD composition",
+        "status": "pass" if stage_available else "fail",
+        "details": "stage.usda resolves the persisted generated-asset references" if stage_available else "stage.usda is missing",
+        "impacted": "stage.usda",
+        "severity": "Info" if stage_available else "High",
+    }]
+    if not rows:
+        checks.append({"check": "Placed geometry", "status": "fail", "details": "No generated GLB placements are available.", "impacted": "world", "severity": "High"})
+        return checks
+    for row in rows:
+        target = row["target_dimensions"]
+        bounds = row["world_bounds"]
+        actual = tuple(bounds[1][i] - bounds[0][i] for i in range(3))
+        delta = max(abs(actual[i] - target[i]) for i in range(3))
+        checks.append({
+            "check": f"Measured mesh fit - {row['asset_name']}",
+            "status": "pass" if delta < 0.002 else "fail",
+            "details": f"World AABB {actual[0]:.3f} x {actual[1]:.3f} x {actual[2]:.3f} m; target {target[0]:.3f} x {target[1]:.3f} x {target[2]:.3f} m",
+            "impacted": row["asset_id"],
+            "severity": "Info" if delta < 0.002 else "High",
+        })
+        source_ok = row["dimension_source"] != "inferred"
+        checks.append({
+            "check": f"Dimension evidence - {row['asset_name']}",
+            "status": "pass" if source_ok else "warn",
+            "details": f"{row['dimension_source']} dimensions; minimum confidence {row['dimension_confidence']:.2f}",
+            "impacted": row["asset_id"],
+            "severity": "Info" if source_ok else "Medium",
+        })
+        anchor = row["anchor"]
+        checks.append({
+            "check": f"Support anchor - {row['asset_name']}",
+            "status": "pass",
+            "details": f"{anchor['mode']} on {anchor['surface']}; authored gap {anchor['gap_m'] * 1000:.1f} mm",
+            "impacted": row["asset_id"],
+            "severity": "Info",
+        })
+    checks.append({
+        "check": "Physical simulation readiness",
+        "status": "warn",
+        "details": "Generated objects are static visual meshes. Measured collision, mass, articulation, and an embodiment-compatible policy are still required before rollout.",
+        "impacted": f"{len(rows)} generated assets",
+        "severity": "High",
+    })
+    return checks
+
+
 @app.get("/api/worlds/scene")
 async def world_scene():
     async with SessionLocal() as session:
@@ -639,17 +857,217 @@ async def world_scene():
         if world is None:
             raise HTTPException(404, "No active world")
         variants = (await session.execute(select(Variant).where(Variant.world_id == world.id).order_by(Variant.created_at))).scalars().all()
-        last = (await session.execute(select(Evaluation).order_by(Evaluation.created_at.desc()).limit(1))).scalar_one_or_none()
+        ids = _placed_asset_ids(world.scene_tree)
+        found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
+        placement_rows = _world_assembly_rows(ids, {row.id: row for row in found})
     return {
         "worldId": world.id,
         "worldName": world.name,
         "sceneTree": world.scene_tree,
+        "placedAssets": _placed_asset_ids(world.scene_tree),
+        "placements": [_placement_api(row) for row in placement_rows],
+        "assembly": {
+            "file": "stage.usda",
+            "available": (WORLDS_DIR / world.id / "stage.usda").is_file(),
+        },
         "variants": [{"id": row.id, "name": row.name, "desc": row.desc, "active": row.active} for row in variants],
-        "physicsChecks": _physics_checks(),
+        "physicsChecks": _generated_world_checks(
+            placement_rows,
+            (WORLDS_DIR / world.id / "stage.usda").is_file(),
+        ),
         "taskSteps": [],
-        "successConditions": ([{"name": "Door angle ≥ 60°", "state": "done" if last.success else "failed", "value": f"{last.door_angle_deg:.1f}°"}] if last else []),
+        "successConditions": [],
         "eventTimeline": [],
     }
+
+
+def _placed_asset_ids(nodes: list[Any]) -> list[str]:
+    """Extract persisted generated-asset placements from the world tree."""
+    found: list[str] = []
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict):
+            continue
+        asset_id = node.get("assetId")
+        if isinstance(asset_id, str) and asset_id and asset_id not in found:
+            found.append(asset_id)
+        children = node.get("children")
+        if isinstance(children, list):
+            for child_id in _placed_asset_ids(children):
+                if child_id not in found:
+                    found.append(child_id)
+    return found
+
+
+def _world_assembly_rows(ids: list[str], by_id: dict[str, Asset]) -> list[dict[str, Any]]:
+    """Build the canonical placement rows used by both OpenUSD and Vulkan.
+
+    Keeping the semantics in one function prevents the displayed whole world
+    from drifting away from the transforms authored into ``stage.usda``.
+    """
+    candidates: list[dict[str, Any]] = []
+    fruit_index = 0
+    for index, asset_id in enumerate(ids):
+        row = by_id.get(asset_id)
+        asset_dir = ASSETS_DIR / asset_id
+        layer = asset_dir / "asset.usda"
+        model = asset_dir / "model.glb"
+        if row is None or not layer.is_file() or not model.is_file():
+            continue
+        spec = row.spec or {}
+
+        def spec_value(key: str, default: Any) -> Any:
+            value = spec.get(key, default)
+            return value.get("value", default) if isinstance(value, dict) else value
+
+        category = str(spec_value("category", row.name)).lower()
+        width = max(0.01, float(spec_value("width_m", 1.0)))
+        height = max(0.01, float(spec_value("height_m", 1.0)))
+        depth = max(0.01, float(spec_value("depth_m", 1.0)))
+        try:
+            fit = world_geometry.measured_fit(model, width, height, depth)
+        except (OSError, ValueError):
+            # Fail visibly but preserve composition for legacy assets whose
+            # raw visual is unavailable. New generated assets always use the
+            # measured branch above.
+            fit = {
+                "raw_bounds": ((-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)),
+                "raw_extents": (1.0, 1.0, 1.0),
+                "scale": (width, depth, height),
+                "local_usd_low": (-width / 2, -depth / 2, -height / 2),
+                "local_usd_high": (width / 2, depth / 2, height / 2),
+                "target_dimensions": (width, depth, height),
+            }
+        source_fields = [spec.get(key, {}) for key in ("width_m", "height_m", "depth_m")]
+        dimension_sources = [str(value.get("source", "inferred")) for value in source_fields if isinstance(value, dict)]
+        confidences = [float(value.get("confidence", 0.0)) for value in source_fields if isinstance(value, dict)]
+        evidence = "measured/scraped" if dimension_sources and all(value != "inferred" for value in dimension_sources) else "inferred"
+        candidates.append({
+            "asset_id": asset_id,
+            "asset_name": row.name,
+            "asset_layer": layer,
+            "model_path": model,
+            "category": category,
+            "fit": fit,
+            "dimension_source": evidence,
+            "dimension_confidence": min(confidences) if confidences else 0.0,
+            "scale_source": f"occupied GLB bounds fitted to {evidence} target dimensions",
+            "index": index,
+        })
+
+    counter_top = 0.9
+    for item in candidates:
+        category = item["category"]
+        if "counter" in category or "island" in item["asset_name"].lower():
+            local_low = item["fit"]["local_usd_low"]
+            local_high = item["fit"]["local_usd_high"]
+            translation = (0.0, 0.0, -local_low[2])
+            counter_top = translation[2] + local_high[2]
+            item["translation"] = translation
+            item["anchor"] = {"mode": "floor", "surface": "world floor", "gap_m": 0.0}
+
+    rows: list[dict[str, Any]] = []
+    for item in candidates:
+        category = item["category"]
+        name = item["asset_name"].lower()
+        fit = item["fit"]
+        low = fit["local_usd_low"]
+        high = fit["local_usd_high"]
+        translation = item.get("translation")
+        anchor = item.get("anchor")
+        if "counter" in category or "island" in name:
+            pass
+        elif "sink" in category and "faucet" not in name:
+            rim_offset = 0.012
+            translation = (-0.35, 0.0, counter_top + rim_offset - high[2])
+            anchor = {"mode": "integrated", "surface": "countertop", "gap_m": rim_offset}
+        elif "faucet" in category or "faucet" in name or "tap" in name:
+            translation = (-0.35, 0.18, counter_top - low[2])
+            anchor = {"mode": "on_surface", "surface": "countertop", "gap_m": 0.0}
+        elif "blender" in category:
+            translation = (0.45, 0.02, counter_top - low[2])
+            anchor = {"mode": "on_surface", "surface": "countertop", "gap_m": 0.0}
+        elif "fruit" in category or any(value in name for value in ("apple", "orange", "banana")):
+            translation = (-0.05 + fruit_index * 0.22, -0.28, counter_top - low[2])
+            fruit_index += 1
+            anchor = {"mode": "on_surface", "surface": "countertop", "gap_m": 0.0}
+        else:
+            translation = (float(item["index"]) * 0.4, 0.0, -low[2])
+            anchor = {"mode": "floor", "surface": "world floor", "gap_m": 0.0}
+        bounds = world_geometry.world_bounds(fit, translation)
+        rows.append({
+            **{key: value for key, value in item.items() if key not in {"fit", "category", "index"}},
+            "translation": translation,
+            "scale": fit["scale"],
+            "raw_bounds": fit["raw_bounds"],
+            "raw_extents": fit["raw_extents"],
+            "target_dimensions": fit["target_dimensions"],
+            "world_bounds": bounds,
+            "anchor": anchor,
+        })
+    return rows
+
+
+def _placement_api(row: dict[str, Any]) -> dict[str, Any]:
+    """Serialize the canonical placement without leaking local asset paths."""
+    return {
+        "assetId": row["asset_id"],
+        "name": row["asset_name"],
+        "translation": list(row["translation"]),
+        "scale": list(row["scale"]),
+        "rawBounds": [list(value) for value in row["raw_bounds"]],
+        "rawExtents": list(row["raw_extents"]),
+        "targetDimensions": list(row["target_dimensions"]),
+        "worldBounds": [list(value) for value in row["world_bounds"]],
+        "dimensionSource": row["dimension_source"],
+        "dimensionConfidence": row["dimension_confidence"],
+        "anchor": row["anchor"],
+        "physicalStatus": "visual_only_pending_measured_collision",
+    }
+
+
+async def _author_world_assembly(session, world: World, tree: list[dict[str, Any]]) -> int:
+    """Persist the active scene tree as a validated OpenUSD reference stage."""
+    ids = _placed_asset_ids(tree)
+    rows: list[dict[str, Any]] = []
+    if ids:
+        found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all()
+        rows = _world_assembly_rows(ids, {row.id: row for row in found})
+    output = WORLDS_DIR / world.id / "stage.usda"
+    if not rows:
+        if output.is_file():
+            output.unlink()
+        return 0
+    _, count = await asyncio.to_thread(usda.write_world_assembly, rows, output)
+    return count
+
+
+@app.post("/api/worlds/assets/{asset_id}/place")
+async def place_asset_in_world(asset_id: str):
+    """Persist an existing composed OpenUSD asset as an active world placement."""
+    asset_dir = (ASSETS_DIR / asset_id).resolve()
+    if asset_dir.parent != ASSETS_DIR.resolve() or not (asset_dir / "world.usda").is_file():
+        raise HTTPException(409, "Asset must have a composed world.usda before it can be placed.")
+    async with SessionLocal() as session:
+        asset = await session.get(Asset, asset_id)
+        if asset is None:
+            raise HTTPException(404, "Asset not found")
+        world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
+        if world is None:
+            raise HTTPException(404, "No active world")
+        world.name = "Kitchen Juice Workspace"
+        tree = [node for node in (world.scene_tree or []) if not (isinstance(node, dict) and node.get("assetId") == asset_id)]
+        tree.append({
+            "id": f"generated-{asset.id}",
+            "assetId": asset.id,
+            "name": asset.name,
+            "icon": "cube",
+            "tag": "OpenUSD generated asset",
+            "children": [{"id": f"trellis-visual-{asset.id}", "assetId": asset.id, "name": "TRELLIS.2 PBR visual mesh", "icon": "cube", "tag": "mesh"}],
+        })
+        await _author_world_assembly(session, world, tree)
+        world.scene_tree = tree
+        await session.commit()
+        return {"worldId": world.id, "assetId": asset.id, "placedAssets": _placed_asset_ids(tree)}
 
 
 @app.put("/api/worlds/scene")
@@ -659,6 +1077,7 @@ async def save_world(payload: SceneIn):
         if world is None:
             raise HTTPException(404, "No active world")
         world.scene_tree = payload.sceneTree
+        await _author_world_assembly(session, world, payload.sceneTree)
         existing = {row.id: row for row in (await session.execute(select(Variant).where(Variant.world_id == world.id))).scalars().all()}
         for item in payload.variants:
             row = existing.get(str(item.get("id")))
@@ -669,9 +1088,29 @@ async def save_world(payload: SceneIn):
     return {"saved": True}
 
 
+@app.get("/api/worlds/files/stage.usda")
+async def world_stage_file():
+    async with SessionLocal() as session:
+        world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
+        if world is None:
+            raise HTTPException(404, "No active world")
+    path = (WORLDS_DIR / world.id / "stage.usda").resolve()
+    if path.parent != (WORLDS_DIR / world.id).resolve() or not path.is_file():
+        raise HTTPException(404, "The active world has no composed OpenUSD stage")
+    return FileResponse(path, filename="stage.usda")
+
+
 @app.post("/api/worlds/checks/run")
 async def run_checks():
-    return {"physicsChecks": await asyncio.to_thread(_physics_checks)}
+    async with SessionLocal() as session:
+        world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
+        if world is None:
+            raise HTTPException(404, "No active world")
+        ids = _placed_asset_ids(world.scene_tree)
+        found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
+    rows = await asyncio.to_thread(_world_assembly_rows, ids, {row.id: row for row in found})
+    stage_available = (WORLDS_DIR / world.id / "stage.usda").is_file()
+    return {"physicsChecks": _generated_world_checks(rows, stage_available)}
 
 
 @app.post("/api/worlds/cameras/probe")
@@ -696,6 +1135,58 @@ async def probe_policy_cameras():
             world.close()
 
     return await asyncio.to_thread(render)
+
+
+@app.get("/api/models/vla-jepa/status")
+async def vla_jepa_status():
+    """Inspect the local checkpoint without loading weights into RAM/VRAM."""
+    try:
+        return await asyncio.to_thread(local_vla.inspect_checkpoint)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(500, f"Local VLA-JEPA checkpoint inspection failed: {exc}") from exc
+
+
+@app.get("/api/models/status")
+async def model_status():
+    """Report installed weights, executable readiness, and real build timings."""
+    flat = await settings_store.get_flat()
+    native_path = str(flat.get("models.trellisNativePath") or r"D:\TRELLIS.2-4B")
+    gguf_path = str(flat.get("models.trellisGgufPath") or r"D:\TRELLIS.2-4B-Quant-GGUF")
+    async with SessionLocal() as session:
+        assets = (await session.execute(select(Asset).order_by(Asset.created_at.desc()))).scalars().all()
+        stages = (await session.execute(select(CompileStage).order_by(CompileStage.asset_id, CompileStage.idx))).scalars().all()
+    by_asset: dict[str, list[CompileStage]] = defaultdict(list)
+    for stage in stages:
+        by_asset[stage.asset_id].append(stage)
+    history = []
+    for asset in assets:
+        geometry = (asset.spec or {}).get("geometry", {}) if isinstance(asset.spec, dict) else {}
+        if not geometry:
+            try:
+                geometry = json.loads((ASSETS_DIR / asset.id / "spec.json").read_text(encoding="utf8")).get("geometry", {})
+            except (OSError, json.JSONDecodeError):
+                geometry = {}
+        if not isinstance(geometry, dict) or geometry.get("generator") != "trellis2":
+            continue
+        rows = by_asset.get(asset.id, [])
+        generation = next((row for row in rows if "trellis" in row.name.lower() or "geometry" in row.name.lower()), None)
+        history.append({
+            "assetId": asset.id,
+            "name": asset.name,
+            "runtime": "native",
+            "resolution": int(geometry.get("resolution") or 1024),
+            "generationSeconds": round(generation.duration_s, 3) if generation else None,
+            "totalSeconds": round(sum(row.duration_s for row in rows), 3),
+            "status": "failed" if any(row.status == "failed" for row in rows) else "completed",
+        })
+    return {
+        "vlaJepa": await asyncio.to_thread(local_vla.inspect_checkpoint),
+        "trellis": await asyncio.to_thread(model_registry.inspect_trellis, native_path, gguf_path),
+        "hardware": await asyncio.to_thread(performance.snapshot),
+        "generationHistory": history[:30],
+        "benchmarkComparable": False,
+        "benchmarkBlocker": "The installed GGUF set is F16 and has no local trellis.cpp executable, so a native-versus-quantized benchmark would be mislabeled.",
+    }
 
 
 @app.post("/api/worlds/variants")

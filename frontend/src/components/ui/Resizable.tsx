@@ -13,47 +13,118 @@ export function ResizeHandle({
 }) {
   const [dragging, setDragging] = useState(false);
   const start = useRef(0);
+  const active = useRef(false);
+  const pointerId = useRef<number | null>(null);
+  const handleRef = useRef<HTMLDivElement | null>(null);
+
+  const stopDrag = useCallback(
+    () => {
+      if (!active.current) return;
+
+      if (pointerId.current !== null && handleRef.current?.hasPointerCapture(pointerId.current)) {
+        try {
+          handleRef.current.releasePointerCapture(pointerId.current);
+        } catch {
+          // Ignore capture failures to avoid pointer state edge-case crashes.
+        }
+      }
+
+      pointerId.current = null;
+      active.current = false;
+      setDragging(false);
+      document.body.classList.remove("col-resizing", "row-resizing");
+    },
+    [],
+  );
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
+      // Ensure no stale drag state if another input started while this one did not close cleanly.
+      stopDrag();
+
       e.preventDefault();
-      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+      pointerId.current = e.pointerId;
+      active.current = true;
+      try {
+        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      } catch {
+        // Some platforms reject capture for this pointer type; continue resizing via move events.
+      }
       start.current = dir === "col" ? e.clientX : e.clientY;
       setDragging(true);
       document.body.classList.add(dir === "col" ? "col-resizing" : "row-resizing");
     },
-    [dir],
+    [dir, stopDrag],
   );
 
   const onPointerMove = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
-      if (!dragging) return;
+      if (!active.current) return;
       const pos = dir === "col" ? e.clientX : e.clientY;
-      onDrag(pos - start.current);
+      try {
+        onDrag(pos - start.current);
+      } catch (error) {
+        console.error("Resize drag handler failed:", error);
+        stopDrag();
+        return;
+      }
       start.current = pos;
     },
-    [dragging, dir, onDrag],
+    [dir, onDrag, stopDrag],
   );
 
-  const stop = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>) => {
-      if (!dragging) return;
-      (e.target as HTMLElement).releasePointerCapture(e.pointerId);
-      setDragging(false);
-      document.body.classList.remove("col-resizing", "row-resizing");
-    },
-    [dragging],
-  );
+  const onPointerUp = useCallback(() => stopDrag(), [stopDrag]);
+
+  const onPointerLeave = useCallback(() => stopDrag(), [stopDrag]);
+
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (e: PointerEvent) => {
+      if (!active.current) return;
+      if (pointerId.current !== null && e.pointerId !== pointerId.current) return;
+      const pos = dir === "col" ? e.clientX : e.clientY;
+      try {
+        onDrag(pos - start.current);
+      } catch (error) {
+        console.error("Resize drag handler failed:", error);
+        stopDrag();
+        return;
+      }
+      start.current = pos;
+    };
+    const onUp = () => stopDrag();
+    const onCancel = () => stopDrag();
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("blur", onCancel);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("blur", onCancel);
+      if (active.current) {
+        stopDrag();
+      }
+    };
+  }, [dir, dragging, onDrag, stopDrag]);
+
+  const onPointerCancel = useCallback(() => {
+    stopDrag();
+  }, [stopDrag]);
 
   return (
     <div
+      ref={handleRef}
       className={`resize-${dir === "col" ? "v" : "h"} ${dragging ? "dragging" : ""}`}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
-      onPointerUp={stop}
-      onPointerCancel={stop}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerCancel}
+      onPointerLeave={onPointerLeave}
       role="separator"
       aria-orientation={dir === "col" ? "vertical" : "horizontal"}
+      style={{ touchAction: "none" }}
     />
   );
 }
@@ -88,7 +159,11 @@ export function usePanelSize(initial: number, min: number, max: number, storageK
     return Number.isFinite(stored) ? Math.max(min, Math.min(max, stored)) : initial;
   });
   const apply = useCallback(
-    (next: number) => setSize(Math.max(min, Math.min(max, next))),
+    (next: number | ((prev: number) => number)) =>
+      setSize((prev) => {
+        const value = typeof next === "function" ? next(prev) : next;
+        return Math.max(min, Math.min(max, value));
+      }),
     [min, max],
   );
   useEffect(() => {

@@ -6,11 +6,24 @@ import { Badge, InspSection, Menu, MenuItem, VecInput } from "../components/ui/c
 import { Tree, type TreeNodeData } from "../components/ui/Tree";
 import { Modal } from "../components/ui/Modal";
 import { useToast } from "../components/ui/Toast";
-import { Viewport } from "../components/three/Viewport";
 import { api, ApiError, downloadApiFile } from "../lib/api";
 import { useApi } from "../lib/useApi";
 import { EmptyState, ErrorState, Skeleton } from "../lib/states";
-import type { Asset, AssetPart } from "../data/types";
+import { NativeVulkanCanvas } from "../components/three/NativeVulkanCanvas";
+import type { Asset, AssetPart, PhotoCandidate } from "../data/types";
+
+interface EvidenceReport {
+  provider: string;
+  model: string;
+  analysis: {
+    assetSummary: string;
+    parts: { name: string; role: string; material: string | null; confidence: number }[];
+    dimensions: { name: string; valueMm: number | null; sourceUnit: string | null; confidence: number }[];
+    materials: string[];
+    unknowns: string[];
+    humanReviewRequired: boolean;
+  };
+}
 
 /** Asset → tree model for the part hierarchy panel. */
 function partsToTree(parts: AssetPart[]): TreeNodeData[] {
@@ -29,12 +42,14 @@ export default function AssetDetail() {
   const nav = useNavigate();
   const toast = useToast();
   const { data: asset, error, loading, refetch } = useApi<Asset>(assetId ? `/assets/${assetId}` : null);
+  const hasAnalysisArtifact = Boolean(asset?.artifacts.some((artifact) => artifact.file === "analysis.json"));
+  const { data: evidenceReport, refetch: refetchEvidence } = useApi<EvidenceReport>(hasAnalysisArtifact && assetId ? `/assets/${assetId}/files/analysis.json` : null);
   const [reevaluating, setReevaluating] = useState(false);
+  const [analyzingEvidence, setAnalyzingEvidence] = useState(false);
+  const [placingInWorld, setPlacingInWorld] = useState(false);
   const [retireConfirm, setRetireConfirm] = useState(false);
   const [retiring, setRetiring] = useState(false);
   const [part, setPart] = useState<string | null>("body");
-  const [turntable, setTurntable] = useState(true);
-  const [doorOpen, setDoorOpen] = useState(0.65);
   const [pos, setPos] = useState<[string, string, string]>(["1.842", "0.000", "0.000"]);
   const [rot, setRot] = useState<[string, string, string]>(["0.000", "0.000", "90.000"]);
   const [scl, setScl] = useState<[string, string, string]>(["1.000", "1.000", "1.000"]);
@@ -68,7 +83,7 @@ export default function AssetDetail() {
 
   const downloadUsd = async () => {
     try {
-      await downloadApiFile(`/assets/${asset.id}/usd`, `${asset.id}.usda`);
+      await downloadApiFile(`/assets/${asset.id}/files/asset.usda`, `${asset.id}.usda`);
       toast.push("ok", "USD downloaded", `${asset.id}.usda`);
     } catch (e) {
       toast.push("err", "USD download failed", e instanceof ApiError ? e.message : String(e));
@@ -77,7 +92,7 @@ export default function AssetDetail() {
 
   const downloadArtifact = async (file: string) => {
     try {
-      await downloadApiFile(`/assets/${asset.id}/artifacts/${encodeURIComponent(file)}`, file);
+      await downloadApiFile(`/assets/${asset.id}/files/${encodeURIComponent(file)}`, file);
       toast.push("ok", "Artifact downloaded", file);
     } catch (e) {
       toast.push("err", "Artifact download failed", e instanceof ApiError ? e.message : String(e));
@@ -129,7 +144,55 @@ export default function AssetDetail() {
     }
   };
 
+  const openInWorld = async () => {
+    setPlacingInWorld(true);
+    try {
+      await api.post(`/worlds/assets/${asset.id}/place`);
+      nav(`/worlds?asset=${encodeURIComponent(asset.id)}`);
+    } catch (e) {
+      toast.push("err", "World placement failed", e instanceof ApiError ? e.message : String(e));
+      setPlacingInWorld(false);
+    }
+  };
+
+  const analyzeEvidence = async () => {
+    setAnalyzingEvidence(true);
+    try {
+      const { jobId } = await api.post<{ jobId: string }>(`/assets/${asset.id}/evidence-analysis`, { confirmEvidenceReview: true });
+      toast.push("info", "Evidence analysis queued", `Job ${jobId} uses only the persisted source evidence.`);
+      const poll = async (attempt = 0) => {
+        if (attempt >= 90) {
+          setAnalyzingEvidence(false);
+          toast.push("info", "Evidence review still running", "Refresh later to inspect the auditable analysis artifact.");
+          return;
+        }
+        try {
+          const job = await api.get<{ status: string; detail: { error?: string } }>(`/jobs/${jobId}`);
+          if (["success", "failed", "blocked"].includes(job.status)) {
+            setAnalyzingEvidence(false);
+            if (job.status === "success") {
+              refetch();
+              window.setTimeout(refetchEvidence, 250);
+              toast.push("ok", "Evidence analysis complete", "Review the sources and unknowns before using any field in physics.");
+            } else {
+              toast.push("err", "Evidence analysis did not complete", job.detail.error ?? "No asset data was promoted.");
+            }
+            return;
+          }
+        } catch { /* retry below */ }
+        window.setTimeout(() => void poll(attempt + 1), 1000);
+      };
+      window.setTimeout(() => void poll(), 700);
+    } catch (e) {
+      setAnalyzingEvidence(false);
+      toast.push("err", "Evidence analysis could not start", e instanceof ApiError ? e.message : String(e));
+    }
+  };
+
   const selectedPartName = findPartName(asset.parts, part) ?? "Body";
+  const hasGeneratedMesh = asset.artifacts.some((artifact) => artifact.file === "model.glb");
+  const hasOpenUsd = asset.artifacts.some((artifact) => artifact.file === "asset.usda");
+  const pipelineError = (asset.properties as Record<string, string>).pipelineError;
 
   return (
     <div className="page">
@@ -148,7 +211,7 @@ export default function AssetDetail() {
         <div className="head-actions">
           <Menu trigger={() => <button className="btn btn-secondary">Actions <Icon name="chevronDown" size={12} /></button>} align="right" width={200}>
             <MenuItem icon="refresh" onClick={reevaluate}>Rebuild asset</MenuItem>
-            <MenuItem icon="download" onClick={downloadUsd}>Download USD</MenuItem>
+            <MenuItem icon="download" onClick={() => hasOpenUsd ? downloadUsd() : toast.push("info", "OpenUSD is not available", "A real generated mesh is required before RobotWorld writes asset.usda.")}>Download USD</MenuItem>
             <MenuItem icon="edit" onClick={() => toast.push("info", "Edit metadata", "Metadata editing enables with the asset API")}>Edit metadata</MenuItem>
             <div className="menu-sep" />
             <MenuItem icon="x" onClick={() => setRetireConfirm(true)}>Retire asset</MenuItem>
@@ -156,7 +219,10 @@ export default function AssetDetail() {
           <button className="btn btn-secondary" onClick={reevaluate} disabled={reevaluating}>
             <Icon name="refresh" size={13} className={reevaluating ? "spin" : undefined} /> {reevaluating ? "Evaluating…" : "Re-evaluate"}
           </button>
-          <button className="btn btn-primary" onClick={() => nav("/worlds")}><Icon name="play" size={13} /> Open in Sim</button>
+          <button className="btn btn-secondary" onClick={analyzeEvidence} disabled={analyzingEvidence} title="Analyze only this asset's persisted Bright Data or Scraper Studio evidence">
+            <Icon name="search" size={13} className={analyzingEvidence ? "spin" : undefined} /> {analyzingEvidence ? "Analyzing…" : "Analyze evidence"}
+          </button>
+          <button className="btn btn-primary" onClick={() => hasGeneratedMesh ? openInWorld() : toast.push("info", "World placement is waiting for geometry", "RobotWorld will not place a placeholder model in the scene.")} disabled={!hasGeneratedMesh || placingInWorld} title={hasGeneratedMesh ? "Persist and open this generated asset's composed OpenUSD world" : "A real GLB must exist before scene placement"}><Icon name="play" size={13} /> {placingInWorld ? "Placing…" : "Open in Sim"}</button>
         </div>
       </div>
 
@@ -215,46 +281,82 @@ export default function AssetDetail() {
       <div className="ad-main">
         {/* 3D preview */}
         <Card
-          title="3D Preview"
+          title="Generated geometry"
           flush
-          right={
-            <span className="row" style={{ gap: 7 }}>
-              <button
-                className="btn btn-ghost btn-sm"
-                onClick={() => setTurntable(!turntable)}
-                style={turntable ? { color: "var(--accent)", borderColor: "var(--accent-line)" } : undefined}
-              >
-                <Icon name="rotate" size={12} /> Turntable
-              </button>
-            </span>
-          }
+          right={hasGeneratedMesh ? <span className="micro t2">Actual GLB · native Vulkan frame</span> : undefined}
         >
-          <div style={{ padding: 10, position: "relative" }}>
-            <Viewport
-              camera={{ position: [1.5, 1.35, 1.9], fov: 38 }}
-              target={[0, 0.5, 0]}
-              doorAngle={doorOpen * 75}
-              style={{ height: 392 }}
-              gizmo={false}
-              autoRotate={turntable}
-              grid
-            />
-            <div className="vp-overlay" style={{ left: "50%", bottom: 18, transform: "translateX(-50%)" }}>
-              <span className="vp-chip">Drag to orbit · wheel to zoom</span>
+          {!hasGeneratedMesh && (
+            <div style={{ padding: 18, minHeight: 180, display: "flex", flexDirection: "column", justifyContent: "center", gap: 8 }}>
+              <div className="row" style={{ gap: 9, color: "var(--amber)" }}><Icon name="clock" size={17} /> No generated mesh available</div>
+              <p className="small t2" style={{ margin: 0 }}>The source photo is real, but RobotWorld will not render a placeholder or procedural stand-in as if it were a TRELLIS result.</p>
+              {pipelineError && <p className="small" style={{ margin: 0, color: "var(--red)", overflowWrap: "anywhere" }}>Generation blocker: {pipelineError}</p>}
             </div>
-          </div>
-          {/* door articulation slider — real kinematic control */}
-          <div className="row" style={{ gap: 10, padding: "0 14px 12px" }}>
-            <span className="small t2" style={{ width: 96 }}>Door articulation</span>
-            <input
-              type="range" min={0} max={100} value={Math.round(doorOpen * 100)}
-              onChange={(e) => setDoorOpen(Number(e.target.value) / 100)}
-              style={{ flex: 1, accentColor: "var(--accent)" }}
-            />
-            <span className="mono small" style={{ width: 44, textAlign: "right" }}>{Math.round(doorOpen * 110)}°</span>
-          </div>
+          )}
+          {hasGeneratedMesh && <NativeGlbPreview assetId={asset.id} />}
         </Card>
+        {asset.sourceImage && (
+          <Card title="Source image used for TRELLIS" flush>
+            <div style={{ padding: 10 }}>
+              <div style={{ border: "1px solid var(--border)", borderRadius: "var(--r-md)", overflow: "hidden", maxWidth: 420 }}>
+                <img
+                  src={asset.sourceImage}
+                  alt="TRELLIS source image"
+                  style={{ width: "100%", height: "220px", objectFit: "cover", display: "block" }}
+                />
+              </div>
+              <div className="small t3" style={{ marginTop: 8, color: "var(--text-2)" }}>
+                Source image selected from Bright Data SERP image search for this build.
+              </div>
+            </div>
+          </Card>
+        )}
 
+        {asset.sourcePhotos && asset.sourcePhotos.length > 0 && (
+          <Card title="Source photo candidates" flush>
+            <div style={{ padding: 10, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 8 }}>
+              {asset.sourcePhotos.slice(0, 8).map((photo: PhotoCandidate) => (
+                <div key={`${photo.id}-${photo.seed}`} style={{ border: "1px solid var(--border)", borderRadius: "var(--r-md)", overflow: "hidden" }}>
+                  {photo.url ? (
+                    <img
+                      src={photo.url}
+                      alt={`photo-${photo.id}`}
+                      style={{ width: "100%", aspectRatio: "4 / 3", objectFit: "cover", display: "block" }}
+                    />
+                  ) : (
+                    <div style={{ aspectRatio: "4 / 3", background: "var(--bg-panel-3)" }} />
+                  )}
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+
+        <Card title="Evidence review" right={evidenceReport ? <Badge tone="amber">human review required</Badge> : undefined} flush>
+          {evidenceReport ? (
+            <div style={{ padding: 12 }} className="col">
+              <p className="small t2" style={{ margin: 0, lineHeight: 1.5 }}>{evidenceReport.analysis.assetSummary}</p>
+              <div className="kv">
+                <KV k="Provider" v={`${evidenceReport.provider} · ${evidenceReport.model}`} />
+                <KV k="Parts extracted" v={String(evidenceReport.analysis.parts.length)} />
+                <KV k="Measured dimensions" v={String(evidenceReport.analysis.dimensions.filter((item) => item.valueMm !== null).length)} />
+                <KV k="Materials" v={evidenceReport.analysis.materials.join(", ") || "none supported by evidence"} />
+              </div>
+              {evidenceReport.analysis.unknowns.length > 0 && (
+                <div className="small" style={{ color: "var(--amber)", lineHeight: 1.5 }}>
+                  Unknown: {evidenceReport.analysis.unknowns.slice(0, 3).join(" · ")}
+                </div>
+              )}
+              <button className="btn btn-ghost btn-sm" style={{ alignSelf: "flex-start" }} onClick={() => downloadArtifact("analysis.json")}>
+                <Icon name="download" size={12} /> Download evidence record
+              </button>
+            </div>
+          ) : (
+            <div style={{ padding: 12 }} className="small t2">
+              No evidence analysis record yet. This action uses only collected textual records; it will leave measurements unknown when the source does not contain them.
+            </div>
+          )}
+        </Card>
+        
         {/* Part tree */}
         <Card title="Part Tree" right={<Badge tone="grey">{asset.parts[0]?.children?.length ?? 0} parts</Badge>} flush>
           <div style={{ padding: "6px 4px", maxHeight: 430, overflowY: "auto" }}>
@@ -317,15 +419,12 @@ export default function AssetDetail() {
                   <div key={s.name} className="row" style={{ flex: 1, minWidth: 108 }}>
                     <div className="col" style={{ gap: 5, flex: 1 }}>
                       <span
-                        className="center"
+                        className={`compiler-state compiler-state--${s.status}`}
                         style={{
-                          width: 30, height: 30, borderRadius: "50%",
-                          background: s.status === "passed" ? "var(--green-soft)" : s.status === "failed" ? "var(--red-soft)" : "var(--bg-panel-3)",
-                          color: s.status === "passed" ? "var(--green)" : s.status === "failed" ? "var(--red)" : "var(--text-3)",
-                          border: `1px solid ${s.status === "passed" ? "rgba(76,195,138,0.4)" : s.status === "failed" ? "rgba(240,86,79,0.4)" : "var(--border-strong)"}`,
+                          alignSelf: "flex-start",
                         }}
                       >
-                        {s.status === "passed" ? <Icon name="check" size={13} /> : s.status === "failed" ? <Icon name="x" size={13} /> : <Icon name="clock" size={13} />}
+                        {s.status.toUpperCase()}
                       </span>
                       <span className="small" style={{ fontWeight: 600 }}>{i + 1}. {s.name}</span>
                       <span className="micro t3 mono">{s.duration}</span>
@@ -339,8 +438,8 @@ export default function AssetDetail() {
               <div className="row" style={{ gap: 8, padding: "10px 14px", borderTop: "1px solid var(--border)" }}>
                 {asset.lastEvalResult === "passed" ? (
                   <>
-                    <Icon name="check" size={13} style={{ color: "var(--green)" }} />
-                    <span className="small g-green" style={{ fontWeight: 580 }}>Compilation completed successfully</span>
+                    <Icon name="terminal" size={13} style={{ color: "var(--text-2)" }} />
+                    <span className="small" style={{ fontWeight: 580 }}>Recorded compile time: {asset.compile.reduce((sum, stage) => sum + stage.durationSeconds, 0).toFixed(1)} s</span>
                   </>
                 ) : asset.lastEvalResult === "failed" ? (
                   <>
@@ -374,7 +473,16 @@ export default function AssetDetail() {
                     <td>
                       <div className="cell-main">
                         <span className="cell-ico">
-                          <Icon name={a.type === "USD" ? "usd" : a.type.includes("image") || a.type.includes("render") ? "image" : a.type === "Mesh" || a.type.includes("Collider") ? "mesh" : "box"} size={13} />
+                          <Icon
+                            name={(() => {
+                              const assetType = a.type.toLowerCase();
+                              if (assetType.includes("usd")) return "usd";
+                              if (assetType.includes("mesh")) return "mesh";
+                              if (assetType.includes("image") || assetType.includes("render")) return "image";
+                              return "box";
+                            })()}
+                            size={13}
+                          />
                         </span>
                         {a.type}
                       </div>
@@ -399,6 +507,18 @@ export default function AssetDetail() {
           )}
         </Card>
       </div>
+    </div>
+  );
+}
+
+function NativeGlbPreview({ assetId }: { assetId: string }) {
+  return (
+    <div style={{ padding: 10 }}>
+      <NativeVulkanCanvas
+        assetId={assetId}
+        label="Actual GLB · native Vulkan"
+        style={{ height: 392, borderRadius: "var(--r-md)", border: "1px solid var(--border)" }}
+      />
     </div>
   );
 }

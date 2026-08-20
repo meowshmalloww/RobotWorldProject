@@ -78,9 +78,15 @@ def test_world_mutations_and_checks() -> None:
     with TestClient(app) as client:
         scene = client.get("/api/worlds/scene").json()
         assert scene["sceneTree"]
+        for placement in scene["placements"]:
+            actual = [placement["worldBounds"][1][i] - placement["worldBounds"][0][i] for i in range(3)]
+            assert max(abs(actual[i] - placement["targetDimensions"][i]) for i in range(3)) < 0.002
+            assert placement["anchor"]["surface"] in {"world floor", "countertop"}
         assert client.put("/api/worlds/scene", json={"sceneTree": scene["sceneTree"], "variants": scene["variants"]}).status_code == 200
         checks = client.post("/api/worlds/checks/run", json={}).json()["physicsChecks"]
         assert checks and all(item["status"] in {"pass", "warn", "fail"} for item in checks)
+        if scene["placements"]:
+            assert any(item["check"].startswith("Measured mesh fit") for item in checks)
         camera_probe = client.post("/api/worlds/cameras/probe", json={})
         assert camera_probe.status_code == 200
         for camera in camera_probe.json()["cameras"].values():
