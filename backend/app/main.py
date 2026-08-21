@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import statistics
 import time
@@ -17,7 +18,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import mujoco
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -49,7 +50,7 @@ from .models import (
 )
 from .telemetry import drain_loop, init_otel, signoz_exporting, span
 from .util import fmt_duration, new_id, rel_time
-from .services import agent, asset_evidence, brightdata, catalog, demo_scenarios, evaluator, events, live, llm, local_vla, model_registry, performance, pipeline, port, settings_store, simcore, trellis, usda, vulkan_renderer, world_geometry
+from .services import agent, asset_evidence, brightdata, catalog, demo_scenarios, evaluator, events, isaac_sim, live, llm, local_vla, model_registry, performance, pipeline, port, robot_registry, settings_store, simcore, trellis, usda, vulkan_renderer, world_geometry
 from .services.remote_policy import PolicyClient, PolicyConfig, PolicyError
 
 log = logging.getLogger(__name__)
@@ -118,8 +119,42 @@ class SceneIn(BaseModel):
     variants: list[dict[str, Any]] = []
 
 
+class PlacementIn(BaseModel):
+    translation: tuple[float, float, float] | None = None
+    rotationZDeg: float | None = Field(default=None, ge=-36000, le=36000)
+    visible: bool | None = None
+    mobility: Literal["movable", "fixed"] | None = None
+
+    @field_validator("translation")
+    @classmethod
+    def finite_translation(cls, value):
+        if value is not None and (any(not math.isfinite(item) for item in value) or any(abs(item) > 1000 for item in value)):
+            raise ValueError("translation must contain finite world coordinates within 1000 metres")
+        return value
+
+
+class RobotPatchIn(BaseModel):
+    cameraMappings: dict[str, str] | None = None
+    policyAdapter: str | None = Field(default=None, max_length=500)
+
+
+class WorldCommandIn(BaseModel):
+    instruction: str = Field(min_length=2, max_length=1000)
+    robotId: str | None = None
+    mode: Literal["plan", "execute"] = "plan"
+
+
 class KeyIn(BaseModel):
     key: str = Field(min_length=1, max_length=8000)
+
+
+class FrontendErrorIn(BaseModel):
+    source: Literal["react", "window", "promise", "api"]
+    message: str = Field(min_length=1, max_length=2000)
+    stack: str = Field(default="", max_length=12000)
+    componentStack: str = Field(default="", max_length=8000)
+    route: str = Field(default="", max_length=500)
+    userAgent: str = Field(default="", max_length=500)
 
 
 class EvalSessionIn(BaseModel):
@@ -610,7 +645,7 @@ async def render_active_world_vulkan(
             raise HTTPException(404, "No active world")
         ids = _placed_asset_ids(world.scene_tree)
         found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
-        rows = _world_assembly_rows(ids, {row.id: row for row in found})
+        rows = _world_assembly_rows(ids, {row.id: row for row in found}, _placement_state(world.scene_tree))
 
     placements = [
         vulkan_renderer.WorldPlacement(
@@ -618,6 +653,7 @@ async def render_active_world_vulkan(
             model_path=(ASSETS_DIR / str(row["asset_id"]) / "model.glb"),
             translation=tuple(float(value) for value in row["translation"]),
             usd_scale=tuple(float(value) for value in row["scale"]),
+            rotation_z_deg=float(row.get("rotation_z_deg") or 0.0),
         )
         for row in rows
         if (ASSETS_DIR / str(row["asset_id"]) / "model.glb").is_file()
@@ -816,11 +852,13 @@ def _generated_world_checks(rows: list[dict[str, Any]], stage_available: bool) -
         target = row["target_dimensions"]
         bounds = row["world_bounds"]
         actual = tuple(bounds[1][i] - bounds[0][i] for i in range(3))
-        delta = max(abs(actual[i] - target[i]) for i in range(3))
+        angle = math.radians(float(row.get("rotation_z_deg") or 0.0))
+        expected = (abs(math.cos(angle)) * target[0] + abs(math.sin(angle)) * target[1], abs(math.sin(angle)) * target[0] + abs(math.cos(angle)) * target[1], target[2])
+        delta = max(abs(actual[i] - expected[i]) for i in range(3))
         checks.append({
             "check": f"Measured mesh fit - {row['asset_name']}",
             "status": "pass" if delta < 0.002 else "fail",
-            "details": f"World AABB {actual[0]:.3f} x {actual[1]:.3f} x {actual[2]:.3f} m; target {target[0]:.3f} x {target[1]:.3f} x {target[2]:.3f} m",
+            "details": f"World AABB {actual[0]:.3f} x {actual[1]:.3f} x {actual[2]:.3f} m; physical W/D/H {target[0]:.3f} x {target[1]:.3f} x {target[2]:.3f} m; rotation {float(row.get('rotation_z_deg') or 0.0):.1f}°",
             "impacted": row["asset_id"],
             "severity": "Info" if delta < 0.002 else "High",
         })
@@ -859,7 +897,7 @@ async def world_scene():
         variants = (await session.execute(select(Variant).where(Variant.world_id == world.id).order_by(Variant.created_at))).scalars().all()
         ids = _placed_asset_ids(world.scene_tree)
         found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
-        placement_rows = _world_assembly_rows(ids, {row.id: row for row in found})
+        placement_rows = _world_assembly_rows(ids, {row.id: row for row in found}, _placement_state(world.scene_tree))
     return {
         "worldId": world.id,
         "worldName": world.name,
@@ -887,6 +925,8 @@ def _placed_asset_ids(nodes: list[Any]) -> list[str]:
     for node in nodes if isinstance(nodes, list) else []:
         if not isinstance(node, dict):
             continue
+        if node.get("visible") is False:
+            continue
         asset_id = node.get("assetId")
         if isinstance(asset_id, str) and asset_id and asset_id not in found:
             found.append(asset_id)
@@ -898,7 +938,21 @@ def _placed_asset_ids(nodes: list[Any]) -> list[str]:
     return found
 
 
-def _world_assembly_rows(ids: list[str], by_id: dict[str, Asset]) -> list[dict[str, Any]]:
+def _placement_state(nodes: list[Any]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict):
+            continue
+        asset_id = node.get("assetId")
+        if isinstance(asset_id, str) and asset_id and asset_id not in result:
+            result[asset_id] = node
+        if isinstance(node.get("children"), list):
+            for key, value in _placement_state(node["children"]).items():
+                result.setdefault(key, value)
+    return result
+
+
+def _world_assembly_rows(ids: list[str], by_id: dict[str, Asset], state: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Build the canonical placement rows used by both OpenUSD and Vulkan.
 
     Keeping the semantics in one function prevents the displayed whole world
@@ -941,9 +995,13 @@ def _world_assembly_rows(ids: list[str], by_id: dict[str, Asset]) -> list[dict[s
         dimension_sources = [str(value.get("source", "inferred")) for value in source_fields if isinstance(value, dict)]
         confidences = [float(value.get("confidence", 0.0)) for value in source_fields if isinstance(value, dict)]
         evidence = "measured/scraped" if dimension_sources and all(value != "inferred" for value in dimension_sources) else "inferred"
+        mass_value = max(0.001, float(spec_value("mass_kg", width * height * depth * 500.0)))
+        mass_field = spec.get("mass_kg", {})
+        mass_source = str(mass_field.get("source", "volume-density estimate")) if isinstance(mass_field, dict) else "asset specification"
         candidates.append({
             "asset_id": asset_id,
             "asset_name": row.name,
+            "asset_kind": row.kind,
             "asset_layer": layer,
             "model_path": model,
             "category": category,
@@ -951,6 +1009,8 @@ def _world_assembly_rows(ids: list[str], by_id: dict[str, Asset]) -> list[dict[s
             "dimension_source": evidence,
             "dimension_confidence": min(confidences) if confidences else 0.0,
             "scale_source": f"occupied GLB bounds fitted to {evidence} target dimensions",
+            "mass_kg": mass_value,
+            "mass_source": mass_source,
             "index": index,
         })
 
@@ -974,7 +1034,17 @@ def _world_assembly_rows(ids: list[str], by_id: dict[str, Asset]) -> list[dict[s
         high = fit["local_usd_high"]
         translation = item.get("translation")
         anchor = item.get("anchor")
-        if "counter" in category or "island" in name:
+        persisted = (state or {}).get(item["asset_id"], {})
+        persisted_translation = persisted.get("translation")
+        rotation_z_deg = float(persisted.get("rotationZDeg") or 0.0)
+        fixed_terms = ("counter", "island", "table", "sink", "faucet", "tap", "cabinet", "wall", "blender")
+        inferred_mobility = "fixed" if any(term in f"{category} {name}" for term in fixed_terms) else "movable"
+        mobility = persisted.get("mobility") if persisted.get("mobility") in {"movable", "fixed"} else inferred_mobility
+        if isinstance(persisted_translation, list) and len(persisted_translation) == 3:
+            translation = tuple(float(value) for value in persisted_translation)
+            stored_anchor = persisted.get("anchor")
+            anchor = stored_anchor if isinstance(stored_anchor, dict) else {"mode": "manual", "surface": "user-authored transform", "gap_m": 0.0}
+        elif "counter" in category or "island" in name:
             pass
         elif "sink" in category and "faucet" not in name:
             rim_offset = 0.012
@@ -993,16 +1063,19 @@ def _world_assembly_rows(ids: list[str], by_id: dict[str, Asset]) -> list[dict[s
         else:
             translation = (float(item["index"]) * 0.4, 0.0, -low[2])
             anchor = {"mode": "floor", "surface": "world floor", "gap_m": 0.0}
-        bounds = world_geometry.world_bounds(fit, translation)
+        bounds = world_geometry.world_bounds(fit, translation, rotation_z_deg)
         rows.append({
             **{key: value for key, value in item.items() if key not in {"fit", "category", "index"}},
             "translation": translation,
+            "rotation_z_deg": rotation_z_deg,
             "scale": fit["scale"],
             "raw_bounds": fit["raw_bounds"],
             "raw_extents": fit["raw_extents"],
             "target_dimensions": fit["target_dimensions"],
             "world_bounds": bounds,
             "anchor": anchor,
+            "mobility": mobility,
+            "collision_approximation": "convexHull" if mobility == "movable" else "none",
         })
     return rows
 
@@ -1013,6 +1086,7 @@ def _placement_api(row: dict[str, Any]) -> dict[str, Any]:
         "assetId": row["asset_id"],
         "name": row["asset_name"],
         "translation": list(row["translation"]),
+        "rotationZDeg": row["rotation_z_deg"],
         "scale": list(row["scale"]),
         "rawBounds": [list(value) for value in row["raw_bounds"]],
         "rawExtents": list(row["raw_extents"]),
@@ -1021,7 +1095,11 @@ def _placement_api(row: dict[str, Any]) -> dict[str, Any]:
         "dimensionSource": row["dimension_source"],
         "dimensionConfidence": row["dimension_confidence"],
         "anchor": row["anchor"],
-        "physicalStatus": "visual_only_pending_measured_collision",
+        "mobility": row["mobility"],
+        "massKg": row["mass_kg"],
+        "massSource": row["mass_source"],
+        "collisionApproximation": row["collision_approximation"],
+        "physicalStatus": "usd_physics_authored_pending_isaac_validation",
     }
 
 
@@ -1031,7 +1109,7 @@ async def _author_world_assembly(session, world: World, tree: list[dict[str, Any
     rows: list[dict[str, Any]] = []
     if ids:
         found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all()
-        rows = _world_assembly_rows(ids, {row.id: row for row in found})
+        rows = _world_assembly_rows(ids, {row.id: row for row in found}, _placement_state(tree))
     output = WORLDS_DIR / world.id / "stage.usda"
     if not rows:
         if output.is_file():
@@ -1064,6 +1142,15 @@ async def place_asset_in_world(asset_id: str):
             "tag": "OpenUSD generated asset",
             "children": [{"id": f"trellis-visual-{asset.id}", "assetId": asset.id, "name": "TRELLIS.2 PBR visual mesh", "icon": "cube", "tag": "mesh"}],
         })
+        ids = _placed_asset_ids(tree)
+        assets = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all()
+        defaults = {row["asset_id"]: row for row in _world_assembly_rows(ids, {item.id: item for item in assets})}
+        for node in tree:
+            if isinstance(node, dict) and node.get("assetId") in defaults and "translation" not in node:
+                row = defaults[str(node["assetId"])]
+                node["translation"] = list(row["translation"])
+                node["anchor"] = row["anchor"]
+                node["visible"] = True
         await _author_world_assembly(session, world, tree)
         world.scene_tree = tree
         await session.commit()
@@ -1088,6 +1175,104 @@ async def save_world(payload: SceneIn):
     return {"saved": True}
 
 
+def _edit_placement(nodes: list[Any], asset_id: str, payload: PlacementIn) -> bool:
+    changed = False
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict):
+            continue
+        if node.get("assetId") == asset_id:
+            if payload.translation is not None:
+                node["translation"] = list(payload.translation)
+                node["anchor"] = {"mode": "manual", "surface": "user-authored transform", "gap_m": 0.0}
+            if payload.visible is not None:
+                node["visible"] = payload.visible
+            if payload.rotationZDeg is not None:
+                node["rotationZDeg"] = float(payload.rotationZDeg) % 360.0
+            if payload.mobility is not None:
+                node["mobility"] = payload.mobility
+            changed = True
+        if isinstance(node.get("children"), list):
+            changed = _edit_placement(node["children"], asset_id, payload) or changed
+    return changed
+
+
+@app.patch("/api/worlds/placements/{asset_id}")
+async def update_world_placement(asset_id: str, payload: PlacementIn):
+    async with SessionLocal() as session:
+        world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
+        if world is None:
+            raise HTTPException(404, "No active world")
+        tree = json.loads(json.dumps(world.scene_tree or []))
+        if not _edit_placement(tree, asset_id, payload):
+            raise HTTPException(404, "Placed asset not found")
+        world.scene_tree = tree
+        await _author_world_assembly(session, world, tree)
+        await session.commit()
+    events.publish("world", "Placement updated", f"{asset_id} · OpenUSD and Vulkan synchronized", asset=asset_id)
+    return {"saved": True, "assetId": asset_id}
+
+
+@app.post("/api/worlds/layout")
+async def auto_layout_world():
+    """Ask Luna for semantic relationships, then solve metres from measured AABBs."""
+    async with SessionLocal() as session:
+        world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
+        if world is None:
+            raise HTTPException(404, "No active world")
+        ids = _placed_asset_ids(world.scene_tree)
+        found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
+        rows = _world_assembly_rows(ids, {row.id: row for row in found}, _placement_state(world.scene_tree))
+        if not rows:
+            raise HTTPException(409, "Place generated assets before running auto-layout.")
+
+        context = [{"assetId": row["asset_id"], "name": row["asset_name"], "dimensionsWDH": row["target_dimensions"], "dimensionSource": row["dimension_source"]} for row in rows]
+        system = """Arrange a tabletop robotics scene from supplied measured assets. Return JSON {placements:[{assetId,relation,u,v}]}; relation is floor, on_counter, or integrated_counter; u/v are numbers -0.8..0.8 across the support surface. Put the largest counter/island on floor. A sink is integrated_counter. A faucet and appliances are on_counter. Do not invent IDs or dimensions."""
+        proposed, provenance = await llm.plan(system, json.dumps(context), span_name="world semantic layout")
+        proposals = proposed.get("placements", []) if isinstance(proposed, dict) else []
+        valid = {str(item.get("assetId")): item for item in proposals if isinstance(item, dict) and str(item.get("assetId")) in ids}
+
+        counter = max(rows, key=lambda row: float(row["target_dimensions"][0]) * float(row["target_dimensions"][1]))
+        cb = counter["world_bounds"]
+        counter_top = float(cb[1][2])
+        arranged: dict[str, tuple[list[float], dict[str, Any]]] = {}
+        arranged[counter["asset_id"]] = (list(counter["translation"]), {"mode": "floor", "surface": "world floor", "gap_m": 0.0})
+        others = [row for row in rows if row["asset_id"] != counter["asset_id"]]
+        columns = max(1, math.ceil(math.sqrt(len(others))))
+        for index, row in enumerate(others):
+            proposal = valid.get(row["asset_id"], {})
+            name = row["asset_name"].lower()
+            relation = str(proposal.get("relation") or ("integrated_counter" if "sink" in name and "faucet" not in name else "on_counter"))
+            fallback_u = -0.7 + 1.4 * ((index % columns) + 0.5) / columns
+            fallback_v = -0.65 + 1.3 * ((index // columns) + 0.5) / max(1, math.ceil(len(others) / columns))
+            u = max(-0.8, min(0.8, float(proposal.get("u", fallback_u))))
+            v = max(-0.8, min(0.8, float(proposal.get("v", fallback_v))))
+            low = row["world_bounds"][0]
+            local_low = [float(low[i]) - float(row["translation"][i]) for i in range(3)]
+            x = (float(cb[0][0]) + float(cb[1][0])) / 2 + u * (float(cb[1][0]) - float(cb[0][0])) / 2
+            y = (float(cb[0][1]) + float(cb[1][1])) / 2 + v * (float(cb[1][1]) - float(cb[0][1])) / 2
+            if relation == "floor":
+                z = -local_low[2]
+                anchor = {"mode": "floor", "surface": "world floor", "gap_m": 0.0}
+            elif relation == "integrated_counter":
+                z = counter_top + 0.012 - float(row["target_dimensions"][2]) - local_low[2]
+                anchor = {"mode": "integrated", "surface": counter["asset_name"], "gap_m": 0.012}
+            else:
+                z = counter_top - local_low[2]
+                anchor = {"mode": "on_surface", "surface": counter["asset_name"], "gap_m": 0.0}
+            arranged[row["asset_id"]] = ([x, y, z], anchor)
+
+        tree = json.loads(json.dumps(world.scene_tree or []))
+        for node in tree:
+            if isinstance(node, dict) and node.get("assetId") in arranged:
+                node["translation"], node["anchor"] = arranged[str(node["assetId"])]
+                node["visible"] = True
+        world.scene_tree = tree
+        await _author_world_assembly(session, world, tree)
+        await session.commit()
+    events.publish("world", "Constraint layout solved", f"{len(arranged)} measured assets · {provenance}", world=world.id)
+    return {"saved": True, "provenance": provenance, "placements": len(arranged), "supportAssetId": counter["asset_id"]}
+
+
 @app.get("/api/worlds/files/stage.usda")
 async def world_stage_file():
     async with SessionLocal() as session:
@@ -1108,7 +1293,7 @@ async def run_checks():
             raise HTTPException(404, "No active world")
         ids = _placed_asset_ids(world.scene_tree)
         found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
-    rows = await asyncio.to_thread(_world_assembly_rows, ids, {row.id: row for row in found})
+    rows = await asyncio.to_thread(_world_assembly_rows, ids, {row.id: row for row in found}, _placement_state(world.scene_tree))
     stage_available = (WORLDS_DIR / world.id / "stage.usda").is_file()
     return {"physicsChecks": _generated_world_checks(rows, stage_available)}
 
@@ -1146,12 +1331,147 @@ async def vla_jepa_status():
         raise HTTPException(500, f"Local VLA-JEPA checkpoint inspection failed: {exc}") from exc
 
 
+@app.get("/api/robots")
+async def robots_list():
+    return {"robots": await asyncio.to_thread(robot_registry.list_all), "accepted": sorted(robot_registry.ALLOWED), "maxBytes": robot_registry.MAX_BYTES}
+
+
+@app.get("/api/simulation/isaac")
+async def isaac_status():
+    flat = await settings_store.get_flat()
+    return await asyncio.to_thread(
+        isaac_sim.inspect,
+        str(flat.get("simulation.isaacRoot") or ""),
+        str(flat.get("simulation.isaacAssetRoot") or ""),
+    )
+
+
+@app.post("/api/robots/franka/isaac", status_code=201)
+async def register_isaac_franka():
+    flat = await settings_store.get_flat()
+    status = await asyncio.to_thread(
+        isaac_sim.inspect,
+        str(flat.get("simulation.isaacRoot") or ""),
+        str(flat.get("simulation.isaacAssetRoot") or ""),
+    )
+    manifest = await asyncio.to_thread(robot_registry.register_isaac_franka, status)
+    events.publish("robot", "Franka reference registered", f"Isaac Sim {status['version']} · {'ready' if status['ready'] else 'runtime missing'}", robot=manifest["id"])
+    return manifest
+
+
+@app.post("/api/simulation/isaac/prepare")
+async def prepare_isaac_world():
+    flat = await settings_store.get_flat()
+    status = await asyncio.to_thread(
+        isaac_sim.inspect,
+        str(flat.get("simulation.isaacRoot") or ""),
+        str(flat.get("simulation.isaacAssetRoot") or ""),
+    )
+    async with SessionLocal() as session:
+        world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
+        if world is None:
+            raise HTTPException(404, "No active world")
+        await _author_world_assembly(session, world, world.scene_tree or [])
+    stage_path = WORLDS_DIR / world.id / "stage.usda"
+    try:
+        launch_path = await asyncio.to_thread(isaac_sim.write_launch_manifest, world.id, stage_path, status)
+    except FileNotFoundError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await asyncio.to_thread(robot_registry.register_isaac_franka, status)
+    return {
+        "prepared": True,
+        "runtimeReady": status["ready"],
+        "blockers": status["blockers"],
+        "stage": str(stage_path),
+        "manifest": str(launch_path),
+        "bridge": str((BASE_DIR / "isaac_bridge.py").resolve()),
+        "command": [status.get("python") or "<isaac-root>/python.bat", str((BASE_DIR / "isaac_bridge.py").resolve()), str(launch_path)],
+    }
+
+
+@app.post("/api/robots/import", status_code=201)
+async def robot_import(request: Request, filename: str = Query(min_length=1, max_length=180)):
+    """Accept a raw robot file so large URDF/USD/GLB imports stream to disk."""
+    if request.headers.get("content-type", "").split(";", 1)[0] not in {"application/octet-stream", "model/gltf-binary", "text/xml", "text/plain"}:
+        raise HTTPException(415, "Upload the robot file as application/octet-stream.")
+    try:
+        manifest = await robot_registry.ingest(filename, request.stream())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    events.publish("robot", "Robot imported", f"{manifest['name']} · {manifest['format']} · readiness inspected", robot=manifest["id"])
+    return manifest
+
+
+@app.put("/api/robots/{robot_id}")
+async def robot_update(robot_id: str, payload: RobotPatchIn):
+    try:
+        return await asyncio.to_thread(robot_registry.update, robot_id, payload.model_dump(exclude_unset=True))
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Robot not found") from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/worlds/commands")
+async def world_command(payload: WorldCommandIn):
+    robots = await asyncio.to_thread(robot_registry.list_all)
+    robot = next((item for item in robots if item.get("id") == payload.robotId), None)
+    vla = await asyncio.to_thread(local_vla.inspect_checkpoint)
+    async with SessionLocal() as session:
+        world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
+        if world is None:
+            raise HTTPException(404, "No active world")
+        ids = _placed_asset_ids(world.scene_tree)
+        found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
+        rows = _world_assembly_rows(ids, {row.id: row for row in found}, _placement_state(world.scene_tree))
+
+    blockers: list[str] = []
+    if robot is None:
+        blockers.append("Select and import a robot embodiment.")
+    else:
+        blockers.extend((robot.get("readiness") or {}).get("blockers") or [])
+    blockers.extend((vla.get("robotWorldContract") or {}).get("blockers") or [])
+    if not rows:
+        blockers.append("The active world has no generated assets.")
+    if rows:
+        blockers.append("World assets are visual-only: measured colliders, mass, friction, and movable/articulated bodies are not compiled.")
+
+    context = {
+        "instruction": payload.instruction,
+        "world": world.name,
+        "objects": [{"id": row["asset_id"], "name": row["asset_name"], "positionM": row["translation"], "physicalStatus": "visual_only"} for row in rows],
+        "robot": {key: robot.get(key) for key in ("id", "name", "format", "joints", "cameraMappings", "policyAdapter")} if robot else None,
+        "checkpoint": vla.get("checkpoint"),
+        "executionBlockers": blockers,
+    }
+    system = """You plan robot manipulation against the supplied verified scene manifest. Return JSON with keys summary, steps, referencedObjectIds, assumptions. Steps must be short strings. Never claim execution, collision safety, graspability, or success. Use only supplied object IDs. If prerequisites are blocked, produce a diagnostic plan that ends before motor commands."""
+    planned, provenance = await llm.plan(system, json.dumps(context), span_name="world command plan")
+    if not planned:
+        planned = {
+            "summary": f"Plan '{payload.instruction}' after the embodiment and physics gates pass.",
+            "steps": ["Resolve every readiness blocker", "Render the mapped policy cameras", "Validate target and destination IDs", "Run a bounded dry-run evaluation", "Permit motor actions only after the safety checks pass"],
+            "referencedObjectIds": [], "assumptions": [],
+        }
+    result = {
+        "instruction": payload.instruction, "mode": payload.mode, "plan": planned,
+        "plannerProvenance": provenance, "executionAllowed": not blockers, "blockers": list(dict.fromkeys(blockers)),
+        "robotId": payload.robotId, "worldId": world.id,
+    }
+    events.publish("agent", "World command planned", f"{payload.instruction[:100]} · {'blocked' if blockers else 'ready'}", world=world.id)
+    if payload.mode == "execute" and blockers:
+        raise HTTPException(409, detail=result)
+    if payload.mode == "execute":
+        raise HTTPException(501, detail={**result, "blockers": ["A verified real-time robot policy transport is not implemented; RobotWorld will not simulate success."]})
+    return result
+
+
 @app.get("/api/models/status")
 async def model_status():
     """Report installed weights, executable readiness, and real build timings."""
     flat = await settings_store.get_flat()
     native_path = str(flat.get("models.trellisNativePath") or r"D:\TRELLIS.2-4B")
-    gguf_path = str(flat.get("models.trellisGgufPath") or r"D:\TRELLIS.2-4B-Quant-GGUF")
+    gguf_path = str(flat.get("models.trellisGgufPath") or r"D:\TRELLIS.2-4B-Q4-GGUF")
+    cpp_path = str(flat.get("models.trellisCppPath") or r"D:\trellis.cpp-v0.6.0-cuda12")
     async with SessionLocal() as session:
         assets = (await session.execute(select(Asset).order_by(Asset.created_at.desc()))).scalars().all()
         stages = (await session.execute(select(CompileStage).order_by(CompileStage.asset_id, CompileStage.idx))).scalars().all()
@@ -1173,19 +1493,23 @@ async def model_status():
         history.append({
             "assetId": asset.id,
             "name": asset.name,
-            "runtime": "native",
+            "runtime": str(geometry.get("runtime") or "unknown"),
             "resolution": int(geometry.get("resolution") or 1024),
             "generationSeconds": round(generation.duration_s, 3) if generation else None,
             "totalSeconds": round(sum(row.duration_s for row in rows), 3),
             "status": "failed" if any(row.status == "failed" for row in rows) else "completed",
         })
+    runtimes = await asyncio.to_thread(model_registry.inspect_trellis, native_path, gguf_path, cpp_path, r"D:\DINOv3")
+    runtime_names = {row["runtime"] for row in history if row["status"] == "completed"}
+    comparable = {"native", "gguf"}.issubset(runtime_names)
     return {
         "vlaJepa": await asyncio.to_thread(local_vla.inspect_checkpoint),
-        "trellis": await asyncio.to_thread(model_registry.inspect_trellis, native_path, gguf_path),
+        "trellis": runtimes,
         "hardware": await asyncio.to_thread(performance.snapshot),
         "generationHistory": history[:30],
-        "benchmarkComparable": False,
-        "benchmarkBlocker": "The installed GGUF set is F16 and has no local trellis.cpp executable, so a native-versus-quantized benchmark would be mislabeled.",
+        "benchmarkComparable": comparable,
+        "benchmarkRunnable": all(row.get("available") and row.get("status", "").startswith("ready") for row in runtimes),
+        "benchmarkBlocker": None if comparable else "Q4 and native need matched successful runs using the same source image, resolution, seed, matte, and warm/cold state.",
     }
 
 
@@ -1542,6 +1866,51 @@ async def observability_logs(level: str | None = Query(default=None)):
             stmt = select(LogLine).where(LogLine.level == level.upper()).order_by(LogLine.time_ms.desc()).limit(500)
         rows = (await session.execute(stmt)).scalars().all()
     return [{"time": datetime.fromtimestamp(row.time_ms / 1000).strftime("%H:%M:%S.%f")[:-3], "level": row.level, "service": row.service, "message": row.message} for row in rows]
+
+
+@app.post("/api/diagnostics/frontend-errors", status_code=202)
+async def record_frontend_error(payload: FrontendErrorIn):
+    """Persist sanitized renderer failures without trusting browser log text."""
+    secret_pattern = re.compile(r"(sk-(?:proj-)?[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._-]{12,})", re.IGNORECASE)
+    clean = lambda value, limit: secret_pattern.sub("[redacted]", value)[:limit]
+    detail = {
+        "message": clean(payload.message, 2000),
+        "route": clean(payload.route, 500),
+        "stack": clean(payload.stack, 12000),
+        "componentStack": clean(payload.componentStack, 8000),
+        "userAgent": clean(payload.userAgent, 500),
+    }
+    async with SessionLocal() as session:
+        session.add(LogLine(
+            time_ms=time.time() * 1000,
+            level="ERROR",
+            service=f"frontend.{payload.source}",
+            message=json.dumps(detail, separators=(",", ":")),
+        ))
+        await session.commit()
+    return {"recorded": True}
+
+
+@app.get("/api/diagnostics/runtime")
+async def runtime_diagnostics():
+    """Real recent failures for the in-editor Diagnostics shelf."""
+    async with SessionLocal() as session:
+        rows = (await session.execute(
+            select(LogLine)
+            .where(LogLine.level.in_(["ERROR", "WARN"]))
+            .order_by(LogLine.time_ms.desc())
+            .limit(100)
+        )).scalars().all()
+    return {
+        "status": "degraded" if any(row.level == "ERROR" for row in rows[:10]) else "healthy",
+        "uptimeSeconds": round(time.monotonic() - STARTED_AT, 1),
+        "events": [{
+            "time": datetime.fromtimestamp(row.time_ms / 1000).strftime("%H:%M:%S.%f")[:-3],
+            "level": row.level,
+            "service": row.service,
+            "message": row.message,
+        } for row in rows],
+    }
 
 
 @app.get("/api/observability/alerts")

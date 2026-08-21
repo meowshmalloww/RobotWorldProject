@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { reportFrontendDiagnostic } from "../lib/runtimeDiagnostics";
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -30,6 +31,12 @@ export class AppErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundar
       error,
       stack: errorInfo.componentStack ? `${error.stack ?? ""}\n${errorInfo.componentStack}` : error.stack ?? null,
     });
+    reportFrontendDiagnostic({
+      source: "react",
+      message: error.message,
+      stack: error.stack,
+      componentStack: errorInfo.componentStack ?? undefined,
+    });
   }
 
   recover = () => {
@@ -45,8 +52,9 @@ export class AppErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundar
       if (this.props.fallback) return this.props.fallback;
       return (
         <div style={{
-          width: "100vw",
-          height: "100vh",
+          width: "100%",
+          height: "100%",
+          minHeight: 0,
           display: "grid",
           placeItems: "center",
           background: "#101113",

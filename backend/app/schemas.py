@@ -133,9 +133,13 @@ class Asset(BaseModel):
 
 class SceneNode(BaseModel):
     id: str
+    assetId: str | None = None
     name: str
     icon: str
     visible: bool | None = None
+    translation: list[float] | None = None
+    rotationZDeg: float | None = None
+    anchor: dict | None = None
     locked: bool | None = None
     tag: str | None = None
     children: list["SceneNode"] = []

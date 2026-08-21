@@ -42,6 +42,7 @@ export default function Training() {
   const toast = useToast();
   const { data, error, loading, refetch } = useApi<TrainingData>("/training");
   const { data: localVla, error: localVlaError, loading: localVlaLoading } = useApi<LocalVlaStatus>("/models/vla-jepa/status");
+  const { data: robotData } = useApi<{ robots: { id: string; name: string; readiness: { executable: boolean; blockers: string[] } }[] }>("/robots");
   // needed for the "run the agent" button when there is no decision yet
   const { data: skillsData } = useApi<{ skills: Skill[] }>("/skills");
   const [runningAgent, setRunningAgent] = useState(false);
@@ -108,6 +109,20 @@ export default function Training() {
             )}
           </div>
         ) : null}
+      </Card>
+
+      <Card title="Embodiment learning loop" right={<StatusBadge status={robotData?.robots.some((robot) => robot.readiness.executable) && localVla?.robotWorldContract?.compatible ? "ready" : "blocked"} />} style={{ marginBottom: 10 }}>
+        <div className="row" style={{ alignItems: "stretch", gap: 6, flexWrap: "wrap" }}>
+          {[
+            ["1", "Import robot", robotData?.robots.length ? `${robotData.robots.length} inspected` : "URDF / MJCF / OpenUSD required"],
+            ["2", "Map observations", "two checkpoint camera keys + robot state"],
+            ["3", "Collect demonstrations", "LeRobot dataset; no synthetic success labels"],
+            ["4", "Fine-tune adapters", "reinitialize camera/state/action projections"],
+            ["5", "Evaluate in physics", "measured collisions and task predicates"],
+            ["6", "Promote or repair", "only measured runs feed the next cycle"],
+          ].map(([n, title, detail]) => <div className="card grow" style={{ minWidth: 155, padding: 9, background: "var(--bg-panel-2)" }} key={n}><span className="micro t3 mono">STEP {n}</span><div className="small" style={{ fontWeight: 650 }}>{title}</div><div className="micro t3">{detail}</div></div>)}
+        </div>
+        <div className="callout callout-warn" style={{ margin: "9px 0 0" }}><Icon name="lock" size={13} /><span><b>No training job will start yet.</b> The DROID VLA-JEPA checkpoint has a 7-D action / 8-D state contract and two exterior cameras; an arbitrary uploaded robot requires robot-specific data and fine-tuning.</span></div>
       </Card>
 
       <div className="tr-stats">

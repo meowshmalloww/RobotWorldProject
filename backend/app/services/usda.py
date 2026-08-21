@@ -335,7 +335,7 @@ def write_world_assembly(
     explicitly visual-only until measured scale/colliders are available.
     """
     try:
-        from pxr import Sdf, Usd, UsdGeom  # type: ignore
+        from pxr import Sdf, Usd, UsdGeom, UsdPhysics  # type: ignore
     except ImportError as exc:
         raise RuntimeError("OpenUSD world authoring unavailable: install usd-core") from exc
 
@@ -361,6 +361,7 @@ def write_world_assembly(
         # composition valid if the compiler changes its internal root name.
         placed.GetPrim().GetReferences().AddReference(relative_layer)
         placed.GetPrim().CreateAttribute("robotworld:assetId", Sdf.ValueTypeNames.String).Set(asset_id)
+        placed.GetPrim().CreateAttribute("robotworld:assetKind", Sdf.ValueTypeNames.Token).Set(str(item.get("asset_kind", "rigid")))
         placed.GetPrim().CreateAttribute("robotworld:physicalStatus", Sdf.ValueTypeNames.String).Set(
             "visual_only_pending_measurement"
         )
@@ -373,11 +374,34 @@ def write_world_assembly(
         placed.GetPrim().CreateAttribute("robotworld:anchorMode", Sdf.ValueTypeNames.String).Set(
             str(item.get("anchor", {}).get("mode", "unanchored"))
         )
+        mobility = str(item.get("mobility", "fixed"))
+        placed.GetPrim().CreateAttribute("robotworld:mobility", Sdf.ValueTypeNames.Token).Set(mobility)
+        placed.GetPrim().CreateAttribute("robotworld:massSource", Sdf.ValueTypeNames.String).Set(
+            str(item.get("mass_source", "unknown"))
+        )
+        placed.GetPrim().CreateAttribute("robotworld:physicalStatus", Sdf.ValueTypeNames.String).Set(
+            "usd_physics_authored_pending_isaac_validation"
+        )
         translation = tuple(float(v) for v in item.get("translation", (index * 1.5, 0.0, 0.0)))
         scale = tuple(max(0.001, float(v)) for v in item.get("scale", (1.0, 1.0, 1.0)))
         xformable = UsdGeom.Xformable(placed)
         xformable.AddTranslateOp().Set(translation)
+        xformable.AddRotateZOp().Set(float(item.get("rotation_z_deg", 0.0)))
         xformable.AddScaleOp().Set(scale)
+        # The generated visual mesh is the collision source. Dynamic meshes use
+        # a convex hull because PhysX does not permit triangle-mesh collision on
+        # moving rigid bodies. Fixed fixtures remain static triangle meshes.
+        mesh_prim = stage.GetPrimAtPath(f"/RobotWorld/Assets/{prim_name}/Visual/Mesh")
+        if mesh_prim and mesh_prim.IsValid() and str(item.get("asset_kind", "rigid")) != "articulated":
+            UsdPhysics.CollisionAPI.Apply(mesh_prim)
+            UsdPhysics.MeshCollisionAPI.Apply(mesh_prim).CreateApproximationAttr().Set(
+                "convexHull" if mobility == "movable" else "none"
+            )
+            if mobility == "movable":
+                UsdPhysics.RigidBodyAPI.Apply(placed.GetPrim())
+                UsdPhysics.MassAPI.Apply(placed.GetPrim()).CreateMassAttr().Set(
+                    max(0.001, float(item.get("mass_kg", 1.0)))
+                )
         authored.append(f"/RobotWorld/Assets/{prim_name}")
 
     stage.Save()
@@ -388,4 +412,8 @@ def write_world_assembly(
         prim = reopened.GetPrimAtPath(prim_path)
         if not prim or not prim.GetChildren():
             raise RuntimeError(f"OpenUSD world validation failed: reference is unresolved at {prim_path}")
+        mesh = reopened.GetPrimAtPath(f"{prim_path}/Visual/Mesh")
+        if mesh and mesh.IsValid() and prim.GetAttribute("robotworld:assetKind").Get() != "articulated":
+            if not mesh.HasAPI(UsdPhysics.CollisionAPI):
+                raise RuntimeError(f"OpenUSD world validation failed: collision API missing at {mesh.GetPath()}")
     return out_path, len(authored)

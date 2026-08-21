@@ -24,9 +24,10 @@ ASSETS_DIR = DATA_DIR / "assets"
 DEMOS_DIR = DATA_DIR / "demos"
 MODELS_DIR = DATA_DIR / "models"
 WORLDS_DIR = DATA_DIR / "worlds"
+ROBOTS_DIR = DATA_DIR / "robots"
 DB_PATH = DATA_DIR / "robotworld.db"
 
-for _d in (DATA_DIR, ASSETS_DIR, DEMOS_DIR, MODELS_DIR, WORLDS_DIR):
+for _d in (DATA_DIR, ASSETS_DIR, DEMOS_DIR, MODELS_DIR, WORLDS_DIR, ROBOTS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
@@ -50,6 +51,8 @@ class EnvSettings(BaseSettings):
     policy_environment_sha256: str | None = None
     trellis_endpoint: str | None = None
     trellis_api_key: str | None = None
+    isaac_sim_root: str | None = None
+    isaacsim_asset_root: str | None = None
 
     brightdata_api_key: str | None = None
     brightdata_account_id: str | None = None
@@ -120,6 +123,9 @@ DEFAULT_SETTINGS: dict = {
         "gravity": -9.81,
         "timestepHz": 500,
         "renderer": "mujoco-offscreen",
+        "isaacRoot": env.isaac_sim_root or "",
+        "isaacAssetRoot": env.isaacsim_asset_root or "",
+        "isaacVersion": "6.0",
     },
     "models": {
         "planner": env.openai_model,
@@ -145,13 +151,16 @@ DEFAULT_SETTINGS: dict = {
         "policyInstruction": "Open the refrigerator door.",
         "policyTimeoutS": 10,
         "policyExecutionHorizon": 8,
-        "trellisEndpoint": env.trellis_endpoint or "",
+        "trellisEndpoint": env.trellis_endpoint or "http://127.0.0.1:8188",
         "trellisApiKey": env.trellis_api_key or "",
         "trellisModel": "microsoft/TRELLIS.2-4B",
         "trellisRuntime": "native",
         "trellisResolution": 1024,
+        "trellisSeed": 1048576,
+        "trellisBackgroundRemoval": True,
         "trellisNativePath": r"D:\TRELLIS.2-4B",
-        "trellisGgufPath": r"D:\TRELLIS.2-4B-Quant-GGUF",
+        "trellisGgufPath": r"D:\TRELLIS.2-4B-Q4-GGUF\q4",
+        "trellisCppPath": r"D:\trellis.cpp-v0.6.0-cuda12",
         "trellisTimeoutS": 300,
         "openaiKey": env.openai_api_key or "",
         "openaiBaseUrl": env.openai_base_url or "https://api.openai.com/v1",

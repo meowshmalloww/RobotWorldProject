@@ -27,7 +27,7 @@ export interface SettingsData {
     brightdata: { enabled: boolean; accountId: string; serpZone: string; unlockerZone: string; apiKey: string };
     signoz: { enabled: boolean; mode: string; endpoint: string; queryEndpoint: string; ingestionKey: string; apiKey: string; region: string };
   };
-  simulation: { engine: string; gravity: number; timestepHz: number; renderer: string };
+  simulation: { engine: string; gravity: number; timestepHz: number; renderer: string; isaacRoot: string; isaacAssetRoot: string; isaacVersion: string };
   models: {
     planner: string; vlm: string; assetAnalysisModel: string; reasoningEffort: string; verbosity: string;
     policy: string; openaiKey: string; openaiBaseUrl: string; provider: string; timeoutS: number;
@@ -36,7 +36,7 @@ export interface SettingsData {
     policyModelRevision: string; policyModelSha256: string; policyNormalizationSha256: string; policyEnvironmentSha256: string;
     policyTimeoutS: number; policyExecutionHorizon: number;
     trellisEndpoint: string; trellisApiKey: string; trellisModel: string; trellisTimeoutS: number;
-    trellisRuntime: string; trellisResolution: number; trellisNativePath: string; trellisGgufPath: string;
+    trellisRuntime: string; trellisResolution: number; trellisSeed: number; trellisBackgroundRemoval: boolean; trellisNativePath: string; trellisGgufPath: string; trellisCppPath: string;
   };
 }
 
@@ -283,10 +283,11 @@ export function IntegrationsPane({ draft, onChange }: { draft: SettingsData["int
 
 interface ModelStatusData {
   vlaJepa: { available: boolean; robotWorldContract?: { compatible: boolean; blockers: string[] } };
-  trellis: Array<{ id: string; label: string; path: string; precision: string; weightsBytes: number; status: string; blockers?: string[] }>;
+  trellis: Array<{ id: string; label: string; path: string; precision: string; weightsBytes: number; status: string; blockers?: string[]; conditioningPath?: string; conditioningReady?: boolean }>;
   generationHistory: Array<{ assetId: string; name: string; runtime: string; resolution: number; totalSeconds: number }>;
   benchmarkComparable: boolean;
-  benchmarkBlocker: string;
+  benchmarkRunnable: boolean;
+  benchmarkBlocker: string | null;
 }
 
 export function ModelsPane({ draft, onChange }: { draft: SettingsData["models"]; onChange: (p: Partial<SettingsData["models"]>) => void }) {
@@ -355,10 +356,13 @@ export function ModelsPane({ draft, onChange }: { draft: SettingsData["models"];
       <div className="st-grid">
         <FormRow label="Runtime"><select className="select" value={draft.trellisRuntime} onChange={(e) => setModel({ trellisRuntime: e.target.value })}><option value="native">Microsoft native BF16/FP16</option><option value="gguf">GGUF / trellis.cpp</option></select></FormRow>
         <FormRow label="Resolution"><select className="select" value={draft.trellisResolution} onChange={(e) => setModel({ trellisResolution: Number(e.target.value) })}><option value={512}>512 - preview</option><option value={1024}>1024 - balanced</option><option value={1536}>1536 - maximum</option></select></FormRow>
+        <FormRow label="Seed"><input className="input mono" type="number" min={0} max={2147483647} value={draft.trellisSeed} onChange={(e) => setModel({ trellisSeed: Math.max(0, Number(e.target.value) || 0) })} /></FormRow>
+        <FormRow label="Foreground matte"><select className="select" value={draft.trellisBackgroundRemoval ? "on" : "off"} onChange={(e) => setModel({ trellisBackgroundRemoval: e.target.value === "on" })}><option value="on">BiRefNet/U2-Net enabled</option><option value="off">Use source alpha</option></select></FormRow>
         <FormRow label="Gateway endpoint"><input className="input mono" value={draft.trellisEndpoint} onChange={(e) => setModel({ trellisEndpoint: e.target.value })} /></FormRow>
         <FormRow label="Model"><input className="input mono" value={draft.trellisModel} onChange={(e) => setModel({ trellisModel: e.target.value })} /></FormRow>
         <FormRow label="Native weights"><input className="input mono" value={draft.trellisNativePath} onChange={(e) => setModel({ trellisNativePath: e.target.value })} /></FormRow>
-        <FormRow label="GGUF weights"><input className="input mono" value={draft.trellisGgufPath} onChange={(e) => setModel({ trellisGgufPath: e.target.value })} /></FormRow>
+        <FormRow label="Q4 GGUF bundle"><input className="input mono" value={draft.trellisGgufPath} onChange={(e) => setModel({ trellisGgufPath: e.target.value })} /></FormRow>
+        <FormRow label="trellis.cpp v0.6 runtime"><input className="input mono" value={draft.trellisCppPath} onChange={(e) => setModel({ trellisCppPath: e.target.value })} /></FormRow>
         <FormRow label="Timeout (s)"><input className="input mono" type="number" value={draft.trellisTimeoutS} onChange={(e) => setModel({ trellisTimeoutS: Number(e.target.value) || 0 })} /></FormRow>
       </div>
       <p className="small t2" style={{ marginTop: 10 }}>Official modes are 512, 1024, and 1536. The requested 500/1584 choices map to supported 512/1536 modes.</p>
@@ -367,8 +371,8 @@ export function ModelsPane({ draft, onChange }: { draft: SettingsData["models"];
 
     <Card title="Installed runtimes" right={<button className="btn btn-ghost btn-sm" onClick={refetchStatus}><Icon name="refresh" size={12} /> Rescan</button>}>
       {statusError && <span className="small" style={{ color: "var(--red)" }}>{statusError.message}</span>}
-      {status?.trellis.map((runtime) => <div className="st-runtime" key={runtime.id}><div><b>{runtime.label}</b><span className="mono micro t3">{runtime.path}</span></div><span className="mono small">{runtime.precision} - {(runtime.weightsBytes / 1024 ** 3).toFixed(1)} GB</span><Badge tone={runtime.status.startsWith("ready") ? "teal" : "amber"}>{runtime.status.replaceAll("_", " ")}</Badge>{runtime.blockers?.map((value) => <span className="micro t3 st-runtime-note" key={value}>{value}</span>)}</div>)}
-      {status && !status.benchmarkComparable && <div className="st-blocker"><b>Quantized comparison not runnable</b><span>{status.benchmarkBlocker}</span><span>The native rows below are measured compile timings; no quantized number is fabricated.</span></div>}
+      {status?.trellis.map((runtime) => <div className="st-runtime" key={runtime.id}><div><b>{runtime.label}</b><span className="mono micro t3">{runtime.path}</span>{runtime.conditioningPath && <span className="mono micro t3">DINOv3: {runtime.conditioningPath}</span>}</div><span className="mono small">{runtime.precision} - {(runtime.weightsBytes / 1024 ** 3).toFixed(1)} GB</span><Badge tone={runtime.status.startsWith("ready") ? "teal" : "amber"}>{runtime.status.replaceAll("_", " ")}</Badge>{runtime.blockers?.map((value) => <span className="micro t3 st-runtime-note" key={value}>{value}</span>)}</div>)}
+      {status && draft.trellisRuntime === "gguf" && !status.benchmarkComparable && <div className="st-blocker"><b>{status.benchmarkRunnable ? "Matched benchmark not run yet" : "Quantized comparison not runnable"}</b><span>{status.benchmarkBlocker}</span><span>No quantized timing or quality score is fabricated.</span></div>}
       {status?.generationHistory.length ? <div className="table-scroll" style={{ marginTop: 10 }}><table className="table"><thead><tr><th>Asset</th><th>Runtime</th><th>Resolution</th><th style={{ textAlign: "right" }}>Total</th></tr></thead><tbody>{status.generationHistory.slice(0, 8).map((row) => <tr key={row.assetId}><td>{row.name}</td><td className="mono">{row.runtime}</td><td className="mono">{row.resolution}</td><td className="mono" style={{ textAlign: "right" }}>{row.totalSeconds.toFixed(1)} s</td></tr>)}</tbody></table></div> : null}
     </Card>
     <Card><SaveSection section="models" draft={draft} /></Card>
@@ -441,6 +445,7 @@ function LegacyModelsPane({ draft, onChange }: { draft: SettingsData["models"]; 
 void LegacyModelsPane;
 
 function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]; onChange: (p: Partial<SettingsData["simulation"]>) => void }) {
+  const { data: isaac, error: isaacError, refetch } = useApi<{ ready: boolean; installed: boolean; version: string; root: string; frankaAsset: string; blockers: string[] }>("/simulation/isaac");
   return (
     <div className="st-stack">
       <Card title="Engine">
@@ -455,6 +460,20 @@ function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]
           </FormRow>
         </div>
         <SaveSection section="simulation" draft={draft} />
+      </Card>
+      <Card title="NVIDIA Isaac Sim + Franka Panda" right={<Badge tone={isaac?.ready ? "teal" : "amber"}>{isaac?.ready ? "Ready" : "Setup required"}</Badge>}>
+        <div className="st-grid">
+          <FormRow label="Target version"><input className="input mono" value={draft.isaacVersion} readOnly /></FormRow>
+          <FormRow label="Isaac Sim root"><input className="input mono" value={draft.isaacRoot} onChange={(e) => onChange({ isaacRoot: e.target.value })} placeholder="C:\\isaacsim" /></FormRow>
+          <FormRow label="Asset root"><input className="input mono" value={draft.isaacAssetRoot} onChange={(e) => onChange({ isaacAssetRoot: e.target.value })} placeholder="Optional; Isaac 6.0 default asset server" /></FormRow>
+          <FormRow label="Franka asset"><span className="mono small">{isaac?.frankaAsset ?? "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"}</span></FormRow>
+        </div>
+        <div className="col" style={{ gap: 4, marginTop: 10 }}>
+          {isaacError && <span className="small g-red">{isaacError.message}</span>}
+          {isaac?.blockers.map((value) => <span className="micro t3" key={value}>BLOCK · {value}</span>)}
+          <div className="row"><button className="btn btn-secondary btn-sm" onClick={refetch}><Icon name="refresh" size={11} /> Recheck runtime</button><span className="micro t3">Physics runs in Isaac Sim; the web viewport remains the editor renderer.</span></div>
+        </div>
+        <SaveSection section="simulation" draft={draft} extra={refetch} />
       </Card>
     </div>
   );

@@ -7,6 +7,7 @@ export interface TreeNodeData {
   icon?: IconName;
   tag?: string;
   locked?: boolean;
+  visible?: boolean;
   defaultHidden?: boolean;
   children?: TreeNodeData[];
 }
@@ -15,29 +16,31 @@ export function Tree({
   nodes,
   selected,
   onSelect,
+  onVisibilityChange,
   depth = 0,
 }: {
   nodes: TreeNodeData[];
   selected?: string | null;
   onSelect?: (id: string, name: string) => void;
+  onVisibilityChange?: (id: string, visible: boolean) => void;
   depth?: number;
 }) {
   return (
     <div className="tree" role={depth === 0 ? "tree" : "group"}>
       {nodes.map((n) => (
-        <TreeRow key={n.id} node={n} depth={depth} selected={selected} onSelect={onSelect} />
+        <TreeRow key={n.id} node={n} depth={depth} selected={selected} onSelect={onSelect} onVisibilityChange={onVisibilityChange} />
       ))}
     </div>
   );
 }
 
 function TreeRow({
-  node, depth, selected, onSelect,
+  node, depth, selected, onSelect, onVisibilityChange,
 }: {
-  node: TreeNodeData; depth: number; selected?: string | null; onSelect?: (id: string, name: string) => void;
+  node: TreeNodeData; depth: number; selected?: string | null; onSelect?: (id: string, name: string) => void; onVisibilityChange?: (id: string, visible: boolean) => void;
 }) {
   const [open, setOpen] = useState(true);
-  const [visible, setVisible] = useState(!node.defaultHidden);
+  const [visible, setVisible] = useState(node.defaultHidden ? false : node.visible !== false);
   const hasKids = !!node.children?.length;
   return (
     <>
@@ -60,14 +63,14 @@ function TreeRow({
         {node.locked && <Icon name="lock" size={11} style={{ color: "var(--text-3)", flex: "none" }} />}
         <span
           className={`t-vis ${visible ? "" : "off"}`}
-          onClick={(e) => { e.stopPropagation(); setVisible(!visible); }}
+          onClick={(e) => { e.stopPropagation(); const next = !visible; setVisible(next); onVisibilityChange?.(node.id, next); }}
           title={visible ? "Hide" : "Show"}
         >
           <Icon name={visible ? "eye" : "eyeOff"} size={12} />
         </span>
       </div>
       {hasKids && open && (
-        <Tree nodes={node.children!} depth={depth + 1} selected={selected} onSelect={onSelect} />
+        <Tree nodes={node.children!} depth={depth + 1} selected={selected} onSelect={onSelect} onVisibilityChange={onVisibilityChange} />
       )}
     </>
   );

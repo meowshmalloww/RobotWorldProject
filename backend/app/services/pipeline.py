@@ -411,6 +411,19 @@ async def build_asset(
         "properties": {k: ({"value": v[0], "source": v[1], "confidence": v[2]} if isinstance(v, tuple) else v) for k, v in spec_triples.items()},
         "provenance": provenance,
         "photos": photos,
+        "collectionTrace": {
+            "provider": "Bright Data SERP API / Web Unlocker" if provenance or photos else "manual or local reference",
+            "inputQuery": query,
+            "requests": [
+                {"tool": "SERP API", "query": f"{query} specifications dimensions", "purpose": "manufacturer dimensions and model identity"},
+                *([{"tool": "SERP Images", "query": f"{query} product photo", "purpose": "TRELLIS.2 conditioning candidates"}] if image_count else []),
+            ],
+            "results": [
+                *[{"type": "page evidence", "value": value} for value in provenance[:10]],
+                *[{"type": "image candidate", "value": item.get("url", ""), "title": item.get("title", ""), "domain": item.get("sourceDomain", ""), "state": item.get("state", "candidate")} for item in photos[:10]],
+            ],
+            "resultCount": len(provenance) + len(photos),
+        },
         "geometry": {"generator": generator, "status": "source_acquired" if photos or generator == "parametric" else "source_image_missing"},
         "openusdValidated": False,
     }

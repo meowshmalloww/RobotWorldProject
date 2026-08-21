@@ -244,6 +244,7 @@ async def asset_out(session: AsyncSession, a: Asset) -> dict:
         "source": a.source,
         "sourceImage": spec_payload.get("sourceImage"),
         "sourcePhotos": spec_payload.get("photos", []),
+        "collectionTrace": spec_payload.get("collectionTrace"),
         "parts": a.parts,
         "artifacts": [
             {"type": ar.type, "file": ar.file, "size": fmt_size(ar.size_bytes), "generated": rel_time(ar.created_at)}
@@ -266,6 +267,7 @@ def _asset_spec_payload(asset_id: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
     photos = payload.get("photos")
+    photo_rows = photos if isinstance(photos, list) else []
     source_image = None
     if isinstance(photos, list):
         for item in photos:
@@ -275,9 +277,23 @@ def _asset_spec_payload(asset_id: str) -> dict[str, Any]:
             if isinstance(value, str) and value:
                 source_image = value
                 break
+    trace = payload.get("collectionTrace") if isinstance(payload.get("collectionTrace"), dict) else None
+    if trace is None:
+        provenance = payload.get("provenance") if isinstance(payload.get("provenance"), list) else []
+        trace = {
+            "provider": "Bright Data / persisted legacy evidence",
+            "inputQuery": "not recorded by legacy build",
+            "requests": [],
+            "results": [
+                *[{"type": "page evidence", "value": str(value)} for value in provenance[:10]],
+                *[{"type": "image candidate", "value": str(item.get("url", "")), "title": str(item.get("title", "")), "domain": str(item.get("sourceDomain", "")), "state": str(item.get("state", "candidate"))} for item in photo_rows[:10] if isinstance(item, dict)],
+            ],
+            "resultCount": len(provenance) + len(photo_rows),
+        }
     return {
-        "photos": photos if isinstance(photos, list) else [],
+        "photos": photo_rows,
         "sourceImage": source_image,
+        "collectionTrace": trace,
     }
 
 

@@ -153,6 +153,7 @@ def capabilities() -> dict:
     return {
         "schemaVersion": "robotworld.trellis2.v1",
         "model": MODEL_ID,
+        "runtime": "native",
         "defaultPipelineType": PIPELINE_TYPES[1024],
         "supportedResolutions": sorted(PIPELINE_TYPES),
         "precision": "native-bf16-fp16",
@@ -178,6 +179,8 @@ async def image_to_3d(
     model: Annotated[str, Form(...)],
     runtime: Annotated[str, Form()] = "native",
     resolution: Annotated[int, Form()] = 1024,
+    seed: Annotated[int, Form()] = 1048576,
+    background_removal: Annotated[bool, Form()] = True,
 ) -> Response:
     if schema_version != "robotworld.trellis2.v1" or model != MODEL_ID or runtime != "native":
         raise HTTPException(422, "Unsupported RobotWorld TRELLIS.2 request contract.")
@@ -204,12 +207,13 @@ async def image_to_3d(
         mesh = None
         glb = None
         try:
-            source = await asyncio.to_thread(_prepare_alpha_source, raw)
+            source = await asyncio.to_thread(_prepare_alpha_source, raw) if background_removal else source.convert("RGBA")
             pipeline = await asyncio.to_thread(_get_pipeline)
             outputs, (_, _, resolution) = await asyncio.to_thread(
                 pipeline.run,
                 source,
                 pipeline_type=pipeline_type,
+                seed=seed,
                 return_latent=True,
             )
             mesh = outputs[0]

@@ -31,7 +31,10 @@ _local_gateway_process: asyncio.subprocess.Process | None = None
 
 async def _settings() -> dict[str, Any]:
     flat = await settings_store.get_flat()
+    runtime_name = str(flat.get("models.trellisRuntime") or "native")
     endpoint = str(flat.get("models.trellisEndpoint") or "").strip().rstrip("/")
+    if runtime_name == "gguf" and endpoint in {"", "http://127.0.0.1:8188", "http://localhost:8188"}:
+        endpoint = "http://127.0.0.1:8189"
     if not endpoint:
         raise TrellisError("TRELLIS.2 gateway is not configured in Settings -> Models.")
     if not endpoint.startswith(("http://", "https://")):
@@ -40,8 +43,12 @@ async def _settings() -> dict[str, Any]:
         "endpoint": endpoint,
         "key": str(flat.get("models.trellisApiKey") or ""),
         "model": str(flat.get("models.trellisModel") or "microsoft/TRELLIS.2-4B"),
-        "runtime": str(flat.get("models.trellisRuntime") or "native"),
+        "runtime": runtime_name,
         "resolution": int(flat.get("models.trellisResolution") or 1024),
+        "seed": max(0, min(int(flat.get("models.trellisSeed") or 1048576), 2**31 - 1)),
+        "background_removal": bool(flat.get("models.trellisBackgroundRemoval", True)),
+        "gguf_path": str(flat.get("models.trellisGgufPath") or r"D:\TRELLIS.2-4B-Q4-GGUF\q4"),
+        "cpp_path": str(flat.get("models.trellisCppPath") or r"D:\trellis.cpp-v0.6.0-cuda12"),
         # Queue wait is included in the HTTP read timeout. A four-object
         # single-flight batch on a 12 GiB laptop GPU can legitimately exceed
         # 30 minutes even though each individual generation is healthy.
@@ -88,14 +95,16 @@ async def _download_image(url: str, *, max_bytes: int = 20 * 1024 * 1024) -> tup
 async def _read_capabilities(cfg: dict[str, Any]) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {cfg['key']}"} if cfg["key"] else {}
     async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.get(f"{cfg['endpoint']}/v1/capabilities", headers=headers)
+        response = await client.get(f"{cfg['endpoint']}/health" if cfg["runtime"] == "gguf" else f"{cfg['endpoint']}/v1/capabilities", headers=headers)
     if response.status_code >= 400:
         raise TrellisError(f"TRELLIS.2 gateway returned HTTP {response.status_code}.")
+    if cfg["runtime"] == "gguf":
+        if response.text.strip().lower() != "ok":
+            raise TrellisError("trellis.cpp health response was not 'ok'.")
+        return {"schemaVersion": "trellis.cpp.v0.6", "model": cfg["model"], "runtime": "gguf", "precision": "Q4", "supportedResolutions": [512, 1024, 1536], "output": "glb", "conditioningPath": cfg["gguf_path"]}
     data = response.json()
     if data.get("schemaVersion") != "robotworld.trellis2.v1" or data.get("model") != cfg["model"]:
         raise TrellisError("TRELLIS.2 gateway capability/model mismatch.")
-    if cfg["runtime"] != "native":
-        raise TrellisError("The selected GGUF installation has weights only; install/configure a trellis.cpp gateway before selecting it.")
     supported = data.get("supportedResolutions") or []
     if cfg["resolution"] not in supported:
         raise TrellisError(f"TRELLIS.2 gateway does not support {cfg['resolution']} resolution.")
@@ -104,16 +113,42 @@ async def _read_capabilities(cfg: dict[str, Any]) -> dict[str, Any]:
 
 async def _start_local_gateway(cfg: dict[str, Any]) -> bool:
     """Start the fixed local worker after its process-level idle shutdown."""
+    global _local_gateway_process
     parsed = urllib.parse.urlsplit(str(cfg["endpoint"]))
-    if parsed.hostname not in {"127.0.0.1", "localhost"} or (parsed.port or 80) != 8188:
+    expected_port = 8189 if cfg["runtime"] == "gguf" else 8188
+    if parsed.hostname not in {"127.0.0.1", "localhost"} or (parsed.port or 80) != expected_port:
         return False
+    if cfg["runtime"] == "gguf":
+        executable = Path(cfg["cpp_path"]).resolve() / "trellis-server.exe"
+        models = Path(cfg["gguf_path"]).resolve()
+        if not executable.is_file() or not models.is_dir():
+            return False
+        async with _local_start_lock:
+            try:
+                return bool(await _read_capabilities(cfg))
+            except (httpx.HTTPError, TrellisError):
+                pass
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            _local_gateway_process = await asyncio.create_subprocess_exec(
+                str(executable), "--host", "127.0.0.1", "--port", str(expected_port), "--models", str(models), "--require-gpu",
+                cwd=str(executable.parent), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, creationflags=creationflags,
+            )
+            for _ in range(180):
+                await asyncio.sleep(0.5)
+                if _local_gateway_process.returncode is not None:
+                    return False
+                try:
+                    await _read_capabilities(cfg)
+                    return True
+                except (httpx.HTTPError, TrellisError):
+                    continue
+            return False
     runtime = Path(os.environ.get("TRELLIS_RUNTIME_DIR", r"D:\TRELLIS.2-runtime"))
     executable = runtime / ".venv" / "Scripts" / "python.exe"
     gateway_dir = Path(__file__).resolve().parents[2]
     if not executable.is_file() or not (gateway_dir / "trellis_gateway.py").is_file():
         return False
 
-    global _local_gateway_process
     async with _local_start_lock:
         try:
             return bool(await _read_capabilities(cfg))
@@ -161,12 +196,17 @@ async def generate_glb(image_url: str, output: Path) -> tuple[list[dict[str, Any
         "model": cfg["model"],
         "runtime": cfg["runtime"],
         "resolution": str(cfg["resolution"]),
+        "seed": str(cfg["seed"]),
+        "background_removal": "true" if cfg["background_removal"] else "false",
     }
+    target = f"{cfg['endpoint']}/generate" if cfg["runtime"] == "gguf" else f"{cfg['endpoint']}/v1/image-to-3d"
+    if cfg["runtime"] == "gguf":
+        data = {"seed": str(cfg["seed"]), "resolution": str(cfg["resolution"]), "bg_removal": "birefnet" if cfg["background_removal"] else "threshold"}
     # Image-to-3D is expensive and not idempotent.  Do not automatically retry
     # an ambiguous timeout: the first generation may still be consuming GPU.
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(cfg["timeout"], connect=20.0)) as client:
-            response = await client.post(f"{cfg['endpoint']}/v1/image-to-3d", headers=headers, files=files, data=data)
+            response = await client.post(target, headers=headers, files=files, data=data)
     except httpx.TimeoutException as exc:
         raise TrellisError("TRELLIS.2 generation timed out; check the gateway job before retrying.") from exc
     if response.status_code >= 400:
@@ -184,5 +224,5 @@ async def generate_glb(image_url: str, output: Path) -> tuple[list[dict[str, Any
     except Exception as exc:
         output.unlink(missing_ok=True)
         raise TrellisError(f"Generated GLB failed trimesh validation: {exc}") from exc
-    parts = [{"id": "trellis_visual", "name": "TRELLIS.2 PBR visual mesh", "type": "visual", "source": cfg["model"], "runtime": cfg["runtime"], "resolution": cfg["resolution"]}]
+    parts = [{"id": "trellis_visual", "name": "TRELLIS.2 PBR visual mesh", "type": "visual", "source": cfg["model"], "runtime": cfg["runtime"], "resolution": cfg["resolution"], "seed": cfg["seed"]}]
     return parts, vertices

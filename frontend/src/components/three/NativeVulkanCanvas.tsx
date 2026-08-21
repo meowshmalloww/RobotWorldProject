@@ -9,15 +9,18 @@ export interface NativeVulkanCanvasProps {
   className?: string;
   style?: React.CSSProperties;
   onFrame?: (metrics: { fps: number; latencyMs: number }) => void;
+  interactionMode?: "orbit" | "translate" | "rotate";
+  onTranslateDelta?: (delta: [number, number, number]) => void;
+  onRotateDelta?: (degrees: number) => void;
 }
 
 /** Presents real backend Vulkan frames without an HTML image drag surface. */
-export function NativeVulkanCanvas({ assetId, framePath, label, className, style, onFrame }: NativeVulkanCanvasProps) {
+export function NativeVulkanCanvas({ assetId, framePath, label, className, style, onFrame, interactionMode = "orbit", onTranslateDelta, onRotateDelta }: NativeVulkanCanvasProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const mounted = useRef(true);
   const view = useRef<View>({ yaw: 34, pitch: 18, zoom: 1 });
-  const drag = useRef<{ pointerId: number; x: number; y: number; yaw: number; pitch: number } | null>(null);
+  const drag = useRef<{ pointerId: number; x: number; y: number; yaw: number; pitch: number; action: "orbit" | "translate" | "rotate" } | null>(null);
   const inFlight = useRef(false);
   const queued = useRef(false);
   const queuedHighQuality = useRef(false);
@@ -143,6 +146,11 @@ export function NativeVulkanCanvas({ assetId, framePath, label, className, style
     const active = drag.current;
     if (!active || active.pointerId !== event.pointerId) return;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    if (active.action === "translate") {
+      const metresPerPixel = 0.0025 / view.current.zoom;
+      onTranslateDelta?.([(event.clientX - active.x) * metresPerPixel, -(event.clientY - active.y) * metresPerPixel, 0]);
+    }
+    if (active.action === "rotate") onRotateDelta?.((event.clientX - active.x) * 0.45);
     drag.current = null;
     setDragging(false);
     queuePose(view.current, true);
@@ -158,18 +166,20 @@ export function NativeVulkanCanvas({ assetId, framePath, label, className, style
       onDragStart={(event) => event.preventDefault()}
       onContextMenu={(event) => event.preventDefault()}
       onPointerDown={(event) => {
-        if (event.button !== 0) return;
+        if (event.button !== 0 && event.button !== 1 && event.button !== 2) return;
         event.preventDefault();
         event.currentTarget.setPointerCapture(event.pointerId);
-        drag.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, yaw: view.current.yaw, pitch: view.current.pitch };
+        const action = event.button !== 0 ? "orbit" : interactionMode === "translate" && onTranslateDelta ? "translate" : interactionMode === "rotate" && onRotateDelta ? "rotate" : "orbit";
+        drag.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, yaw: view.current.yaw, pitch: view.current.pitch, action };
         setDragging(true);
       }}
       onPointerMove={(event) => {
         const active = drag.current;
         if (!active || active.pointerId !== event.pointerId) return;
         event.preventDefault();
+        if (active.action !== "orbit") return;
         queuePose({
-          yaw: active.yaw - (event.clientX - active.x) * 0.35,
+          yaw: active.yaw + (event.clientX - active.x) * 0.35,
           pitch: Math.max(-35, Math.min(70, active.pitch + (event.clientY - active.y) * 0.2)),
           zoom: view.current.zoom,
         });
@@ -187,7 +197,7 @@ export function NativeVulkanCanvas({ assetId, framePath, label, className, style
       {error && <div className="vp-render-state vp-render-state--error">{error}</div>}
       <div className="vp-overlay vp-overlay__hud" style={{ left: 10, right: 10, bottom: 10, top: "auto", display: "flex", flexWrap: "wrap", gap: 6, pointerEvents: "none" }}>
         <span className="vp-chip">{label}</span>
-        <span className="vp-chip">drag to orbit · wheel to zoom</span>
+        <span className="vp-chip">{interactionMode === "translate" && onTranslateDelta ? "left drag moves selection" : interactionMode === "rotate" && onRotateDelta ? "left drag rotates selection" : "left drag free camera"} · right drag orbits · wheel zooms</span>
         <span className="vp-chip">{metrics.fps > 0 ? `${metrics.fps} FPS` : "idle"}{metrics.latencyMs > 0 ? ` · ${metrics.latencyMs} ms` : ""}</span>
       </div>
     </div>

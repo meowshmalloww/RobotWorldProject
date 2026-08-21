@@ -8,6 +8,7 @@ mesh bounds prevents long/thin objects from being scaled twice.
 from __future__ import annotations
 
 from functools import lru_cache
+import math
 from pathlib import Path
 from typing import Any
 
@@ -64,10 +65,14 @@ def measured_fit(model_path: Path, target_width: float, target_height: float, ta
     }
 
 
-def world_bounds(fit: dict[str, Any], translation: tuple[float, float, float]) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+def world_bounds(fit: dict[str, Any], translation: tuple[float, float, float], rotation_z_deg: float = 0.0) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     low = fit["local_usd_low"]
     high = fit["local_usd_high"]
+    angle = math.radians(float(rotation_z_deg))
+    cosine, sine = math.cos(angle), math.sin(angle)
+    corners = [(x, y) for x in (low[0], high[0]) for y in (low[1], high[1])]
+    rotated = [(x * cosine - y * sine, x * sine + y * cosine) for x, y in corners]
     return (
-        tuple(float(low[i] + translation[i]) for i in range(3)),
-        tuple(float(high[i] + translation[i]) for i in range(3)),
+        (min(x for x, _ in rotated) + translation[0], min(y for _, y in rotated) + translation[1], low[2] + translation[2]),
+        (max(x for x, _ in rotated) + translation[0], max(y for _, y in rotated) + translation[1], high[2] + translation[2]),
     )

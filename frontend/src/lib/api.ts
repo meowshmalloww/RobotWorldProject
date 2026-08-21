@@ -59,8 +59,28 @@ export const api = {
   get: <T>(path: string, signal?: AbortSignal) => request<T>("GET", path, undefined, signal),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
   put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body),
+  patch: <T>(path: string, body?: unknown) => request<T>("PATCH", path, body),
   del: (path: string) => request<void>("DELETE", path),
 };
+
+export async function uploadBinary<T>(path: string, file: File): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}${path.includes("?") ? "&" : "?"}filename=${encodeURIComponent(file.name)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: file,
+    });
+  } catch {
+    throw new ApiError(0, "RobotWorld API is offline.");
+  }
+  if (!res.ok) {
+    let message = `${res.status} ${res.statusText}`;
+    try { const data = await res.json(); message = typeof data?.detail === "string" ? data.detail : JSON.stringify(data?.detail ?? data); } catch { /* keep status */ }
+    throw new ApiError(res.status, message);
+  }
+  return await res.json() as T;
+}
 
 /** Download a backend file as a blob (e.g. USD artifacts). */
 export async function downloadApiFile(path: string, filename: string): Promise<void> {

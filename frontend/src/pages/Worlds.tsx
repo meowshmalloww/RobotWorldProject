@@ -6,7 +6,7 @@ import { Tree } from "../components/ui/Tree";
 import { PanelRail, ResizeHandle, usePanelSize } from "../components/ui/Resizable";
 import { useToast } from "../components/ui/Toast";
 import { Modal } from "../components/ui/Modal";
-import { api, ApiError } from "../lib/api";
+import { api, ApiError, uploadBinary } from "../lib/api";
 import { useApi } from "../lib/useApi";
 import { EmptyState, ErrorState, Skeleton } from "../lib/states";
 import { NativeVulkanCanvas } from "../components/three/NativeVulkanCanvas";
@@ -96,10 +96,10 @@ function SceneComposer({ assetId }: { assetId: string }) {
   const [seed, setSeed] = useState("1048576");
   const [variant, setVariant] = useState("");
   const [shadingVariant, setShadingVariant] = useState<"rgb" | "seg" | "depth">("rgb");
-  const [gizmoMode, setGizmoMode] = useState<"translate" | "rotate" | "scale">("translate");
+  const [gizmoMode, setGizmoMode] = useState<"translate" | "rotate" | "camera">("camera");
   const [simPlaying, setSimPlaying] = useState(false);
   const [inspTab, setInspTab] = useState<"Components" | "Physics" | "Provenance">("Components");
-  const [shelfTab, setShelfTab] = useState<"Console" | "Checks" | "Variants">("Console");
+  const [shelfTab, setShelfTab] = useState<"Console" | "Checks" | "Variants" | "Agent" | "Robots" | "Diagnostics">("Agent");
   const [saved, setSaved] = useState("never");
   const [saving, setSaving] = useState(false);
   const [checks, setChecks] = useState<PhysicsCheck[] | null>(null);
@@ -109,6 +109,13 @@ function SceneComposer({ assetId }: { assetId: string }) {
   const [treeSearch, setTreeSearch] = useState("");
   const variantNameRef = useRef<HTMLInputElement>(null);
   const variantDescRef = useRef<HTMLInputElement>(null);
+  const { data: robotData, refetch: refetchRobots } = useApi<{ robots: RobotManifest[] }>("/robots");
+  const [robotId, setRobotId] = useState("");
+  const [instruction, setInstruction] = useState("Grab the apple and put it in the blender.");
+  const [command, setCommand] = useState<WorldCommandResult | null>(null);
+  const [planning, setPlanning] = useState(false);
+  const [importingRobot, setImportingRobot] = useState(false);
+  const [arranging, setArranging] = useState(false);
 
   // panel state - resizable + collapsible
   const [leftW, setLeftW] = usePanelSize(260, 200, 440, "robotworld.worlds.leftW");
@@ -155,8 +162,54 @@ function SceneComposer({ assetId }: { assetId: string }) {
   }, [sceneTree]);
   const variantCards = useMemo(() => scene?.variants ?? [], [scene]);
   const physicsChecks = checks ?? scene?.physicsChecks ?? [];
-  const activePlacement = scene?.placements?.find((item) => item.assetId === placedAssetId);
+  // Older saved scenes do not contain every newer transform field. Normalize
+  // at the API boundary so stale HMR data cannot crash render or drag paths.
+  const activePlacement = useMemo(() => {
+    const placement = scene?.placements?.find((item) => item.assetId === placedAssetId);
+    return placement ? normalizeWorldPlacement(placement) : undefined;
+  }, [placedAssetId, scene?.placements]);
   const hasPlacedWorldAssets = Boolean(scene?.placedAssets?.length);
+
+  useEffect(() => { if (!robotId && robotData?.robots[0]) setRobotId(robotData.robots[0].id); }, [robotData, robotId]);
+
+  const planCommand = async (mode: "plan" | "execute" = "plan") => {
+    setPlanning(true);
+    try {
+      const result = await api.post<WorldCommandResult>("/worlds/commands", { instruction, robotId: robotId || null, mode });
+      setCommand(result);
+      setShelfTab("Agent");
+    } catch (e) {
+      toast.push("err", mode === "execute" ? "Execution blocked" : "Planning failed", e instanceof ApiError ? e.message : String(e));
+    } finally { setPlanning(false); }
+  };
+
+  const importRobot = async (file?: File) => {
+    if (!file) return;
+    setImportingRobot(true);
+    try {
+      const robot = await uploadBinary<RobotManifest>("/robots/import", file);
+      setRobotId(robot.id);
+      await refetchRobots();
+      setShelfTab("Robots");
+      toast.push(robot.readiness.executable ? "ok" : "info", "Robot inspected", `${robot.name} · ${robot.joints} joints · ${robot.readiness.blockers.length} readiness gates`);
+    } catch (e) { toast.push("err", "Robot import failed", e instanceof ApiError ? e.message : String(e)); }
+    finally { setImportingRobot(false); }
+  };
+
+  const updatePlacement = async (asset: string, patch: { translation?: number[]; rotationZDeg?: number; visible?: boolean; mobility?: "movable" | "fixed" }) => {
+    try { await api.patch(`/worlds/placements/${asset}`, patch); await refetch(); }
+    catch (e) { toast.push("err", "Placement update failed", e instanceof ApiError ? e.message : String(e)); }
+  };
+
+  const autoLayout = async () => {
+    setArranging(true);
+    try {
+      const result = await api.post<{ placements: number; provenance: string }>("/worlds/layout", {});
+      await refetch();
+      toast.push("ok", "Constraint layout saved", `${result.placements} measured assets · ${result.provenance}`);
+    } catch (e) { toast.push("err", "Auto-layout failed", e instanceof ApiError ? e.message : String(e)); }
+    finally { setArranging(false); }
+  };
 
   // select active variant once loaded
   useEffect(() => {
@@ -189,6 +242,18 @@ function SceneComposer({ assetId }: { assetId: string }) {
     window.addEventListener("robotworld:reset-layout", reset);
     return () => window.removeEventListener("robotworld:reset-layout", reset);
   }, [setLeftW, setRightW, setShelfH]);
+
+  useEffect(() => {
+    const shortcuts = (event: KeyboardEvent) => {
+      const tag = (event.target as HTMLElement | null)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (event.key.toLowerCase() === "w") setGizmoMode("translate");
+      if (event.key.toLowerCase() === "e") setGizmoMode("rotate");
+      if (event.key.toLowerCase() === "q") setGizmoMode("camera");
+    };
+    window.addEventListener("keydown", shortcuts);
+    return () => window.removeEventListener("keydown", shortcuts);
+  }, []);
 
   useEffect(() => {
     if (!acceptanceJob || ["success", "failed", "blocked"].includes(acceptanceJob.status)) return;
@@ -281,25 +346,6 @@ function SceneComposer({ assetId }: { assetId: string }) {
     }
   };
 
-  if (scene && !hasPlacedWorldAssets) {
-    return (
-      <div className="world-editor col" style={{ flex: 1, minHeight: 0, gap: 0, background: "var(--bg-app)" }}>
-        <div className="unity-dockbar" style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 12px", background: "var(--bg-panel-1)", borderBottom: "1px solid var(--border)" }}>
-          <Icon name="worlds" size={13} style={{ color: "var(--accent)" }} />
-          <span className="small" style={{ fontWeight: 620 }}>OpenUSD workspace</span>
-          <span className="grow" />
-          <Badge tone="grey">No generated assets placed</Badge>
-        </div>
-        <div className="center col" style={{ flex: 1, minHeight: 0, gap: 10, padding: 28, color: "var(--text-3)", textAlign: "center" }}>
-          <Icon name="cube" size={30} />
-          <span className="small" style={{ color: "var(--text-1)", fontWeight: 650 }}>The world is empty</span>
-          <span className="micro" style={{ maxWidth: 480 }}>RobotWorld only places generated GLB/OpenUSD artifacts here. The old procedural kitchen and logistics stand-ins are disabled.</span>
-          <a className="btn btn-primary btn-sm" href="#/assets"><Icon name="assets" size={12} /> Open generated assets</a>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="world-editor col" style={{ flex: 1, minHeight: 0, gap: 0, background: "var(--bg-app)" }}>
       {/* Unity Engine Transport & Tool Dock */}
@@ -311,6 +357,12 @@ function SceneComposer({ assetId }: { assetId: string }) {
               <span className="small ellipsis" style={{ fontWeight: 620 }}>{scene?.worldName ?? "OpenUSD World"}</span>
               <Badge tone="grey">{scene?.placedAssets?.length ?? 0} placed assets</Badge>
             </span>
+            <span className="v-divider" />
+            <div className="unity-group row" style={{ gap: 2, background: "var(--bg-panel-2)", padding: "2px 4px", borderRadius: 4, border: "1px solid var(--border)" }}>
+              <button className={`btn btn-sm ${gizmoMode === "translate" ? "btn-secondary" : "btn-ghost"}`} onClick={() => setGizmoMode("translate")} title="Move selected object (W)"><Icon name="move" size={12} /> Move</button>
+              <button className={`btn btn-sm ${gizmoMode === "rotate" ? "btn-secondary" : "btn-ghost"}`} onClick={() => setGizmoMode("rotate")} title="Rotate selected object around world Z (E)"><Icon name="refresh" size={12} /> Rotate</button>
+              <button className={`btn btn-sm ${gizmoMode === "camera" ? "btn-secondary" : "btn-ghost"}`} onClick={() => setGizmoMode("camera")} title="Free camera orbit (Q)"><Icon name="camera" size={12} /> Camera</button>
+            </div>
             <span className="v-divider" />
             <span className="micro t3">OpenUSD composition persisted</span>
             <span className="grow" />
@@ -325,6 +377,7 @@ function SceneComposer({ assetId }: { assetId: string }) {
             </button>
             <span className="v-divider" />
             <span className="micro t3 mono">Placement autosaved</span>
+            <button className="btn btn-secondary btn-sm" disabled={arranging} onClick={autoLayout}><Icon name="spark" size={11} /> {arranging ? "Solving..." : "Auto-layout"}</button>
           </>
         ) : <>
         {/* Simulation Transport */}
@@ -376,12 +429,12 @@ function SceneComposer({ assetId }: { assetId: string }) {
             <Icon name="refresh" size={12} />
           </button>
           <button
-            className={`btn btn-sm btn-icon ${gizmoMode === "scale" ? "btn-secondary" : "btn-ghost"}`}
-            onClick={() => setGizmoMode("scale")}
-            title="Scale Tool (R)"
+            className={`btn btn-sm btn-icon ${gizmoMode === "camera" ? "btn-secondary" : "btn-ghost"}`}
+            onClick={() => setGizmoMode("camera")}
+            title="Free Camera (Q)"
             style={{ height: 26, width: 26 }}
           >
-            <Icon name="maximizeWin" size={11} />
+            <Icon name="camera" size={11} />
           </button>
         </div>
 
@@ -503,6 +556,10 @@ function SceneComposer({ assetId }: { assetId: string }) {
                       const owner = assetByNodeId.get(id);
                       if (owner) setActivePlacedAssetId(owner);
                     }}
+                    onVisibilityChange={(id, visible) => {
+                      const owner = assetByNodeId.get(id);
+                      if (owner) void updatePlacement(owner, { visible });
+                    }}
                   />
                 ) : (
                   <EmptyState icon="worlds">No scene nodes loaded.</EmptyState>
@@ -519,7 +576,7 @@ function SceneComposer({ assetId }: { assetId: string }) {
         <div className="col" style={{ flex: 1, minWidth: 0, minHeight: 0, gap: 0 }}>
           <div className="card unity-viewport-container" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", borderRadius: 0, border: 0 }}>
             {hasPlacedWorldAssets ? (
-              <GeneratedWorldView worldName={scene?.worldName ?? "OpenUSD World"} assetCount={scene?.placedAssets?.length ?? 0} stageAvailable={Boolean(scene?.assembly?.available)} />
+              <GeneratedWorldView worldName={scene?.worldName ?? "OpenUSD World"} assetCount={scene?.placedAssets?.length ?? 0} stageAvailable={Boolean(scene?.assembly?.available)} placement={activePlacement} mode={gizmoMode} translate={gizmoMode === "translate" ? (delta) => activePlacement && updatePlacement(activePlacement.assetId, { translation: activePlacement.translation.map((value, index) => value + delta[index]) }) : undefined} rotate={gizmoMode === "rotate" ? (degrees) => activePlacement && updatePlacement(activePlacement.assetId, { rotationZDeg: finiteNumber(activePlacement.rotationZDeg) + degrees }) : undefined} />
             ) : (
               <div className="center col" style={{ flex: 1, minHeight: 0, gap: 10, padding: 28, color: "var(--text-3)", textAlign: "center" }}>
                 <Icon name="cube" size={28} />
@@ -536,14 +593,14 @@ function SceneComposer({ assetId }: { assetId: string }) {
               <div className="card unity-shelf" style={{ height: shelfH, flex: "none", display: "flex", flexDirection: "column", minHeight: 0, borderRadius: 0, borderRight: 0, borderLeft: 0, borderBottom: 0 }}>
                 <header className="card-head" style={{ minHeight: 30, padding: "0 8px 0 10px", background: "var(--bg-panel-2)", borderBottom: "1px solid var(--border)" }}>
                   <span className="tabs" style={{ border: 0, gap: 4 }}>
-                    {(["Console", "Checks", "Variants"] as const).map((t) => (
+                    {(["Agent", "Robots", "Console", "Diagnostics", "Checks", "Variants"] as const).map((t) => (
                       <button
                         key={t}
                         className={shelfTab === t ? "on" : ""}
                         style={{ height: 24, fontSize: 11, padding: "0 10px", borderRadius: 3 }}
                         onClick={() => setShelfTab(t)}
                       >
-                        {t === "Console" ? "Console" : t === "Checks" ? "Problems" : "Terminal"}
+                        {t === "Checks" ? "Problems" : t}
                       </button>
                     ))}
                   </span>
@@ -552,6 +609,8 @@ function SceneComposer({ assetId }: { assetId: string }) {
                       <button className="btn btn-ghost btn-sm" onClick={rerunChecks} disabled={checksRunning} style={{ height: 22, fontSize: 10 }}>
                         <Icon name="refresh" size={10} className={checksRunning ? "spin" : undefined} /> {checksRunning ? "Evaluating..." : "Run real checks"}
                       </button>
+                    ) : shelfTab === "Robots" ? (
+                      <label className="btn btn-ghost btn-sm" style={{ height: 22, fontSize: 10, cursor: "pointer" }}><Icon name="upload" size={10} /> {importingRobot ? "Inspecting..." : "Import robot"}<input type="file" accept=".urdf,.xml,.mjcf,.usd,.usda,.usdc,.glb" hidden disabled={importingRobot} onChange={(event) => { void importRobot(event.target.files?.[0]); event.currentTarget.value = ""; }} /></label>
                     ) : generatedAsset ? (
                       <Badge tone="grey">runtime evidence</Badge>
                     ) : shelfTab === "Variants" ? (
@@ -565,8 +624,12 @@ function SceneComposer({ assetId }: { assetId: string }) {
                 </header>
 
                 <div style={{ flex: 1, overflowY: "auto", minHeight: 0, background: "var(--bg-panel-1)" }}>
-                  {generatedAsset ? (
-                    <GeneratedAssetShelf asset={generatedAsset} tab={shelfTab} assembly={scene?.assembly} checks={physicsChecks} checksRunning={checksRunning} />
+                  {shelfTab === "Agent" || shelfTab === "Robots" ? (
+                    <RobotAgentPanel tab={shelfTab} robots={robotData?.robots ?? []} robotId={robotId} setRobotId={setRobotId} instruction={instruction} setInstruction={setInstruction} command={command} planning={planning} onPlan={planCommand} onImport={importRobot} importing={importingRobot} onRobotsChanged={refetchRobots} />
+                  ) : shelfTab === "Diagnostics" ? (
+                    <RuntimeDiagnosticsPanel />
+                  ) : generatedAsset ? (
+                    <GeneratedAssetShelf asset={generatedAsset} tab={shelfTab as "Console" | "Checks" | "Variants"} assembly={scene?.assembly} checks={physicsChecks} checksRunning={checksRunning} />
                   ) : shelfTab === "Console" ? (
                     <AcceptanceConsole scenario={activeAcceptance} catalog={acceptance ?? undefined} job={acceptanceJob} />
                   ) : shelfTab === "Checks" ? (
@@ -652,7 +715,7 @@ function SceneComposer({ assetId }: { assetId: string }) {
 
               <div style={{ flex: 1, overflowY: "auto", minHeight: 0, padding: "8px 10px" }}>
                 {generatedAsset ? (
-                  <GeneratedAssetInspector asset={generatedAsset} placement={activePlacement} tab={inspTab} />
+                  <GeneratedAssetInspector asset={generatedAsset} placement={activePlacement} tab={inspTab} onTransform={(translation) => updatePlacement(generatedAsset.id, { translation })} onMobility={(mobility) => updatePlacement(generatedAsset.id, { mobility })} />
                 ) : selected && inspTab === "Components" ? (
                   <UnityComponentInspector selected={selected} selectedName={selectedName} scenario={activeAcceptance} />
                 ) : selected && inspTab === "Physics" ? (
@@ -696,7 +759,109 @@ function SceneComposer({ assetId }: { assetId: string }) {
   );
 }
 
-function GeneratedWorldView({ worldName, assetCount, stageAvailable }: { worldName: string; assetCount: number; stageAvailable: boolean }) {
+interface RuntimeDiagnostics {
+  status: "healthy" | "degraded";
+  uptimeSeconds: number;
+  events: { time: string; level: string; service: string; message: string }[];
+}
+
+function diagnosticMessage(raw: string): string {
+  try {
+    const parsed = JSON.parse(raw) as { message?: string; route?: string };
+    if (parsed && typeof parsed === "object" && parsed.message) {
+      return `${parsed.message}${parsed.route ? ` · ${parsed.route}` : ""}`;
+    }
+  } catch { /* plain backend log */ }
+  return raw;
+}
+
+function RuntimeDiagnosticsPanel() {
+  const { data, error, loading, refetch } = useApi<RuntimeDiagnostics>("/diagnostics/runtime");
+  useEffect(() => {
+    const timer = window.setInterval(refetch, 3000);
+    return () => window.clearInterval(timer);
+  }, [refetch]);
+  return <div className="col" style={{ minHeight: "100%", gap: 0 }}>
+    <div className="row" style={{ padding: "7px 10px", borderBottom: "1px solid var(--border)" }}>
+      <StatusBadge status={error ? "failed" : data?.status ?? (loading ? "running" : "idle")} />
+      <span className="micro t3">API uptime {finiteNumber(data?.uptimeSeconds).toFixed(1)} s · auto-refresh 3 s</span>
+      <span className="grow" />
+      <button className="btn btn-ghost btn-sm" onClick={refetch}><Icon name="refresh" size={10} /> Refresh</button>
+    </div>
+    {error ? <ErrorState message={error.message} onRetry={refetch} /> : data?.events.length ? <div className="acceptance-log mono" style={{ padding: "6px 10px", maxHeight: "none" }}>
+      {data.events.map((event, index) => <div className="console-line" key={`${event.time}-${event.service}-${index}`}>
+        <span className="console-time">{event.time}</span>
+        <span className={event.level === "ERROR" ? "g-red" : "t2"}>[{event.level}] {event.service} · {diagnosticMessage(event.message)}</span>
+      </div>)}
+    </div> : <EmptyState icon="shield">No recent runtime errors or warnings.</EmptyState>}
+  </div>;
+}
+
+function RobotAgentPanel({ tab, robots, robotId, setRobotId, instruction, setInstruction, command, planning, onPlan, onImport, importing, onRobotsChanged }: {
+  tab: "Agent" | "Robots"; robots: RobotManifest[]; robotId: string; setRobotId: (id: string) => void;
+  instruction: string; setInstruction: (value: string) => void; command: WorldCommandResult | null; planning: boolean;
+  onPlan: (mode?: "plan" | "execute") => void; onImport: (file?: File) => void; importing: boolean;
+  onRobotsChanged: () => void;
+}) {
+  const toast = useToast();
+  const [preparingIsaac, setPreparingIsaac] = useState(false);
+  const robot = robots.find((item) => item.id === robotId);
+  const addFranka = async () => {
+    setPreparingIsaac(true);
+    try {
+      const value = await api.post<RobotManifest>("/robots/franka/isaac", {});
+      setRobotId(value.id);
+      onRobotsChanged();
+      toast.push(value.readiness.executable ? "ok" : "info", "Franka Panda registered", value.readiness.executable ? "Isaac articulation is ready." : value.readiness.blockers[0] ?? "Readiness gates remain.");
+    } catch (e) { toast.push("err", "Franka registration failed", e instanceof ApiError ? e.message : String(e)); }
+    finally { setPreparingIsaac(false); }
+  };
+  const prepareIsaac = async () => {
+    setPreparingIsaac(true);
+    try {
+      const value = await api.post<{ runtimeReady: boolean; blockers: string[] }>("/simulation/isaac/prepare", {});
+      onRobotsChanged();
+      toast.push(value.runtimeReady ? "ok" : "info", "Isaac stage prepared", value.runtimeReady ? "OpenUSD physics and Franka launch manifest are ready." : value.blockers[0] ?? "Install Isaac Sim to launch.");
+    } catch (e) { toast.push("err", "Isaac stage preparation failed", e instanceof ApiError ? e.message : String(e)); }
+    finally { setPreparingIsaac(false); }
+  };
+  const mapCamera = async (key: string, value: string) => {
+    if (!robot) return;
+    try {
+      await api.put(`/robots/${robot.id}`, { cameraMappings: { ...robot.cameraMappings, [key]: value } });
+      onRobotsChanged();
+      toast.push("ok", "Camera mapping saved", `${key} → ${value}`);
+    } catch (e) { toast.push("err", "Camera mapping failed", e instanceof ApiError ? e.message : String(e)); }
+  };
+  if (tab === "Robots") return <div className="row" style={{ alignItems: "stretch", minHeight: "100%" }}>
+    <div className="col" style={{ width: 250, padding: 10, borderRight: "1px solid var(--border)" }}>
+      <select className="select" value={robotId} onChange={(e) => setRobotId(e.target.value)}><option value="">Select robot</option>{robots.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.format}</option>)}</select>
+      <button className="btn btn-secondary btn-sm" disabled={preparingIsaac} onClick={() => void addFranka()}><Icon name="plus" size={11} /> Add Franka Panda</button>
+      <button className="btn btn-ghost btn-sm" disabled={preparingIsaac} onClick={() => void prepareIsaac()}><Icon name="worlds" size={11} /> Prepare Isaac stage</button>
+      <label className="empty-note center col" style={{ marginTop: 8, minHeight: 78, borderStyle: "dashed", cursor: "pointer" }} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); void onImport(e.dataTransfer.files[0]); }}>
+        <Icon name="upload" size={17} /><span>{importing ? "Inspecting source..." : "Drop URDF, MJCF, OpenUSD, or GLB"}</span><input hidden type="file" accept=".urdf,.xml,.mjcf,.usd,.usda,.usdc,.glb" onChange={(e) => void onImport(e.target.files?.[0])} />
+      </label>
+    </div>
+    <div className="grow col" style={{ padding: 10, gap: 8 }}>
+      {!robot ? <EmptyState icon="robot">Import a robot; RobotWorld will inspect it without assuming it is executable.</EmptyState> : <>
+        <div className="row"><b>{robot.name}</b><Badge tone="grey">{robot.format}</Badge><Badge tone={robot.readiness.executable ? "teal" : "amber"}>{robot.joints} joints · {robot.readiness.executable ? "executable" : "gated"}</Badge></div>
+        <div className="row" style={{ gap: 8 }}>
+          {(["observation.images.exterior_1_left", "observation.images.exterior_2_left"] as const).map((key) => <label className="field grow" key={key}><span className="micro t3">{key}</span><select className="select" value={robot.cameraMappings[key] ?? ""} onChange={(e) => void mapCamera(key, e.target.value)}><option value="">Map camera...</option>{robot.cameraNames.map((name) => <option value={name} key={name}>{name}</option>)}</select></label>)}
+        </div>
+        {robot.readiness.blockers.map((value) => <div className="console-line" key={value}><span className="console-time">BLOCK</span><span>{value}</span></div>)}
+      </>}
+    </div>
+  </div>;
+  return <div className="row" style={{ alignItems: "stretch", minHeight: "100%" }}>
+    <div className="col" style={{ flex: 1, padding: 10, gap: 7 }}>
+      <div className="row"><select className="select" style={{ width: 220 }} value={robotId} onChange={(e) => setRobotId(e.target.value)}><option value="">No robot selected</option>{robots.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><input className="input grow" value={instruction} onChange={(e) => setInstruction(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !planning) void onPlan("plan"); }} placeholder="Describe the task for the planner and VLA..." /><button className="btn btn-primary btn-sm" disabled={planning || instruction.trim().length < 2} onClick={() => void onPlan("plan")}><Icon name="spark" size={12} /> {planning ? "Planning..." : "Plan"}</button><button className="btn btn-secondary btn-sm" disabled={planning || !command?.executionAllowed} onClick={() => void onPlan("execute")} title={command?.executionAllowed ? "Request bounded execution" : "Resolve all reported gates first"}><Icon name="play" size={12} /> Execute</button></div>
+      {command ? <><div className="small"><b>{command.plan.summary}</b> <span className="micro t3 mono">{command.plannerProvenance}</span></div>{command.plan.steps.map((step, i) => <div className="console-line" key={`${i}-${step}`}><span className="console-time">{String(i + 1).padStart(2, "0")}</span><span>{step}</span></div>)}</> : <div className="empty-note">The planner can inspect the real scene/robot manifests now. Motor execution remains disabled until robot, cameras, VLA adaptation, and physical assets all pass.</div>}
+    </div>
+    <div className="col" style={{ width: 300, padding: 10, borderLeft: "1px solid var(--border)", gap: 4 }}><b className="small">Execution gates</b>{(command?.blockers ?? robot?.readiness.blockers ?? ["Run Plan to evaluate the full world + policy contract."]).map((value) => <span className="micro t3" key={value}>• {value}</span>)}</div>
+  </div>;
+}
+
+function GeneratedWorldView({ worldName, assetCount, stageAvailable, placement, mode, translate, rotate }: { worldName: string; assetCount: number; stageAvailable: boolean; placement?: WorldPlacement; mode: "translate" | "rotate" | "camera"; translate?: (delta: [number, number, number]) => void; rotate?: (degrees: number) => void }) {
   const asset = { name: `${worldName} · ${assetCount} placed assets` };
   const hasWorldLayer = stageAvailable;
   return (
@@ -704,15 +869,30 @@ function GeneratedWorldView({ worldName, assetCount, stageAvailable }: { worldNa
       framePath="/api/worlds/render/vulkan"
       label={`${asset.name} · actual GLB · ${hasWorldLayer ? "OpenUSD composed" : "OpenUSD layer unavailable"}`}
       style={{ flex: 1, minHeight: 0 }}
+      interactionMode={mode === "translate" && placement && translate ? "translate" : mode === "rotate" && placement && rotate ? "rotate" : "orbit"}
+      onTranslateDelta={translate}
+      onRotateDelta={rotate}
       onFrame={({ fps, latencyMs }) => window.dispatchEvent(new CustomEvent("robotworld:world-frame", { detail: { fps, latencyMs, active: true } }))}
     />
   );
+}
+
+interface RobotManifest {
+  id: string; name: string; format: string; joints: number; cameras: number; cameraNames: string[];
+  cameraMappings: Record<string, string>; policyAdapter?: string | null;
+  readiness: { executable: boolean; blockers: string[] };
+}
+
+interface WorldCommandResult {
+  instruction: string; executionAllowed: boolean; plannerProvenance: string; blockers: string[];
+  plan: { summary: string; steps: string[]; referencedObjectIds?: string[]; assumptions?: string[] };
 }
 
 interface WorldPlacement {
   assetId: string;
   name: string;
   translation: number[];
+  rotationZDeg?: number;
   scale: number[];
   rawBounds: number[][];
   rawExtents: number[];
@@ -721,7 +901,49 @@ interface WorldPlacement {
   dimensionSource: string;
   dimensionConfidence: number;
   anchor: { mode: string; surface: string; gap_m: number };
+  mobility?: "movable" | "fixed";
+  massKg?: number;
+  massSource?: string;
+  collisionApproximation?: string;
   physicalStatus: string;
+}
+
+function finiteNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function finiteVector(value: unknown, length = 3, fallback = 0): number[] {
+  if (!Array.isArray(value)) return Array.from({ length }, () => fallback);
+  return Array.from({ length }, (_, index) => finiteNumber(value[index], fallback));
+}
+
+function normalizeWorldPlacement(placement: WorldPlacement): WorldPlacement {
+  const bounds = Array.isArray(placement.worldBounds) ? placement.worldBounds : [];
+  const anchor = placement.anchor && typeof placement.anchor === "object"
+    ? placement.anchor
+    : { mode: "unanchored", surface: "unknown", gap_m: 0 };
+  return {
+    ...placement,
+    translation: finiteVector(placement.translation),
+    rotationZDeg: finiteNumber(placement.rotationZDeg),
+    scale: finiteVector(placement.scale, 3, 1),
+    rawBounds: [finiteVector(placement.rawBounds?.[0]), finiteVector(placement.rawBounds?.[1])],
+    rawExtents: finiteVector(placement.rawExtents),
+    targetDimensions: finiteVector(placement.targetDimensions),
+    worldBounds: [finiteVector(bounds[0]), finiteVector(bounds[1])],
+    dimensionSource: placement.dimensionSource || "unknown",
+    dimensionConfidence: finiteNumber(placement.dimensionConfidence),
+    anchor: {
+      mode: anchor.mode || "unanchored",
+      surface: anchor.surface || "unknown",
+      gap_m: finiteNumber(anchor.gap_m),
+    },
+    mobility: placement.mobility === "movable" ? "movable" : "fixed",
+    massKg: finiteNumber(placement.massKg, 1),
+    massSource: placement.massSource || "unknown",
+    collisionApproximation: placement.collisionApproximation || "unknown",
+    physicalStatus: placement.physicalStatus || "unknown",
+  };
 }
 
 function GeneratedAssetShelf({ asset, tab, assembly, checks, checksRunning }: { asset: Asset; tab: "Console" | "Checks" | "Variants"; assembly?: SceneData["assembly"]; checks: PhysicsCheck[]; checksRunning: boolean }) {
@@ -780,12 +1002,14 @@ function GeneratedAssetShelf({ asset, tab, assembly, checks, checksRunning }: { 
   );
 }
 
-function GeneratedAssetInspector({ asset, placement, tab }: { asset: Asset; placement?: WorldPlacement; tab: "Components" | "Physics" | "Provenance" }) {
+function GeneratedAssetInspector({ asset, placement, tab, onTransform, onMobility }: { asset: Asset; placement?: WorldPlacement; tab: "Components" | "Physics" | "Provenance"; onTransform: (translation: number[]) => void; onMobility: (mobility: "movable" | "fixed") => void }) {
   const files = new Set(asset.artifacts.map((artifact) => artifact.file));
-  const vec = (values: number[] | undefined) => values ? values.map((value) => value.toFixed(4)).join(", ") : "unavailable";
+  const vec = (values: number[] | undefined) => values ? values.map((value) => finiteNumber(value).toFixed(4)).join(", ") : "unavailable";
   if (placement && tab === "Components") return <div className="col" style={{ gap: 10 }}>
     <InspSection title="Transform" defaultOpen={true}><div className="kv">
       <div className="kv-row"><span className="kv-k">Position XYZ (m)</span><span className="kv-v mono">{vec(placement.translation)}</span></div>
+      <div className="row" style={{ gap: 5 }}>{placement.translation.map((value, index) => <label className="field grow" key={index}><span className="micro t3">{["X", "Y", "Z"][index]} m</span><input className="input mono" type="number" step="0.01" value={value} onChange={(event) => { const next = [...placement.translation]; next[index] = Number(event.target.value) || 0; onTransform(next); }} /></label>)}</div>
+      <div className="kv-row"><span className="kv-k">Rotation Z</span><span className="kv-v mono">{finiteNumber(placement.rotationZDeg).toFixed(2)}° (use Rotate mode)</span></div>
       <div className="kv-row"><span className="kv-k">Mesh fit XYZ</span><span className="kv-v mono">{vec(placement.scale)}</span></div>
       <div className="kv-row"><span className="kv-k">World AABB min</span><span className="kv-v mono">{vec(placement.worldBounds[0])}</span></div>
       <div className="kv-row"><span className="kv-k">World AABB max</span><span className="kv-v mono">{vec(placement.worldBounds[1])}</span></div>
@@ -798,12 +1022,15 @@ function GeneratedAssetInspector({ asset, placement, tab }: { asset: Asset; plac
   </div>;
   if (placement && tab === "Physics") return <div className="col" style={{ gap: 10 }}>
     <InspSection title="Support relationship" defaultOpen={true}><div className="kv">
+      <div className="kv-row"><span className="kv-k">Body mode</span><span className="kv-v"><select className="select" value={placement.mobility ?? "fixed"} onChange={(event) => onMobility(event.target.value as "movable" | "fixed")}><option value="movable">Movable · gravity + grasp</option><option value="fixed">Fixed · static fixture</option></select></span></div>
       <div className="kv-row"><span className="kv-k">Anchor</span><span className="kv-v mono">{placement.anchor.mode}</span></div>
       <div className="kv-row"><span className="kv-k">Surface</span><span className="kv-v">{placement.anchor.surface}</span></div>
       <div className="kv-row"><span className="kv-k">Authored gap</span><span className="kv-v mono">{(placement.anchor.gap_m * 1000).toFixed(1)} mm</span></div>
       <div className="kv-row"><span className="kv-k">Status</span><span className="kv-v">{placement.physicalStatus.replaceAll("_", " ")}</span></div>
+      <div className="kv-row"><span className="kv-k">Collision</span><span className="kv-v mono">{placement.collisionApproximation}</span></div>
+      <div className="kv-row"><span className="kv-k">Mass</span><span className="kv-v mono">{finiteNumber(placement.massKg).toFixed(3)} kg · {placement.massSource}</span></div>
     </div></InspSection>
-    <p className="micro t3">The viewport placement is real. Collision, mass, articulation, and policy readiness remain blocked until measured physical data is compiled.</p>
+    <p className="micro t3">OpenUSD collision and rigid-body metadata are authored into stage.usda. Isaac Sim must validate contacts and grasp/drop behavior; estimated mass remains visibly labeled and does not count as measured evidence.</p>
   </div>;
   if (placement && tab === "Provenance") return <div className="col" style={{ gap: 10 }}>
     <InspSection title="Generated artifact chain" defaultOpen={true}><div className="kv">
@@ -811,6 +1038,14 @@ function GeneratedAssetInspector({ asset, placement, tab }: { asset: Asset; plac
       <div className="kv-row"><span className="kv-k">GLB</span><span className="kv-v mono">{files.has("model.glb") ? "model.glb present" : "missing"}</span></div>
       <div className="kv-row"><span className="kv-k">OpenUSD</span><span className="kv-v mono">{files.has("visual.usdc") && files.has("asset.usda") ? "visual.usdc -> asset.usda -> stage.usda" : "incomplete"}</span></div>
       <div className="kv-row"><span className="kv-k">Scale method</span><span className="kv-v">occupied GLB bounds fitted to target dimensions</span></div>
+    </div></InspSection>
+    <InspSection title="Bright Data collection trace" defaultOpen={true}><div className="col" style={{ gap: 5 }}>
+      {asset.collectionTrace ? <>
+        <div className="kv-row"><span className="kv-k">Provider</span><span className="kv-v">{asset.collectionTrace.provider}</span></div>
+        <div className="kv-row"><span className="kv-k">Input</span><span className="kv-v mono">{asset.collectionTrace.inputQuery}</span></div>
+        {asset.collectionTrace.requests.map((request, index) => <div className="console-line" key={`${request.tool}-${index}`}><span className="console-time">QUERY</span><span><b>{request.tool}</b> · {request.query} · {request.purpose}</span></div>)}
+        {asset.collectionTrace.results.map((result, index) => <div className="console-line" key={`${result.value}-${index}`}><span className="console-time">RESULT</span><span>{result.type} · {result.title || result.domain || result.value}</span></div>)}
+      </> : <span className="micro t3">This legacy asset predates collection tracing. Rebuild it to persist the exact queries and sanitized results.</span>}
     </div></InspSection>
   </div>;
   return (

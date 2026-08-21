@@ -5,7 +5,7 @@ import time
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services import brightdata
+from app.services import brightdata, llm
 
 
 def test_primary_read_contract() -> None:
@@ -79,6 +79,10 @@ def test_world_mutations_and_checks() -> None:
         scene = client.get("/api/worlds/scene").json()
         assert scene["sceneTree"]
         for placement in scene["placements"]:
+            assert isinstance(placement["rotationZDeg"], (int, float))
+            assert placement["mobility"] in {"movable", "fixed"}
+            assert placement["collisionApproximation"] in {"convexHull", "none"}
+            assert placement["massKg"] > 0
             actual = [placement["worldBounds"][1][i] - placement["worldBounds"][0][i] for i in range(3)]
             assert max(abs(actual[i] - placement["targetDimensions"][i]) for i in range(3)) < 0.002
             assert placement["anchor"]["surface"] in {"world floor", "countertop"}
@@ -87,6 +91,13 @@ def test_world_mutations_and_checks() -> None:
         assert checks and all(item["status"] in {"pass", "warn", "fail"} for item in checks)
         if scene["placements"]:
             assert any(item["check"].startswith("Measured mesh fit") for item in checks)
+            first = scene["placements"][0]
+            moved = [first["translation"][0] + 0.01, first["translation"][1], first["translation"][2]]
+            assert client.patch(f"/api/worlds/placements/{first['assetId']}", json={"translation": moved, "rotationZDeg": 15}).status_code == 200
+            updated = client.get("/api/worlds/scene").json()
+            actual = next(item for item in updated["placements"] if item["assetId"] == first["assetId"])["translation"]
+            assert actual == moved
+            assert next(item for item in updated["placements"] if item["assetId"] == first["assetId"])["rotationZDeg"] == 15
         camera_probe = client.post("/api/worlds/cameras/probe", json={})
         assert camera_probe.status_code == 200
         for camera in camera_probe.json()["cameras"].values():
@@ -96,6 +107,72 @@ def test_world_mutations_and_checks() -> None:
         variant = client.post("/api/worlds/variants", json={"name": "Test clearance", "desc": "API contract test"})
         assert variant.status_code == 200
         assert client.post(f"/api/worlds/variants/{variant.json()['id']}/activate", json={}).status_code == 200
+
+
+def test_frontend_diagnostics_and_isaac_franka_fail_closed() -> None:
+    with TestClient(app) as client:
+        recorded = client.post("/api/diagnostics/frontend-errors", json={
+            "source": "react",
+            "message": "Cannot read properties of undefined (reading 'toFixed')",
+            "stack": "GeneratedAssetInspector",
+            "componentStack": "Worlds",
+            "route": "/#/worlds",
+            "userAgent": "pytest",
+        })
+        assert recorded.status_code == 202
+        diagnostics = client.get("/api/diagnostics/runtime")
+        assert diagnostics.status_code == 200
+        assert any(row["service"] == "frontend.react" for row in diagnostics.json()["events"])
+
+        status = client.get("/api/simulation/isaac")
+        assert status.status_code == 200
+        assert status.json()["version"] == "6.0"
+        assert status.json()["franka"]["armDof"] == 7
+        assert status.json()["franka"]["fingerJoints"] == 2
+
+        franka = client.post("/api/robots/franka/isaac", json={})
+        assert franka.status_code == 201
+        assert franka.json()["armDof"] == 7
+        assert franka.json()["readiness"]["executable"] is False
+
+        scene = client.get("/api/worlds/scene").json()
+        if scene["placements"]:
+            prepared = client.post("/api/simulation/isaac/prepare", json={})
+            assert prepared.status_code == 200, prepared.text
+            assert prepared.json()["prepared"] is True
+            assert prepared.json()["runtimeReady"] is status.json()["ready"]
+
+
+def test_robot_import_camera_mapping_and_world_command_gate(monkeypatch) -> None:
+    async def no_provider(*args, **kwargs):
+        return None, "heuristic:test"
+
+    monkeypatch.setattr(llm, "plan", no_provider)
+    urdf = b'''<robot name="test_arm"><link name="base"/><link name="tool"/><joint name="j1" type="revolute"><parent link="base"/><child link="tool"/><limit lower="-1" upper="1" effort="10" velocity="1"/></joint><gazebo reference="tool"><sensor name="wrist"><camera name="wrist_cam"/></sensor></gazebo></robot>'''
+    with TestClient(app) as client:
+        imported = client.post(
+            "/api/robots/import?filename=test_arm.urdf",
+            content=urdf,
+            headers={"content-type": "application/octet-stream"},
+        )
+        assert imported.status_code == 201, imported.text
+        robot = imported.json()
+        assert robot["format"] == "urdf" and robot["joints"] == 1
+        assert robot["readiness"]["executable"] is False
+        mapped = client.put(f"/api/robots/{robot['id']}", json={"cameraMappings": {
+            "observation.images.exterior_1_left": "wrist_cam",
+            "observation.images.exterior_2_left": "wrist_cam",
+        }})
+        assert mapped.status_code == 200
+        assert any("fine-tuned checkpoint" in item for item in mapped.json()["readiness"]["blockers"])
+        plan = client.post("/api/worlds/commands", json={
+            "instruction": "grab the apple and put it in the blender",
+            "robotId": robot["id"],
+            "mode": "plan",
+        })
+        assert plan.status_code == 200, plan.text
+        assert plan.json()["executionAllowed"] is False
+        assert plan.json()["plan"]["steps"]
 
 
 def test_native_vulkan_frame_and_acceptance_run_fail_closed_without_policy() -> None:

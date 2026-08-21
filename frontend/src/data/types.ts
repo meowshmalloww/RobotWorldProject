@@ -114,6 +114,13 @@ export interface Asset {
   source: string;
   sourceImage?: string;
   sourcePhotos?: PhotoCandidate[];
+  collectionTrace?: {
+    provider: string;
+    inputQuery: string;
+    requests: { tool: string; query: string; purpose: string }[];
+    results: { type: string; value: string; title?: string; domain?: string; state?: string }[];
+    resultCount: number;
+  };
   parts: AssetPart[];
   artifacts: Artifact[];
   compile: CompileStage[];
@@ -131,6 +138,9 @@ export interface SceneNode {
   name: string;
   icon: string;
   visible?: boolean;
+  translation?: number[];
+  rotationZDeg?: number;
+  anchor?: { mode: string; surface: string; gap_m: number };
   locked?: boolean;
   tag?: string;
   children?: SceneNode[];

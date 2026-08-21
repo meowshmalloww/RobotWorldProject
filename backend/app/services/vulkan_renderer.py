@@ -52,6 +52,7 @@ class WorldPlacement:
     model_path: Path
     translation: tuple[float, float, float]
     usd_scale: tuple[float, float, float]
+    rotation_z_deg: float = 0.0
 
 
 _lock = threading.RLock()
@@ -343,7 +344,7 @@ def render_world_glb_png(
             if not model.is_file() or model.suffix.lower() != ".glb":
                 raise ValueError(f"Generated GLB is unavailable for {placement.asset_id}.")
             stamp = model.stat().st_mtime_ns
-            cache_entries.append(f"{placement.asset_id}:{model}:{stamp}:{placement.translation}:{placement.usd_scale}")
+            cache_entries.append(f"{placement.asset_id}:{model}:{stamp}:{placement.translation}:{placement.usd_scale}:{placement.rotation_z_deg}")
         cache_key = "|".join(cache_entries)
 
         if _world_scene_cache is None or _world_scene_cache_key != cache_key:
@@ -363,6 +364,7 @@ def render_world_glb_png(
                     # USD (X, Y, Z) = glTF (X, -Z, Y) for our visual.usdc authoring.
                     asset.local.position = (usd_x, usd_z, -usd_y)
                     asset.local.scale = (usd_width, usd_height, usd_depth)
+                    asset.local.rotation = la.quat_from_euler((0.0, math.radians(placement.rotation_z_deg), 0.0), order="XYZ")
                     bounds = asset.get_world_bounding_box()
                     if bounds is None:
                         raise ValueError("GLB has no renderable bounds.")
