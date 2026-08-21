@@ -125,8 +125,10 @@ export function WorldEditorCanvas({
     orbit.dampingFactor = 0.09;
     orbit.screenSpacePanning = true;
     orbit.zoomToCursor = true;
-    orbit.rotateSpeed = -0.65;
-    orbit.panSpeed = 0.75;
+    // Positive rotate speed keeps drag direction matched to the cursor:
+    // drag up orbits up, drag right orbits right (a negative value inverts both).
+    orbit.rotateSpeed = 0.85;
+    orbit.panSpeed = 0.9;
     orbit.minDistance = 0.08;
     orbit.maxDistance = 120;
     orbit.mouseButtons.LEFT = THREE.MOUSE.ROTATE;

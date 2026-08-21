@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { Card, Progress } from "../components/ui/Card";
 import { StatCard } from "../components/ui/StatCard";
 import { Icon, type IconName } from "../components/ui/Icon";
@@ -30,7 +31,6 @@ export default function Sources() {
   const [photo, setPhoto] = useState(1);
   const [creating, setCreating] = useState(false);
   const [running, setRunning] = useState(false);
-  const [repairing, setRepairing] = useState(false);
 
   // Add-source form
   const domainRef = useRef<HTMLInputElement>(null);
@@ -72,24 +72,6 @@ export default function Sources() {
       toast.push("err", "Could not add source", e instanceof ApiError ? e.message : String(e));
     } finally {
       setCreating(false);
-    }
-  };
-
-  const repairCollector = async (approve = false) => {
-    if (!sel || sel.collector === "—") return;
-    if (!window.confirm(approve ? "Approve and save the pending Bright Data repair, then rerun this collector?" : "Start a billable Bright Data self-heal job for this collector?")) return;
-    setRepairing(true);
-    try {
-      const path = approve ? `/sources/${sel.id}/repair/approve` : `/sources/${sel.id}/repair`;
-      const body = approve ? {} : { prompt: "Repair the extractor so every row contains model, dimensions, source URL, and at least one product image." };
-      const { jobId } = await api.post<{ jobId: string }>(path, body);
-      toast.push("ok", approve ? "Repair approval queued" : "Self-heal queued", `${sel.collector} · job ${jobId}`);
-      refetch();
-      refetchDetail();
-    } catch (e) {
-      toast.push("err", "Repair request failed", e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setRepairing(false);
     }
   };
 
@@ -298,10 +280,7 @@ export default function Sources() {
                 <button className="btn btn-secondary btn-sm" onClick={() => toast.push("info", "Open in source", "External navigation requires the backend proxy")}>Open in source <Icon name="external" size={11} /></button>
                 <span className="grow" />
                 {sel.collector !== "—" && (
-                  <>
-                    <button className="btn btn-ghost btn-sm" onClick={() => repairCollector(false)} disabled={repairing}><Icon name="chip" size={12} /> Start self-heal</button>
-                    <button className="btn btn-secondary btn-sm" onClick={() => repairCollector(true)} disabled={repairing}><Icon name="check" size={12} /> Approve pending repair</button>
-                  </>
+                  <Link className="btn btn-secondary btn-sm" to="/scraper-repair"><Icon name="shield" size={12} /> Governed repair</Link>
                 )}
                 <button className="btn btn-ghost btn-sm" onClick={runCollector} disabled={running}>
                   <Icon name="refresh" size={12} className={running ? "spin" : undefined} /> {running ? "Queued…" : "Re-run collector"}

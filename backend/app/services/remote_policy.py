@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import base64
 import io
-import math
 import time
 import uuid
 from collections import deque
@@ -212,7 +211,7 @@ class RemotePolicyController:
         self.queue: deque[np.ndarray] = deque()
         self.policy_error: PolicyError | None = None
         try:
-            caps = self.client.probe()
+            self.client.probe()
             self.client.reset(self.episode_id, seed=0, environment_sha256=self.config.environment_sha256)
         except PolicyError as exc:
             self.policy_error = exc

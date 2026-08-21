@@ -34,6 +34,13 @@ def test_primary_read_contract() -> None:
             response = client.get(path)
             assert response.status_code == 200, (path, response.text)
         assert client.get("/api/skills/open-refrigerator").status_code == 404
+        legacy_agent = client.post("/api/agent/run", json={"skillId": "open-refrigerator"})
+        assert legacy_agent.status_code == 410
+        assert "legacy parameterized-skill agent is disabled" in legacy_agent.text
+        services = client.get("/api/observability/services").json()
+        canonical_agent = next(item for item in services if item["name"] == "curriculum-planner")
+        assert canonical_agent["kind"] == "agent-tool-service"
+        assert canonical_agent["status"] == "healthy"
 
 
 def test_write_only_secrets_survive_section_save() -> None:
@@ -115,7 +122,7 @@ def test_world_mutations_and_checks() -> None:
         assert client.post(f"/api/worlds/variants/{variant.json()['id']}/activate", json={}).status_code == 200
 
 
-def test_frontend_diagnostics_and_isaac_franka_fail_closed() -> None:
+def test_frontend_diagnostics_and_deferred_isaac_fail_closed() -> None:
     with TestClient(app) as client:
         recorded = client.post("/api/diagnostics/frontend-errors", json={
             "source": "react",
@@ -131,22 +138,16 @@ def test_frontend_diagnostics_and_isaac_franka_fail_closed() -> None:
         assert any(row["service"] == "frontend.react" for row in diagnostics.json()["events"])
 
         status = client.get("/api/simulation/isaac")
-        assert status.status_code == 200
-        assert status.json()["version"] == "5.1"
-        assert status.json()["franka"]["armDof"] == 7
-        assert status.json()["franka"]["fingerJoints"] == 2
+        assert status.status_code == 404
+        assert "deferred" in status.json()["detail"]
 
         franka = client.post("/api/robots/franka/isaac", json={})
-        assert franka.status_code == 201
-        assert franka.json()["armDof"] == 7
-        assert franka.json()["readiness"]["executable"] is False
+        assert franka.status_code == 404
 
         scene = client.get("/api/worlds/scene").json()
         if scene["placements"]:
             prepared = client.post("/api/simulation/isaac/prepare", json={})
-            assert prepared.status_code == 200, prepared.text
-            assert prepared.json()["prepared"] is True
-            assert prepared.json()["runtimeReady"] is status.json()["ready"]
+            assert prepared.status_code == 404
 
 
 def test_robot_import_camera_mapping_and_world_command_gate(monkeypatch) -> None:

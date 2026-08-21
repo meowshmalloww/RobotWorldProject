@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { Card } from "../components/ui/Card";
 import { StatCard } from "../components/ui/StatCard";
 import { Icon, type IconName } from "../components/ui/Icon";
@@ -6,11 +6,10 @@ import { StatusBadge } from "../components/ui/controls";
 import { LineChart } from "../components/charts/LineChart";
 import { downloadFile } from "../components/ui/Modal";
 import { useToast } from "../components/ui/Toast";
-import { api, ApiError } from "../lib/api";
 import { useApi } from "../lib/useApi";
 import { EmptyState, ErrorState, Skeleton } from "../lib/states";
 import { fmtPp } from "../lib/format";
-import type { EvalComparisonRow, Skill, Stat, TrainingRun } from "../data/types";
+import type { EvalComparisonRow, Stat, TrainingRun } from "../data/types";
 
 interface TrainingData {
   stats: Stat[];
@@ -39,13 +38,11 @@ interface LocalVlaStatus {
 }
 
 export default function Training() {
+  const nav = useNavigate();
   const toast = useToast();
   const { data, error, loading, refetch } = useApi<TrainingData>("/training");
   const { data: localVla, error: localVlaError, loading: localVlaLoading } = useApi<LocalVlaStatus>("/models/vla-jepa/status");
   const { data: robotData } = useApi<{ robots: { id: string; name: string; readiness: { executable: boolean; blockers: string[] } }[] }>("/robots");
-  // needed for the "run the agent" button when there is no decision yet
-  const { data: skillsData } = useApi<{ skills: Skill[] }>("/skills");
-  const [runningAgent, setRunningAgent] = useState(false);
 
   const runs = data?.runs ?? [];
   const agentDecision = data?.agentDecision ?? null;
@@ -57,28 +54,11 @@ export default function Training() {
     toast.push("ok", "Runs exported", `training-runs.csv · ${runs.length} rows`);
   };
 
-  const runAgent = async () => {
-    const skillId = skillsData?.skills[0]?.id;
-    if (!skillId) {
-      toast.push("err", "No skills available", "The agent needs at least one skill to analyze");
-      return;
-    }
-    setRunningAgent(true);
-    try {
-      const { jobId } = await api.post<{ jobId: string }>("/agent/run", { skillId });
-      toast.push("ok", "Agent iteration started", `Job ${jobId} · analyzing ${skillId}`);
-      setTimeout(refetch, 5000);
-    } catch (e) {
-      toast.push("err", "Agent failed to start", e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setRunningAgent(false);
-    }
-  };
-
   return (
     <div className="page">
       <div className="page-head">
         <div>
+          <div className="page-eyebrow">Policy · Checkpoints</div>
           <h1 className="page-title">Policy &amp; Evaluation</h1>
           <p className="page-sub">Review measured evaluations and checkpoint readiness. Training is intentionally disabled on this workstation.</p>
         </div>
@@ -247,11 +227,12 @@ export default function Training() {
         {/* right rail */}
         <div className="tr-right">
           {/* Agent decision */}
-          <Card title={<span className="row" style={{ gap: 7 }}><Icon name="agent" size={14} style={{ color: "var(--purple)" }} /> Agent Decision</span>} info>
+          <Card title={<span className="row" style={{ gap: 7 }}><Icon name="agent" size={14} style={{ color: "var(--purple)" }} /> Legacy decision history</span>} info>
             {loading && !data ? (
               <Skeleton rows={4} />
             ) : agentDecision ? (
               <>
+                <div className="callout" style={{ marginBottom: 9 }}>This read-only record predates the canonical failure, coverage, and scenario toolchain. It is not executed as the current agent pipeline.</div>
                 <div className="small t2" style={{ marginBottom: 8 }}>{agentDecision.title}</div>
                 <div className="card" style={{ background: "var(--bg-panel-2)", padding: "10px 12px" }}>
                   <div className="row" style={{ gap: 8 }}>
@@ -289,9 +270,9 @@ export default function Training() {
             ) : (
               <div className="empty-note col center" style={{ gap: 8, padding: 18 }}>
                 <Icon name="agent" size={18} style={{ color: "var(--purple)" }} />
-                <span>No agent decision yet — run the agent to analyze skill gaps.</span>
-                <button className="btn btn-primary btn-sm" onClick={runAgent} disabled={runningAgent}>
-                  <Icon name="play" size={12} /> {runningAgent ? "Starting…" : "Run the agent"}
+                <span>No legacy decision record. Use the canonical measured curriculum workflow.</span>
+                <button className="btn btn-primary btn-sm" onClick={() => nav("/failure-analysis")}>
+                  <Icon name="workflow" size={12} /> Open failure analysis
                 </button>
               </div>
             )}

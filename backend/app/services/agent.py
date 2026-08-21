@@ -19,7 +19,7 @@ from ..db import SessionLocal
 from ..models import AgentDecision, Evaluation, Skill
 from ..telemetry import span
 from ..util import new_id
-from . import evaluator, events, llm, port, signoz
+from . import evaluator, events, llm, signoz
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ async def analyze_failures(skill_id: str) -> dict[str, Any]:
     try:
         cloud = await signoz.search_traces(
             minutes=180,
-            filter_expr=f"service.name = 'robotworld-backend' AND name = 'robot.evaluation.episode'",
+            filter_expr="service.name = 'robotworld-backend' AND name = 'robot.evaluation.episode'",
             limit=60,
         )
         # Do not depend on a single SigNoz response envelope version; retain a
@@ -148,7 +148,7 @@ async def run_once(skill_id: str, *, episodes_per_family: int = 4) -> dict[str, 
             weakest = analysis.get("weakest_family") or "nominal"
             with span("worlds.generate", family=weakest):
                 async with SessionLocal() as session:
-                    fams = await evaluator.ensure_families(session, skill_id)
+                    await evaluator.ensure_families(session, skill_id)
                 # new variants enter through the next evaluation's sampling
 
             # 5. Training is intentionally disabled on this workstation. Keep
@@ -173,16 +173,6 @@ async def run_once(skill_id: str, *, episodes_per_family: int = 4) -> dict[str, 
             summary = f"{skill_name}: {before['success_rate']:.0f}% measured asset-validation success · {plan['title']} · training disabled"
             _state.update(lastSummary=summary)
             result = {"before": before, "after": after, "decision": plan, "delta_pp": delta, "trainingPerformed": False}
-            try:
-                with span("port.publish_result", skill=skill_id):
-                    await port.sync_curriculum_result(skill_id, skill_name, result)
-            except port.NotConfigured:
-                pass
-            except port.PortError:
-                # Port is an external control-plane projection. The completed
-                # local evaluation/training result remains valid and persisted.
-                log.exception("Port result sync failed")
-                events.publish("alert", "Port sync failed", "The local curriculum result was kept and can be synced later.")
             events.publish("agent", "Curriculum iteration complete", summary, skill=skill_id)
             return result
     finally:

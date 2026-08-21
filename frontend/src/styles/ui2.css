@@ -1,0 +1,333 @@
+/* ==========================================================================
+   RobotWorld UI refresh layer (2026-08)
+   Additive redesign: richer headers, calmer surfaces, better motion.
+   Loaded after components.css / pages.css so it can refine, not break.
+   ========================================================================== */
+
+/* ---- Page headers ---------------------------------------------------------- */
+.page-head { margin-bottom: 16px; }
+.page-eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.page-eyebrow::before {
+  content: "";
+  width: 14px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+  opacity: 0.85;
+}
+.page-title { font-size: 20px; font-weight: 660; }
+.page-sub { max-width: 720px; line-height: 1.45; }
+
+/* ---- Entrance motion -------------------------------------------------------- */
+@keyframes rw-rise {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: none; }
+}
+.rise { animation: rw-rise 200ms var(--ease) both; }
+.rise-1 { animation-delay: 20ms; }
+.rise-2 { animation-delay: 55ms; }
+.rise-3 { animation-delay: 90ms; }
+.rise-4 { animation-delay: 125ms; }
+
+@keyframes rw-pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
+.pulse-dot { animation: rw-pulse-dot 1.6s ease-in-out infinite; }
+
+/* ---- Cards ------------------------------------------------------------------- */
+.card { transition: border-color 140ms var(--ease), background 140ms var(--ease); }
+.card:hover { border-color: var(--border-strong); }
+.card.clickable { cursor: pointer; }
+.card.clickable:hover { background: var(--bg-panel-2); transform: none; }
+
+/* Section label used across redesigned pages */
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 18px 0 8px;
+}
+.section-head:first-child { margin-top: 0; }
+.section-head .section-title {
+  font-size: 11px;
+  font-weight: 680;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+.section-head .section-line { flex: 1; height: 1px; background: var(--border); }
+.section-head .section-meta { font-size: var(--fs-micro); color: var(--text-3); font-family: var(--font-mono); }
+
+/* ---- Hero band (Overview) ------------------------------------------------------ */
+.hero-band {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background:
+    radial-gradient(600px 220px at 12% -30%, rgba(255, 255, 255, 0.075), transparent 60%),
+    radial-gradient(500px 200px at 90% 130%, rgba(98, 154, 154, 0.10), transparent 60%),
+    linear-gradient(180deg, var(--bg-panel-2), var(--bg-panel));
+  padding: 18px 20px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+.hero-band .hero-title { font-size: 17px; font-weight: 680; letter-spacing: -0.01em; }
+.hero-band .hero-sub { color: var(--text-2); font-size: var(--fs-body); margin-top: 4px; max-width: 640px; line-height: 1.5; }
+.hero-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+
+/* Pipeline flow strip */
+.flow-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+.flow-step {
+  position: relative;
+  background: var(--bg-panel);
+  padding: 13px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: background 130ms var(--ease);
+}
+.flow-step:hover { background: var(--bg-panel-2); }
+.flow-step .flow-n {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-3);
+  opacity: 0.8;
+}
+.flow-step .flow-title { font-size: 12px; font-weight: 640; display: flex; align-items: center; gap: 7px; }
+.flow-step .flow-detail { font-size: var(--fs-micro); color: var(--text-3); line-height: 1.4; }
+.flow-step .flow-ico {
+  width: 24px; height: 24px; border-radius: 6px; flex: none;
+  display: grid; place-items: center;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ---- Tabs: scrollable strip (fixes clipped tabs in narrow panels) -------------- */
+.tabs.scrollable {
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex-wrap: nowrap;
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-panel-3) transparent;
+}
+.tabs.scrollable::-webkit-scrollbar { height: 5px; }
+.tabs.scrollable::-webkit-scrollbar-thumb { background: var(--bg-panel-3); border-radius: 3px; }
+.tabs.scrollable button { flex: none; }
+
+/* ---- Resize handles: bigger hit area, visible affordance ------------------------ */
+.resize-v, .resize-h { position: relative; z-index: 5; flex: none; }
+.resize-v { width: 5px; margin: 0 -2px; cursor: col-resize; }
+.resize-h { height: 5px; margin: -2px 0; cursor: row-resize; }
+.resize-v::after, .resize-h::after {
+  content: "";
+  position: absolute;
+  border-radius: 2px;
+  background: transparent;
+  transition: background 120ms var(--ease);
+}
+.resize-v::after { left: 2px; right: 2px; top: 50%; height: 26px; transform: translateY(-50%); }
+.resize-h::after { top: 2px; bottom: 2px; left: 50%; width: 26px; transform: translateX(-50%); }
+.resize-v:hover::after, .resize-v.dragging::after { background: var(--accent-line); }
+.resize-h:hover::after, .resize-h.dragging::after { background: var(--accent-line); }
+
+/* Panel open/close animation (suppressed while actively resizing) */
+.world-editor .unity-panel,
+.world-editor .unity-inspector { transition: width 150ms var(--ease); }
+.world-editor .unity-shelf { transition: height 150ms var(--ease); }
+body.col-resizing .world-editor .unity-panel,
+body.col-resizing .world-editor .unity-inspector { transition: none; }
+body.row-resizing .world-editor .unity-shelf { transition: none; }
+
+/* ---- Worlds dockbar polish ------------------------------------------------------- */
+.unity-dockbar { gap: 9px !important; }
+.unity-group { box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02); }
+.unity-dockbar .btn.active { background: var(--accent-soft); color: var(--text-1); box-shadow: inset 0 0 0 1px var(--accent-line); }
+
+/* Inspector body: long values must wrap, never push the panel wider */
+.unity-inspector .kv-v { overflow-wrap: anywhere; min-width: 0; }
+.unity-inspector { min-width: 0; }
+.inspector-agent { min-width: 0; }
+.inspector-agent .console-line span:last-child { overflow-wrap: anywhere; }
+
+/* ---- Stat cards --------------------------------------------------------------------- */
+.stat-card { transition: border-color 140ms var(--ease), transform 140ms var(--ease); }
+.stat-card:hover { border-color: var(--border-strong); }
+
+/* ---- Tables ---------------------------------------------------------------------------- */
+.table tbody tr { transition: background 90ms var(--ease); }
+.table tbody tr.rowlink:hover { background: var(--bg-hover); }
+.table tbody tr.rowlink.selected { background: var(--accent-soft); }
+
+/* ---- Buttons: primary gets a subtle top light ------------------------------------------- */
+.btn-primary { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25); }
+.btn-primary:hover { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35); }
+.btn:active { transform: translateY(0.5px); }
+
+/* ---- Callouts ------------------------------------------------------------------------------ */
+.callout { border-radius: var(--r-md); }
+
+/* ---- Deployment target cards (Models page) --------------------------------------------------- */
+.deploy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }
+.deploy-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--bg-panel);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 140ms var(--ease), background 140ms var(--ease);
+}
+.deploy-card:hover { border-color: var(--border-strong); background: var(--bg-panel-2); }
+.deploy-card.selected { border-color: var(--accent-line); background: var(--accent-soft); }
+.deploy-card .deploy-head { display: flex; align-items: center; gap: 9px; }
+.deploy-card .deploy-ico {
+  width: 30px; height: 30px; border-radius: 8px; flex: none;
+  display: grid; place-items: center;
+  background: var(--bg-panel-3);
+  color: var(--text-1);
+}
+.deploy-card .deploy-title { font-size: 12.5px; font-weight: 650; }
+.deploy-card .deploy-sub { font-size: var(--fs-micro); color: var(--text-3); }
+.deploy-card .deploy-body { font-size: var(--fs-small); color: var(--text-2); line-height: 1.45; }
+
+/* ---- Key/value rows: tighter rhythm ---------------------------------------------------------- */
+.kv-row { gap: 10px; }
+.kv-k { flex: none; }
+
+/* ---- Settings: wider content column, sticky nav ---------------------------------------------- */
+.st-layout { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 12px; align-items: start; }
+.st-nav { position: sticky; top: 0; display: flex; flex-direction: column; gap: 2px; }
+.st-nav button {
+  display: flex; align-items: center; gap: 9px;
+  height: 32px; padding: 0 11px;
+  border-radius: var(--r-md);
+  color: var(--text-2); font-size: var(--fs-body); font-weight: 520;
+  text-align: left;
+  transition: background 90ms var(--ease), color 90ms var(--ease);
+}
+.st-nav button:hover { background: var(--bg-hover); color: var(--text-1); }
+.st-nav button.on { background: var(--accent-soft); color: var(--text-1); box-shadow: inset 0 0 0 1px var(--accent-line); }
+.st-stack { display: flex; flex-direction: column; gap: 10px; }
+@media (max-width: 900px) {
+  .st-layout { grid-template-columns: 1fr; }
+  .st-nav { position: static; flex-direction: row; flex-wrap: wrap; }
+}
+
+/* ---- Assets: automation banner ------------------------------------------------------------------ */
+.auto-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: linear-gradient(90deg, var(--teal-soft), transparent 55%), var(--bg-panel);
+  padding: 12px 14px;
+}
+.auto-banner .auto-ico {
+  width: 32px; height: 32px; border-radius: 9px; flex: none;
+  display: grid; place-items: center;
+  background: var(--teal-soft);
+  color: var(--teal);
+  border: 1px solid rgba(98, 154, 154, 0.25);
+}
+
+/* ---- Evidence / records timeline ------------------------------------------------------------------ */
+.rec-row { transition: background 90ms var(--ease); }
+.rec-row:hover { background: var(--bg-hover); }
+
+/* ---- Empty states: softer --------------------------------------------------------------------------- */
+.empty-note { border-radius: var(--r-md); }
+
+/* ---- Focus visibility --------------------------------------------------------------------------------- */
+.btn:focus-visible, .tabs button:focus-visible, .input:focus-visible, .select:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 1px;
+}
+
+/* ---- Scrollbar polish for panels ---------------------------------------------------------------------- */
+.unity-panel ::-webkit-scrollbar, .unity-inspector ::-webkit-scrollbar, .unity-shelf ::-webkit-scrollbar { width: 8px; }
+
+/* ---- Observation: metric tiles ------------------------------------------------------------------------ */
+.metric-tile {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-panel);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.metric-tile .metric-v { font-size: 17px; font-weight: 660; font-family: var(--font-mono); }
+.metric-tile .metric-k { font-size: var(--fs-micro); color: var(--text-3); text-transform: uppercase; letter-spacing: 0.07em; }
+
+/* ---- Robot cards ---------------------------------------------------------------------------------------- */
+.robot-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--bg-panel);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  transition: border-color 140ms var(--ease), background 140ms var(--ease);
+}
+.robot-card:hover { border-color: var(--border-strong); }
+.robot-card.selected { border-color: var(--accent-line); background: var(--accent-soft); }
+
+/* ---- Dropdown menu popover ------------------------------------------------------------------ */
+.menu-pop {
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-pop);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  animation: rw-rise 120ms var(--ease) both;
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border-radius: 5px;
+  font-size: var(--fs-body);
+  color: var(--text-1);
+  text-align: left;
+  white-space: nowrap;
+  transition: background 80ms var(--ease);
+}
+.menu-item:hover { background: var(--bg-hover); }
+.menu-item:disabled { opacity: 0.45; pointer-events: none; }
+
+/* ---- Reduced motion --------------------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .rise, .pulse-dot { animation: none; }
+  .world-editor .unity-panel, .world-editor .unity-inspector, .world-editor .unity-shelf { transition: none; }
+}

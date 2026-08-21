@@ -30,8 +30,8 @@ class BrightDataError(RuntimeError):
 class NotConfigured(BrightDataError):
     def __init__(self) -> None:
         super().__init__(
-            "Bright Data is not configured — set the API key in Settings → Integrations "
-            "(or BRIGHTDATA_API_KEY in backend/.env)."
+            "Bright Data is not configured; set the API token in Settings > Integrations "
+            "or BRIGHTDATA_API_TOKEN in backend/.env."
         )
 
 
@@ -235,7 +235,22 @@ async def dca_dataset(collection_id: str) -> tuple[bool, list[dict] | dict]:
         return False, r.json() if r.text else {}
     if r.status_code >= 400:
         raise BrightDataError(f"DCA dataset failed ({r.status_code}): {r.text[:300]}")
-    return True, r.json()
+    try:
+        payload = r.json()
+    except ValueError as exc:
+        raise BrightDataError("DCA dataset returned non-JSON content.") from exc
+    # Current Scraper Studio returns status objects such as
+    # {"status":"building"} with HTTP 200, and returns a JSON array only
+    # when the snapshot is ready.
+    if isinstance(payload, list):
+        return True, payload
+    if isinstance(payload, dict):
+        status = str(payload.get("status") or payload.get("state") or "").lower()
+        if status in {"failed", "error", "cancelled", "canceled"}:
+            detail = str(payload.get("error") or payload.get("message") or status)[:300]
+            raise BrightDataError(f"DCA dataset entered terminal state '{status}': {detail}")
+        return False, payload
+    raise BrightDataError("DCA dataset response must be a status object or JSON array.")
 
 
 async def dca_run_and_wait(collector: str, inputs: list[dict], *, timeout_s: float = 180.0) -> list[dict]:

@@ -3,13 +3,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 /**
  * Drag handle between docked panels. `onDelta` receives the horizontal
  * (or vertical) pixel delta from drag start; the parent owns the size state.
+ *
+ * Move events are consumed once at the window level. Attaching a React
+ * onPointerMove as well double-fired every delta (panels resized at 2x the
+ * cursor speed and felt buggy), so the element itself only owns capture.
  */
 export function ResizeHandle({
   dir,
   onDrag,
+  onReset,
 }: {
   dir: "col" | "row";
   onDrag: (delta: number) => void;
+  onReset?: () => void;
 }) {
   const [dragging, setDragging] = useState(false);
   const start = useRef(0);
@@ -57,25 +63,13 @@ export function ResizeHandle({
     [dir, stopDrag],
   );
 
-  const onPointerMove = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>) => {
-      if (!active.current) return;
-      const pos = dir === "col" ? e.clientX : e.clientY;
-      try {
-        onDrag(pos - start.current);
-      } catch (error) {
-        console.error("Resize drag handler failed:", error);
-        stopDrag();
-        return;
-      }
-      start.current = pos;
-    },
-    [dir, onDrag, stopDrag],
-  );
-
   const onPointerUp = useCallback(() => stopDrag(), [stopDrag]);
 
-  const onPointerLeave = useCallback(() => stopDrag(), [stopDrag]);
+  const onPointerLeave = useCallback(() => {
+    // Pointer capture keeps move events targeting this element even outside
+    // its bounds; only drop the drag when capture was never granted.
+    if (pointerId.current === null) stopDrag();
+  }, [stopDrag]);
 
   useEffect(() => {
     if (!dragging) return;
@@ -118,12 +112,13 @@ export function ResizeHandle({
       ref={handleRef}
       className={`resize-${dir === "col" ? "v" : "h"} ${dragging ? "dragging" : ""}`}
       onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerCancel}
       onPointerLeave={onPointerLeave}
+      onDoubleClick={onReset}
       role="separator"
       aria-orientation={dir === "col" ? "vertical" : "horizontal"}
+      title={onReset ? "Drag to resize · double-click to reset" : "Drag to resize"}
       style={{ touchAction: "none" }}
     />
   );
@@ -151,23 +146,39 @@ export function PanelRail({
   );
 }
 
-/** Panel width state with clamp. */
-export function usePanelSize(initial: number, min: number, max: number, storageKey?: string) {
+/**
+ * Panel width/height state with clamp. Sizes are additionally bounded against
+ * the current viewport (55% of the window on the panel's axis) so a persisted
+ * large panel can never push the viewport or neighbouring panels off-screen.
+ */
+export function usePanelSize(initial: number, min: number, max: number, storageKey?: string, axis: "col" | "row" = "col") {
+  const viewportMax = useCallback(
+    (requested: number) => {
+      const limit = axis === "col" ? Math.floor(window.innerWidth * 0.55) : Math.floor(window.innerHeight * 0.55);
+      return Math.max(min, Math.min(max, limit, requested));
+    },
+    [axis, max, min],
+  );
   const [size, setSize] = useState(() => {
-    if (!storageKey) return initial;
+    if (!storageKey) return Math.min(initial, viewportMax(max));
     const stored = Number(window.localStorage.getItem(storageKey));
-    return Number.isFinite(stored) ? Math.max(min, Math.min(max, stored)) : initial;
+    return Number.isFinite(stored) && stored > 0 ? viewportMax(stored) : Math.min(initial, viewportMax(max));
   });
   const apply = useCallback(
     (next: number | ((prev: number) => number)) =>
       setSize((prev) => {
         const value = typeof next === "function" ? next(prev) : next;
-        return Math.max(min, Math.min(max, value));
+        return viewportMax(value);
       }),
-    [min, max],
+    [viewportMax],
   );
   useEffect(() => {
     if (storageKey) window.localStorage.setItem(storageKey, String(size));
   }, [size, storageKey]);
+  useEffect(() => {
+    const onResize = () => setSize((prev) => viewportMax(prev));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [viewportMax]);
   return [size, apply] as const;
 }

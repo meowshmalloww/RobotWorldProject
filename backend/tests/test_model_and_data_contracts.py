@@ -167,3 +167,17 @@ def test_brightdata_rejects_wrapped_upstream_failure(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(brightdata, "_send", send)
     with pytest.raises(brightdata.BrightDataError, match=r"upstream target failed \(403\)"):
         asyncio.run(brightdata.google_search("robot refrigerator"))
+
+
+def test_brightdata_dataset_200_status_object_is_not_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def creds():
+        return {"key": "secret", "serp_zone": "serp_api1", "unlocker_zone": "unlocker"}
+
+    async def send(method: str, url: str, **kwargs):
+        return httpx.Response(200, json={"status": "building"})
+
+    monkeypatch.setattr(brightdata, "_creds", creds)
+    monkeypatch.setattr(brightdata, "_send", send)
+    ready, payload = asyncio.run(brightdata.dca_dataset("j_in_progress"))
+    assert ready is False
+    assert payload == {"status": "building"}

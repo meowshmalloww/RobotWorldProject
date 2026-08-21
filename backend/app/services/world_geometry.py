@@ -15,6 +15,11 @@ from typing import Any
 import numpy as np
 import trimesh
 
+# If per-axis fitting would stretch/compress any axis this many times more than
+# another, the target box disagrees with the generated mesh's shape; preserve
+# the mesh's native proportions instead of distorting it.
+MAX_ASPECT_SKEW = 3.0
+
 
 @lru_cache(maxsize=128)
 def _bounds_for_stamp(path_text: str, modified_ns: int) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
@@ -34,6 +39,12 @@ def measured_fit(model_path: Path, target_width: float, target_height: float, ta
 
     glTF uses Y-up and the authored USD layer maps ``(x, y, z)`` to
     ``(x, -z, y)``.  Consequently USD scale is ordered width/depth/height.
+
+    Per-axis fitting matches the authored real-world dimensions, but a generated
+    mesh whose native aspect ratio disagrees with those dimensions gets crushed
+    (e.g. a wide blob fitted to a slim faucet becomes paper-thin).  When the
+    per-axis scales disagree by more than ``MAX_ASPECT_SKEW`` we fall back to a
+    height-anchored uniform scale so the mesh keeps its generated proportions.
     """
     path = model_path.resolve()
     stat = path.stat()
@@ -44,6 +55,14 @@ def measured_fit(model_path: Path, target_width: float, target_height: float, ta
         max(0.001, float(target_height)) / glb_extents[1],
         max(0.001, float(target_depth)) / glb_extents[2],
     )
+    # Guard against extreme aspect-ratio distortion.  A large spread between the
+    # per-axis scales means the target box and the generated mesh disagree about
+    # the object's shape; stretching the mesh to match would make it look wrong.
+    max_scale = max(glb_scale)
+    min_scale = min(glb_scale)
+    if max_scale / max(min_scale, 1e-9) > MAX_ASPECT_SKEW:
+        uniform = glb_scale[1]  # anchor on height (glTF Y), the trusted axis
+        glb_scale = (uniform, uniform, uniform)
     usd_scale = (glb_scale[0], glb_scale[2], glb_scale[1])
     local_usd_low = (
         low[0] * usd_scale[0],

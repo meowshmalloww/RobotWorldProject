@@ -123,7 +123,6 @@ def door_asset_xml(spec: dict[str, Any]) -> str:
     hinge_x = -w / 2 if hinge_side == "left" else w / 2 - door_w
     panel_cx = door_w / 2  # panel extends +X from hinge
     handle = spec.get("handle", {})
-    handle_x = float(handle.get("offset_from_edge", 0.06))
     handle_xml = _handle_xml(handle, door_w, door_t, door_cy)
 
     return f"""

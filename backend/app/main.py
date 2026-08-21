@@ -18,16 +18,17 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import mujoco
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, select
 
 from . import __version__
 from .bootstrap import seed_definitions
-from .config import ASSETS_DIR, BASE_DIR, WORLDS_DIR, env
+from .config import ASSETS_DIR, BASE_DIR, DATA_DIR, ROBOTS_DIR, WORLDS_DIR, env
+from .contracts import AgentToolCall, ApprovalDecision, AutonomousCurriculumRunRequest, BrightDataCollectionRequest, CompiledAssetOracleRequest, CompiledAssetVlaEvaluationRequest, CurriculumPlanRequest, FrankaRegistrationRequest, ModelRegistrationCreate, ModelValidationRequest, ObjectRequest, OracleEvaluationRequest, RecordedEvidenceImport, RigidAssetCompileRequest, ScraperCollectorVersionCreate, ScraperRepairCreate, ScraperRepairDecision, ScraperRepairDemoRequest, ScraperRepairDraftSubmission, ScraperRepairRollback, VlaNormalizedAction
 from .db import SessionLocal, init_db
 from .models import (
     AgentDecision,
@@ -40,7 +41,6 @@ from .models import (
     MetricPoint,
     RepairEvent,
     Scenario,
-    ScenarioFamily,
     Skill,
     Source,
     Span,
@@ -50,13 +50,17 @@ from .models import (
 )
 from .telemetry import drain_loop, init_otel, signoz_exporting, span
 from .util import fmt_duration, new_id, rel_time
-from .services import agent, asset_evidence, brightdata, catalog, demo_scenarios, evaluator, events, isaac_sim, live, llm, local_vla, model_registry, performance, pipeline, port, robot_registry, settings_store, simcore, trellis, usda, vulkan_renderer, world_geometry
+from .services import agent, agent_tools, asset_evidence, autonomous_curriculum, brightdata, catalog, command_store, control_catalog, curriculum_catalog, demo_scenarios, evaluation_catalog, evaluator, events, evidence_catalog, evidence_collection, isaac_sim, live, llm, local_vla, model_registry, performance, pipeline, port, rigid_asset_compiler, robot_catalog, robot_registry, scraper_repair, scraper_repair_demo, settings_store, signoz, simcore, trellis, usda, vla_bridge, vla_policy_worker, vulkan_renderer, world_geometry
 from .services.remote_policy import PolicyClient, PolicyConfig, PolicyError
 
 log = logging.getLogger(__name__)
 STARTED_AT = time.monotonic()
 _tasks: set[asyncio.Task] = set()
 HIDDEN_LEGACY_SKILLS = {"open-refrigerator"}
+DEFERRED_ISAAC_ENABLED = os.environ.get("ROBOTWORLD_ENABLE_DEFERRED_ISAAC", "").lower() in {"1", "true", "yes"}
+DEFERRED_PORT_ENABLED = os.environ.get("ROBOTWORLD_ENABLE_DEFERRED_PORT", "").lower() in {"1", "true", "yes"}
+LEGACY_SKILL_AGENT_ENABLED = os.environ.get("ROBOTWORLD_ENABLE_LEGACY_SKILL_AGENT", "").lower() in {"1", "true", "yes"}
+LEGACY_SOURCE_REPAIR_ENABLED = os.environ.get("ROBOTWORLD_ENABLE_LEGACY_SOURCE_REPAIR", "").lower() in {"1", "true", "yes"}
 
 
 class AgentRunIn(BaseModel):
@@ -182,13 +186,6 @@ async def _integration_config() -> dict[str, Any]:
     model_base = str(flat.get("models.openaiBaseUrl") or "").lower()
     local_model = model_base.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]"))
     return {
-        "port": bool(
-            flat.get("integrations.port.enabled")
-            and (
-                flat.get("integrations.port.token")
-                or (flat.get("integrations.port.clientId") and flat.get("integrations.port.clientSecret"))
-            )
-        ),
         "brightdata": bool(flat.get("integrations.brightdata.enabled") and flat.get("integrations.brightdata.apiKey")),
         "signoz": bool(flat.get("integrations.signoz.enabled") and flat.get("integrations.signoz.endpoint")),
         "signozQuery": bool(flat.get("integrations.signoz.queryEndpoint") and flat.get("integrations.signoz.apiKey")),
@@ -199,23 +196,37 @@ async def _integration_config() -> dict[str, Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    reconciled_workers = await control_catalog.reconcile_local_worker_state()
+    reconciled_scenarios = await curriculum_catalog.reconcile_incomplete_executions()
+    resumed_evidence_collections = await evidence_collection.resume_incomplete()
+    resumed_autonomous_runs = await autonomous_curriculum.resume_incomplete()
     await seed_definitions()
     flat = await settings_store.get_flat()
     init_otel(
         str(flat.get("integrations.signoz.endpoint") or "") if flat.get("integrations.signoz.enabled") else None,
-        str(flat.get("integrations.signoz.ingestionKey") or "") if flat.get("integrations.signoz.enabled") else None,
     )
     stop = asyncio.Event()
     drain_task = asyncio.create_task(drain_loop(stop), name="telemetry-drain")
     app.state.telemetry_stop = stop
     log.info("RobotWorld API %s started on %s:%s", __version__, env.host, env.port)
+    if reconciled_workers:
+        log.warning("Reconciled %s stale local model worker registration(s) to AVAILABLE", reconciled_workers)
+    if reconciled_scenarios:
+        log.warning("Reconciled %s interrupted scenario execution(s) to retryable PLANNED state", reconciled_scenarios)
+    if resumed_evidence_collections:
+        log.warning("Resumed %s durable evidence collection run(s)", resumed_evidence_collections)
+    if resumed_autonomous_runs:
+        log.warning("Resumed %s durable autonomous curriculum run(s)", resumed_autonomous_runs)
     try:
         yield
     finally:
+        await autonomous_curriculum.shutdown()
+        await evidence_collection.shutdown()
         for task in tuple(_tasks):
             task.cancel()
         if _tasks:
             await asyncio.gather(*_tasks, return_exceptions=True)
+        await asyncio.to_thread(vla_policy_worker.stop)
         stop.set()
         await drain_task
 
@@ -267,7 +278,6 @@ async def _health() -> dict[str, Any]:
         "simulation": {"engine": "MuJoCo", "version": mujoco.__version__, "timestepHz": 500},
         "signoz": "exporting" if signoz_exporting() else "not_configured" if not configured["signoz"] else "restart_required",
         "brightdata": "configured" if configured["brightdata"] else "not_configured",
-        "port": "configured" if configured["port"] else "not_configured",
         "openai": provider["status"] if configured["model"] else "not_configured",
         "modelProvider": provider,
     }
@@ -521,6 +531,11 @@ async def run_demo_scenario(scenario_id: str, payload: DemoRunIn = DemoRunIn()):
 
 @app.post("/api/agent/run", status_code=202)
 async def run_agent(payload: AgentRunIn):
+    if not LEGACY_SKILL_AGENT_ENABLED:
+        raise HTTPException(
+            410,
+            "The legacy parameterized-skill agent is disabled. Use the canonical failure-analysis, curriculum, and scenario agent tools.",
+        )
     async with SessionLocal() as session:
         if await session.get(Skill, payload.skillId) is None:
             raise HTTPException(404, "Skill not found")
@@ -529,6 +544,41 @@ async def run_agent(payload: AgentRunIn):
     except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
     return {"jobId": job_id}
+
+
+@app.get("/api/agent/tools")
+async def agent_tool_definitions():
+    """Return versioned JSON Schemas for the server-side agent control surface."""
+    return {"tools": agent_tools.definitions()}
+
+
+@app.get("/api/agent/tool-calls")
+async def agent_tool_calls(limit: int = Query(default=100, ge=1, le=200)):
+    return {"toolCalls": await agent_tools.list_calls(limit)}
+
+
+@app.post("/api/agent/approvals", status_code=201)
+async def create_agent_approval(payload: ApprovalDecision):
+    try:
+        return await agent_tools.create_approval(payload)
+    except agent_tools.UnknownAgentTool as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except agent_tools.AgentToolError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/agent/tools/invoke")
+async def invoke_agent_tool(payload: AgentToolCall):
+    try:
+        return await agent_tools.invoke(payload)
+    except agent_tools.UnknownAgentTool as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except agent_tools.AgentToolAuthorizationError as exc:
+        raise HTTPException(403, {"message": str(exc), "toolCallId": exc.tool_call_id}) from exc
+    except agent_tools.AgentToolExecutionError as exc:
+        raise HTTPException(409, {"message": str(exc), "toolCallId": exc.tool_call_id}) from exc
+    except agent_tools.AgentToolError as exc:
+        raise HTTPException(422, {"message": str(exc), "toolCallId": exc.tool_call_id}) from exc
 
 
 @app.post("/api/skills/{skill_id}/generate-worlds", status_code=202)
@@ -575,6 +625,51 @@ async def assets_list():
             {"label": "Blocked", "value": str(sum(row["status"] == "blocked" for row in assets)), "icon": "warning", "tint": "amber", "foot": "inspect compile output"},
         ],
     }
+
+
+@app.get("/api/asset-versions")
+async def compiled_asset_versions_list(limit: int = Query(default=100, ge=1, le=500)):
+    """List canonical immutable compiler outputs separately from legacy builds."""
+    return {"assetVersions": await rigid_asset_compiler.list_versions(limit)}
+
+
+@app.post("/api/asset-versions/rigid", status_code=201)
+async def compile_rigid_asset_version(
+    payload: RigidAssetCompileRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await rigid_asset_compiler.compile_rigid(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Evidence bundle not found.") from exc
+    except command_store.CommandConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (ValueError, OSError, rigid_asset_compiler.AssetCompileError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/asset-versions/{version_id}")
+async def compiled_asset_version_get(version_id: str):
+    try:
+        return {"assetVersion": await rigid_asset_compiler.get_version(version_id)}
+    except KeyError as exc:
+        raise HTTPException(404, "Compiled asset version not found.") from exc
+
+
+@app.get("/api/asset-versions/{version_id}/previews/drop-settled.png")
+async def compiled_asset_drop_preview(version_id: str):
+    try:
+        row = await rigid_asset_compiler.get_version(version_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Compiled asset version not found.") from exc
+    root = (DATA_DIR / row["artifactRoot"]).resolve()
+    preview = (root / "previews" / "drop_settled.png").resolve()
+    if not root.is_relative_to(ASSETS_DIR.resolve()) or not preview.is_relative_to(root) or not preview.is_file():
+        raise HTTPException(404, "Drop-settle preview is unavailable.")
+    return FileResponse(preview, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/assets/build", status_code=202)
@@ -1367,11 +1462,518 @@ async def vla_jepa_status():
 
 @app.get("/api/robots")
 async def robots_list():
-    return {"robots": await asyncio.to_thread(robot_registry.list_all), "accepted": sorted(robot_registry.ALLOWED), "maxBytes": robot_registry.MAX_BYTES}
+    files = await asyncio.to_thread(robot_registry.list_all)
+    if not DEFERRED_ISAAC_ENABLED:
+        files = [row for row in files if not str(row.get("format") or "").startswith("isaac")]
+    registrations = await robot_catalog.list_registered()
+    registration_by_id = {row["id"]: row for row in registrations}
+    for row in files:
+        if row["id"] in registration_by_id:
+            row["registration"] = registration_by_id[row["id"]]
+    return {
+        "robots": files,
+        "registrations": registrations,
+        "accepted": sorted(robot_registry.ALLOWED),
+        "maxBytes": robot_registry.MAX_BYTES,
+        "defaultBackend": "mujoco",
+        "deferredBackends": ["isaac_sim"],
+    }
+
+
+@app.post("/api/robots/franka/mujoco", status_code=201)
+async def register_mujoco_franka(
+    payload: FrankaRegistrationRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        result = await robot_catalog.register_franka(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except robot_catalog.RobotConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    events.publish("robot", "Franka validated", "Pinned MuJoCo Menagerie runtime and two camera views validated", robot=result.get("result", {}).get("robot", {}).get("id"))
+    return result
+
+
+@app.post("/api/robots/{robot_id}/activate")
+async def activate_registered_robot(
+    robot_id: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await robot_catalog.activate_robot(
+            robot_id,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Robot registration not found.") from exc
+    except robot_catalog.RobotConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/robots/{robot_id}/previews/{camera}.png")
+async def robot_camera_preview(robot_id: str, camera: str):
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", robot_id) or camera not in {"front", "wrist"}:
+        raise HTTPException(404, "Robot camera preview not found.")
+    root = (ROBOTS_DIR / robot_id).resolve()
+    preview = (root / "previews" / f"{camera}.png").resolve()
+    if root.parent != ROBOTS_DIR.resolve() or root not in preview.parents or not preview.is_file():
+        raise HTTPException(404, "Robot camera preview not found.")
+    return FileResponse(preview, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/world-templates")
+async def world_templates_list():
+    return {"worldTemplates": await evaluation_catalog.list_world_templates()}
+
+
+@app.get("/api/evidence/requests")
+async def evidence_requests_list():
+    return {"objectRequests": await evidence_catalog.list_requests()}
+
+
+@app.post("/api/evidence/requests", status_code=201)
+async def evidence_request_create(
+    payload: ObjectRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await evidence_catalog.create_request(payload, idempotency_key=_idempotency_key(idempotency_key))
+    except (ValueError, command_store.CommandConflict) as exc:
+        raise HTTPException(409 if isinstance(exc, command_store.CommandConflict) else 422, str(exc)) from exc
+
+
+@app.get("/api/evidence/requests/{request_id}")
+async def evidence_request_get(request_id: str):
+    try:
+        return await evidence_catalog.get_request(request_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Object request not found.") from exc
+
+
+@app.post("/api/evidence/requests/{request_id}/normalize-recorded", status_code=201)
+async def evidence_recorded_normalize(
+    request_id: str,
+    payload: RecordedEvidenceImport,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await evidence_catalog.normalize_recorded(
+            request_id,
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Object request not found.") from exc
+    except (evidence_catalog.EvidenceConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/evidence/bundles/{bundle_id}")
+async def evidence_bundle_get(bundle_id: str):
+    try:
+        return await evidence_catalog.get_bundle(bundle_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Evidence bundle not found.") from exc
+
+
+@app.get("/api/evidence/collections")
+async def evidence_collections_list(
+    request_id: str | None = Query(default=None, alias="requestId", max_length=64),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    return {"collectionRuns": await evidence_collection.list_runs(request_id=request_id, limit=limit)}
+
+
+@app.post("/api/evidence/requests/{request_id}/collections", status_code=202)
+async def evidence_collection_create(
+    request_id: str,
+    payload: BrightDataCollectionRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await evidence_collection.create_run(
+            request_id,
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Object request not found.") from exc
+    except (ValueError, evidence_collection.EvidenceCollectionConflict) as exc:
+        raise HTTPException(409 if isinstance(exc, evidence_collection.EvidenceCollectionConflict) else 422, str(exc)) from exc
+    except command_store.CommandConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/evidence/collections/{run_id}")
+async def evidence_collection_get(run_id: str):
+    try:
+        return {"collectionRun": await evidence_collection.get_run(run_id)}
+    except KeyError as exc:
+        raise HTTPException(404, "Evidence collection run not found.") from exc
+
+
+@app.post("/api/evidence/collections/{run_id}/cancel")
+async def evidence_collection_cancel(run_id: str):
+    try:
+        return {"collectionRun": await evidence_collection.cancel_run(run_id)}
+    except KeyError as exc:
+        raise HTTPException(404, "Evidence collection run not found.") from exc
+
+
+@app.get("/api/scraper-collector-versions")
+async def scraper_collector_versions_list(
+    collector_id: str | None = Query(default=None, alias="collectorId", max_length=160),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    return {"collectorVersions": await scraper_repair.list_collector_versions(collector_id=collector_id, limit=limit)}
+
+
+@app.post("/api/scraper-collector-versions", status_code=201)
+async def scraper_collector_version_create(
+    payload: ScraperCollectorVersionCreate,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await scraper_repair.register_collector_version(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except (scraper_repair.ScraperRepairConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/scraper-repair-runs")
+async def scraper_repair_runs_list(limit: int = Query(default=100, ge=1, le=500)):
+    return {"repairRuns": await scraper_repair.list_repair_runs(limit)}
+
+
+@app.get("/api/scraper-repair-runs/{run_id}")
+async def scraper_repair_run_get(run_id: str):
+    try:
+        return {"repairRun": await scraper_repair.get_repair_run(run_id)}
+    except KeyError as exc:
+        raise HTTPException(404, "Scraper repair run not found.") from exc
+
+
+@app.post("/api/scraper-repair-runs", status_code=201)
+async def scraper_repair_run_create(
+    payload: ScraperRepairCreate,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await scraper_repair.create_repair_run(payload, idempotency_key=_idempotency_key(idempotency_key))
+    except KeyError as exc:
+        raise HTTPException(404, "Collector version, object request, or failure bundle not found.") from exc
+    except (scraper_repair.ScraperRepairConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/scraper-repair-runs/{run_id}/provider-request", status_code=202)
+async def scraper_repair_provider_request(
+    run_id: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await scraper_repair.trigger_provider_repair(run_id, idempotency_key=_idempotency_key(idempotency_key))
+    except KeyError as exc:
+        raise HTTPException(404, "Scraper repair run not found.") from exc
+    except (scraper_repair.ScraperRepairConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except brightdata.BrightDataError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/scraper-repair-runs/{run_id}/draft", status_code=201)
+async def scraper_repair_draft_submit(
+    run_id: str,
+    payload: ScraperRepairDraftSubmission,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await scraper_repair.submit_draft(run_id, payload, idempotency_key=_idempotency_key(idempotency_key))
+    except KeyError as exc:
+        raise HTTPException(404, "Scraper repair run not found.") from exc
+    except (scraper_repair.ScraperRepairConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/scraper-repair-runs/{run_id}/test", status_code=201)
+async def scraper_repair_test(
+    run_id: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await scraper_repair.run_quality_tests(run_id, idempotency_key=_idempotency_key(idempotency_key))
+    except KeyError as exc:
+        raise HTTPException(404, "Scraper repair run or test artifact not found.") from exc
+    except (scraper_repair.ScraperRepairConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/scraper-repair-runs/{run_id}/decision", status_code=201)
+async def scraper_repair_decide(
+    run_id: str,
+    payload: ScraperRepairDecision,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await scraper_repair.decide(run_id, payload, idempotency_key=_idempotency_key(idempotency_key))
+    except KeyError as exc:
+        raise HTTPException(404, "Scraper repair run not found.") from exc
+    except (scraper_repair.ScraperRepairConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except brightdata.BrightDataError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/scraper-repair-runs/{run_id}/rollback", status_code=201)
+async def scraper_repair_rollback(
+    run_id: str,
+    payload: ScraperRepairRollback,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await scraper_repair.rollback(run_id, payload, idempotency_key=_idempotency_key(idempotency_key))
+    except KeyError as exc:
+        raise HTTPException(404, "Scraper repair run not found.") from exc
+    except (scraper_repair.ScraperRepairConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/scraper-repair/demo/page/{layout}", response_class=HTMLResponse)
+async def scraper_repair_controlled_page(layout: str):
+    try:
+        return HTMLResponse(scraper_repair_demo.page_html(layout), headers={"Cache-Control": "no-store"})
+    except KeyError as exc:
+        raise HTTPException(404, "Controlled scraper layout not found.") from exc
+
+
+@app.post("/api/scraper-repair/demo", status_code=201)
+async def scraper_repair_controlled_demo(payload: ScraperRepairDemoRequest):
+    try:
+        return await scraper_repair_demo.run_demo(automatic_promotion=payload.automatic_promotion)
+    except (scraper_repair.ScraperRepairError, ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/evaluations")
+async def evaluation_runs_list(limit: int = Query(default=100, ge=1, le=500)):
+    return {"evaluations": await evaluation_catalog.list_evaluations(limit)}
+
+
+@app.post("/api/evaluations/oracle/pick-place", status_code=201)
+async def evaluation_oracle_pick_place(
+    payload: OracleEvaluationRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await evaluation_catalog.run_pick_place_oracle(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Robot registration not found.") from exc
+    except (evaluation_catalog.EvaluationConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/evaluations/oracle/compiled-asset-pick-place", status_code=201)
+async def evaluation_oracle_compiled_asset_pick_place(
+    payload: CompiledAssetOracleRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await evaluation_catalog.run_compiled_asset_pick_place_oracle(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Robot registration or compiled asset version not found.") from exc
+    except (evaluation_catalog.EvaluationConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/evaluations/vla/compiled-asset-pick-place", status_code=201)
+async def evaluation_vla_compiled_asset_pick_place(
+    payload: CompiledAssetVlaEvaluationRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await evaluation_catalog.run_compiled_asset_pick_place_vla(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Robot, model, or compiled asset version not found.") from exc
+    except (evaluation_catalog.EvaluationConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/evaluations/{run_id}/analyze", status_code=201)
+async def evaluation_analyze(
+    run_id: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await curriculum_catalog.analyze_evaluation(
+            run_id,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Evaluation not found.") from exc
+    except (curriculum_catalog.CurriculumError, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/failure-events")
+async def failure_events_list(limit: int = Query(default=100, ge=1, le=500)):
+    return {"failureEvents": await curriculum_catalog.list_failure_events(limit)}
+
+
+@app.get("/api/coverage")
+async def coverage_get(
+    robot_id: str | None = Query(default=None, alias="robotId"),
+    model_id: str | None = Query(default=None, alias="modelId"),
+    task_family: str = Query(default="pick_place", alias="taskFamily", pattern=r"^[a-z][a-z0-9_-]+$"),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    return await curriculum_catalog.coverage_state(
+        robot_id=robot_id,
+        model_id=model_id,
+        task_family=task_family,
+        limit=limit,
+    )
+
+
+@app.post("/api/curriculum/plan-next", status_code=201)
+async def curriculum_plan_next(
+    payload: CurriculumPlanRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await curriculum_catalog.plan_next(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Robot or model registration not found.") from exc
+    except (curriculum_catalog.CurriculumError, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/curriculum/plans")
+async def curriculum_plans_list(limit: int = Query(default=100, ge=1, le=500)):
+    return {"plans": await curriculum_catalog.list_plans(limit)}
+
+
+@app.get("/api/scenario-specs")
+async def scenario_specs_list(limit: int = Query(default=100, ge=1, le=500)):
+    return {"scenarios": await curriculum_catalog.list_scenarios(limit)}
+
+
+@app.post("/api/scenario-specs/{scenario_id}/oracle", status_code=201)
+async def scenario_oracle_execute(
+    scenario_id: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await curriculum_catalog.execute_scenario_oracle(
+            scenario_id,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Scenario specification not found.") from exc
+    except (curriculum_catalog.CurriculumError, evaluation_catalog.EvaluationConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/scenario-executions")
+async def scenario_executions_list(limit: int = Query(default=100, ge=1, le=500)):
+    return {"executions": await curriculum_catalog.list_scenario_executions(limit)}
+
+
+@app.post("/api/autonomous-runs", status_code=202)
+async def autonomous_run_start(
+    payload: AutonomousCurriculumRunRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await autonomous_curriculum.start_run(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Robot, model, or asset registration not found.") from exc
+    except (autonomous_curriculum.AutonomousCurriculumError, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/autonomous-runs")
+async def autonomous_runs_list(limit: int = Query(default=100, ge=1, le=500)):
+    return {"runs": await autonomous_curriculum.list_runs(limit)}
+
+
+@app.get("/api/autonomous-runs/{run_id}")
+async def autonomous_run_get(run_id: str):
+    try:
+        return {"run": await autonomous_curriculum.get_run(run_id)}
+    except KeyError as exc:
+        raise HTTPException(404, "Autonomous curriculum run not found.") from exc
+
+
+@app.post("/api/autonomous-runs/{run_id}/cancel")
+async def autonomous_run_cancel(run_id: str):
+    try:
+        return {"run": await autonomous_curriculum.cancel_run(run_id)}
+    except KeyError as exc:
+        raise HTTPException(404, "Autonomous curriculum run not found.") from exc
+
+
+@app.get("/api/evaluations/{run_id}")
+async def evaluation_run_get(run_id: str):
+    try:
+        return await evaluation_catalog.get_evaluation(run_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Evaluation not found.") from exc
+
+
+@app.get("/api/evaluations/{run_id}/frames/{phase}/{camera}.png")
+async def evaluation_frame_get(run_id: str, phase: str, camera: str):
+    try:
+        path = evaluation_catalog.frame_path(run_id, phase, camera)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Evaluation frame not found.") from exc
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/simulation/isaac")
 async def isaac_status():
+    if not DEFERRED_ISAAC_ENABLED:
+        raise HTTPException(404, "Isaac Sim integration is deferred and disabled. MuJoCo is the authoritative backend.")
     flat = await settings_store.get_flat()
     return await asyncio.to_thread(
         isaac_sim.inspect,
@@ -1382,6 +1984,8 @@ async def isaac_status():
 
 @app.post("/api/robots/franka/isaac", status_code=201)
 async def register_isaac_franka():
+    if not DEFERRED_ISAAC_ENABLED:
+        raise HTTPException(404, "Isaac Sim integration is deferred and disabled. Register the pinned MuJoCo Franka instead.")
     flat = await settings_store.get_flat()
     status = await asyncio.to_thread(
         isaac_sim.inspect,
@@ -1395,6 +1999,8 @@ async def register_isaac_franka():
 
 @app.post("/api/simulation/isaac/prepare")
 async def prepare_isaac_world():
+    if not DEFERRED_ISAAC_ENABLED:
+        raise HTTPException(404, "Isaac Sim integration is deferred and disabled. MuJoCo is the authoritative backend.")
     flat = await settings_store.get_flat()
     status = await asyncio.to_thread(
         isaac_sim.inspect,
@@ -1541,6 +2147,161 @@ async def model_status():
         "benchmarkComparable": False,
         "benchmarkRunnable": False,
         "benchmarkBlocker": "Quantized TRELLIS is disabled for this workspace; only the native Microsoft pipeline is active.",
+    }
+
+
+def _idempotency_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        raise HTTPException(400, "Idempotency-Key must not be blank.")
+    if len(cleaned) > 160:
+        raise HTTPException(400, "Idempotency-Key must be at most 160 characters.")
+    return cleaned
+
+
+def _registry_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, KeyError):
+        return HTTPException(404, "Model registration not found.")
+    if isinstance(exc, (control_catalog.RegistryConflict, command_store.CommandConflict)):
+        return HTTPException(409, str(exc))
+    return HTTPException(422, str(exc))
+
+
+@app.get("/api/models")
+async def registered_models_list():
+    """List internal model registrations without resolving or returning secrets."""
+    return {
+        "models": await control_catalog.list_models(),
+        "allowedLocalRoots": [str(path) for path in model_registry.configured_model_roots()],
+    }
+
+
+@app.post("/api/models", status_code=201)
+async def registered_model_create(
+    payload: ModelRegistrationCreate,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await control_catalog.register_model(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except (KeyError, control_catalog.RegistryError, command_store.CommandConflict, ValueError) as exc:
+        raise _registry_http_error(exc) from exc
+
+
+@app.get("/api/models/{model_id}")
+async def registered_model_get(model_id: str):
+    try:
+        return await control_catalog.get_model(model_id)
+    except KeyError as exc:
+        raise _registry_http_error(exc) from exc
+
+
+@app.post("/api/models/{model_id}/validate")
+async def registered_model_validate(
+    model_id: str,
+    payload: ModelValidationRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await control_catalog.validate_model(
+            model_id,
+            compute_content_hash=payload.compute_content_hash,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except (KeyError, control_catalog.RegistryError, command_store.CommandConflict, ValueError) as exc:
+        raise _registry_http_error(exc) from exc
+
+
+@app.post("/api/models/{model_id}/load")
+async def registered_model_load(
+    model_id: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await control_catalog.load_model(
+            model_id,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except (KeyError, control_catalog.RegistryError, command_store.CommandConflict, ValueError) as exc:
+        raise _registry_http_error(exc) from exc
+
+
+@app.post("/api/models/{model_id}/unload")
+async def registered_model_unload(
+    model_id: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await control_catalog.unload_model(
+            model_id,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except (KeyError, control_catalog.RegistryError, command_store.CommandConflict, ValueError) as exc:
+        raise _registry_http_error(exc) from exc
+
+
+@app.get("/api/models/{model_id}/bridges/franka/{robot_id}")
+async def model_franka_bridge_status(model_id: str, robot_id: str):
+    try:
+        return await vla_bridge.bridge_status(model_id, robot_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Model or robot registration not found.") from exc
+
+
+@app.get("/api/models/{model_id}/worker-probe")
+async def model_worker_probe(model_id: str):
+    try:
+        model = await control_catalog.get_model(model_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Model registration not found.") from exc
+    if model["providerType"] != "local_path" or "vla_policy" not in model["roles"]:
+        raise HTTPException(422, "This worker probe currently supports local VLA policy registrations only.")
+    try:
+        return await asyncio.to_thread(
+            vla_policy_worker.probe_checkpoint,
+            str(model["localPath"] or ""),
+            str(model["expectedDevice"] or "cuda"),
+        )
+    except (OSError, ValueError, vla_policy_worker.VlaWorkerError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/workers/vla-jepa")
+async def vla_jepa_worker_status():
+    return await asyncio.to_thread(vla_policy_worker.status)
+
+
+@app.post("/api/workers/vla-jepa/stop")
+async def stop_vla_jepa_worker():
+    await asyncio.to_thread(vla_policy_worker.kill)
+    reconciled = await control_catalog.reconcile_local_worker_state()
+    return {"stopped": True, "reconciledModelRegistrations": reconciled, "worker": vla_policy_worker.status()}
+
+
+@app.post("/api/vla/bridges/franka/actions/decode")
+async def decode_franka_vla_action(payload: VlaNormalizedAction):
+    try:
+        return vla_bridge.decode_action(payload)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/audit")
+async def audit_events_list(
+    entity_type: str | None = Query(default=None, max_length=40),
+    entity_id: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    return {
+        "events": await control_catalog.audit_history(
+            entity_type=entity_type,
+            entity_id=entity_id,
+            limit=limit,
+        )
     }
 
 
@@ -1702,6 +2463,12 @@ async def run_source(source_id: str):
 
 @app.post("/api/sources/{source_id}/repair", status_code=202)
 async def repair_source(source_id: str, payload: SourceRepairIn):
+    if not LEGACY_SOURCE_REPAIR_ENABLED:
+        raise HTTPException(
+            410,
+            "Legacy source repair is disabled because it bypasses canonical golden/canary validation. "
+            "Create a governed repair at /api/scraper-repair-runs instead.",
+        )
     async with SessionLocal() as session:
         row = await session.get(Source, source_id)
         if row is None:
@@ -1731,6 +2498,12 @@ async def repair_source(source_id: str, payload: SourceRepairIn):
 
 @app.post("/api/sources/{source_id}/repair/approve", status_code=202)
 async def approve_source_repair(source_id: str):
+    if not LEGACY_SOURCE_REPAIR_ENABLED:
+        raise HTTPException(
+            410,
+            "Legacy source-repair approval is disabled because it bypasses the canonical decision audit. "
+            "Use /api/scraper-repair-runs/{run_id}/decision instead.",
+        )
     async with SessionLocal() as session:
         row = await session.get(Source, source_id)
         if row is None:
@@ -1825,12 +2598,11 @@ async def observability_services():
     uptime = fmt_duration(time.monotonic() - STARTED_AT)
     return [
         {"name": "robotworld-api", "kind": "core", "status": "running", "version": __version__, "latency": "local", "uptime": uptime, "restarts": 0},
-        {"name": "curriculum-agent", "kind": "agent", "status": "running" if agent.status()["running"] else "stopped", "version": __version__, "latency": "—", "uptime": uptime, "restarts": 0},
+        {"name": "curriculum-planner", "kind": "agent-tool-service", "status": "healthy", "version": __version__, "latency": "—", "uptime": uptime, "restarts": 0},
         {"name": "mujoco-worker", "kind": "worker", "status": "running", "version": mujoco.__version__, "latency": "in-process", "uptime": uptime, "restarts": 0, "gpu": "CPU physics"},
         {"name": "model-provider", "kind": "integration", "status": "running" if provider["status"] == "healthy" else "degraded" if configured["model"] else "stopped", "version": str(provider.get("model") or "not configured"), "latency": "—", "uptime": uptime, "restarts": 0},
         {"name": "brightdata", "kind": "integration", "status": "running" if configured["brightdata"] else "stopped", "version": "REST", "latency": "external", "uptime": uptime, "restarts": 0},
         {"name": "signoz-exporter", "kind": "integration", "status": "running" if signoz_exporting() else "stopped", "version": "OTLP", "latency": "external", "uptime": uptime, "restarts": 0},
-        {"name": "port-catalog", "kind": "integration", "status": "running" if configured["port"] else "stopped", "version": "REST", "latency": "external", "uptime": uptime, "restarts": 0},
     ]
 
 
@@ -1913,7 +2685,8 @@ async def observability_logs(level: str | None = Query(default=None)):
 async def record_frontend_error(payload: FrontendErrorIn):
     """Persist sanitized renderer failures without trusting browser log text."""
     secret_pattern = re.compile(r"(sk-(?:proj-)?[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._-]{12,})", re.IGNORECASE)
-    clean = lambda value, limit: secret_pattern.sub("[redacted]", value)[:limit]
+    def clean(value: str, limit: int) -> str:
+        return secret_pattern.sub("[redacted]", value)[:limit]
     detail = {
         "message": clean(payload.message, 2000),
         "route": clean(payload.route, 500),
@@ -1992,6 +2765,8 @@ async def put_key(service: str, payload: KeyIn):
 
 @app.post("/api/integrations/port/sync")
 async def sync_port_catalog():
+    if not DEFERRED_PORT_ENABLED:
+        raise HTTPException(404, "Port integration is deferred and disabled; RobotWorld's internal catalog is authoritative.")
     async with SessionLocal() as session:
         skills = (await session.execute(select(Skill).where(Skill.id.not_in(HIDDEN_LEGACY_SKILLS)))).scalars().all()
         assets = (await session.execute(select(Asset))).scalars().all()

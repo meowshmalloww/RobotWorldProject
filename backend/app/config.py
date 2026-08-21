@@ -25,9 +25,11 @@ DEMOS_DIR = DATA_DIR / "demos"
 MODELS_DIR = DATA_DIR / "models"
 WORLDS_DIR = DATA_DIR / "worlds"
 ROBOTS_DIR = DATA_DIR / "robots"
+WORKERS_DIR = DATA_DIR / "workers"
+EVIDENCE_DIR = DATA_DIR / "evidence"
 DB_PATH = DATA_DIR / "robotworld.db"
 
-for _d in (DATA_DIR, ASSETS_DIR, DEMOS_DIR, MODELS_DIR, WORLDS_DIR, ROBOTS_DIR):
+for _d in (DATA_DIR, ASSETS_DIR, DEMOS_DIR, MODELS_DIR, WORLDS_DIR, ROBOTS_DIR, WORKERS_DIR, EVIDENCE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
@@ -54,16 +56,17 @@ class EnvSettings(BaseSettings):
     isaac_sim_root: str | None = None
     isaacsim_asset_root: str | None = None
 
+    # Current Bright Data documentation calls this an API token. Keep the
+    # older API_KEY alias for existing local installations, but prefer TOKEN.
+    brightdata_api_token: str | None = None
     brightdata_api_key: str | None = None
     brightdata_account_id: str | None = None
     brightdata_serp_zone: str = "serp"
     brightdata_unlocker_zone: str = "web_unlocker"
 
-    signoz_endpoint: str | None = None  # e.g. https://ingest.us.signoz.cloud:443
-    signoz_query_endpoint: str | None = None  # e.g. https://my-workspace.us.signoz.cloud
-    signoz_ingestion_key: str | None = None
-    signoz_api_key: str | None = None   # for the v5 query API
-    signoz_region: str = "us"
+    signoz_endpoint: str | None = None  # self-hosted Community OTLP HTTP receiver
+    signoz_query_endpoint: str | None = None  # self-hosted Community UI/API
+    signoz_api_key: str | None = None   # optional local read-only query service account
 
     port_api_key: str | None = None
     port_client_id: str | None = None
@@ -78,7 +81,6 @@ SECRET_KEYS = {
     "integrations.port.token",
     "integrations.port.clientSecret",
     "integrations.brightdata.apiKey",
-    "integrations.signoz.ingestionKey",
     "integrations.signoz.apiKey",
     "models.openaiKey",
     "models.policyApiKey",
@@ -106,14 +108,13 @@ DEFAULT_SETTINGS: dict = {
             "accountId": env.brightdata_account_id or "",
             "serpZone": env.brightdata_serp_zone,
             "unlockerZone": env.brightdata_unlocker_zone,
-            "apiKey": env.brightdata_api_key or "",
+            "apiKey": env.brightdata_api_token or env.brightdata_api_key or "",
         },
         "signoz": {
             "enabled": False,
             "mode": "self_hosted",
             "endpoint": env.signoz_endpoint or "http://127.0.0.1:4318",
             "queryEndpoint": env.signoz_query_endpoint or "http://127.0.0.1:8080",
-            "ingestionKey": env.signoz_ingestion_key or "",
             "apiKey": env.signoz_api_key or "",
             "region": "local",
         },

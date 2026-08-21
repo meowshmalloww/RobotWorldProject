@@ -14,7 +14,6 @@ import math
 import re
 import time
 import urllib.parse
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
@@ -75,7 +74,9 @@ KNOWN_PRODUCTS: dict[str, dict[str, Any]] = {
     },
     "KITCHEN FAUCET": {
         "manufacturer": "Generic", "model": "kitchen-faucet", "category": "faucet",
-        "width_m": (0.06, "inferred", 0.3), "height_m": (0.40, "inferred", 0.3),
+        # A pull-down kitchen faucet occupies roughly 30 cm across spout and
+        # handle; the previous 6 cm prior flattened generated meshes to paper.
+        "width_m": (0.30, "inferred", 0.3), "height_m": (0.40, "inferred", 0.3),
         "depth_m": (0.25, "inferred", 0.3), "mass_kg": (2.0, "inferred", 0.25),
         "materials": (["stainless steel"], "inferred", 0.35),
     },

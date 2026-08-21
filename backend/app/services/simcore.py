@@ -20,7 +20,7 @@ import mujoco
 import numpy as np
 from mujoco.rendering.classic.renderer import Renderer
 
-from .mjcf import ARM, build_world
+from .mjcf import build_world
 
 CTRL_HZ = 60
 DT_CTRL = 1.0 / CTRL_HZ
@@ -563,7 +563,6 @@ class ScriptedController:
         rate regardless of how much the physical joints lag — so the position
         actuators develop their full authority against load/contact instead
         of being capped at kp*step by the lag itself."""
-        w = self.w
         step = (rate or self.JOINT_RATE) * DT_CTRL
         self._ref = self._ref + np.clip(q_target - self._ref, -step, step)
         reached = bool(np.max(np.abs(q_target - self._ref)) < 0.03)

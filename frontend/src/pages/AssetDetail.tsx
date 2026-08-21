@@ -6,7 +6,7 @@ import { Badge, InspSection, Menu, MenuItem, VecInput } from "../components/ui/c
 import { Tree, type TreeNodeData } from "../components/ui/Tree";
 import { Modal } from "../components/ui/Modal";
 import { useToast } from "../components/ui/Toast";
-import { api, ApiError, downloadApiFile } from "../lib/api";
+import { api, apiUrl, ApiError, downloadApiFile } from "../lib/api";
 import { useApi } from "../lib/useApi";
 import { EmptyState, ErrorState, Skeleton } from "../lib/states";
 import { NativeVulkanCanvas } from "../components/three/NativeVulkanCanvas";
@@ -310,6 +310,45 @@ export default function AssetDetail() {
             </div>
           </Card>
         )}
+
+        <Card title="Materials & textures" right={hasGeneratedMesh ? <Badge tone="teal">PBR baked in GLB</Badge> : undefined} flush>
+          {(() => {
+            const basecolor = asset.artifacts.find((artifact) => artifact.file.toLowerCase().includes("basecolor"));
+            return (
+              <div style={{ padding: 12, display: "flex", gap: 14, alignItems: "flex-start", flexWrap: "wrap" }}>
+                {basecolor ? (
+                  <div style={{ flex: "none", width: 190 }}>
+                    <div style={{ border: "1px solid var(--border)", borderRadius: "var(--r-md)", overflow: "hidden" }}>
+                      <img
+                        src={apiUrl(`/assets/${asset.id}/files/${encodeURIComponent(basecolor.file)}`)}
+                        alt="Baked base color texture"
+                        style={{ width: "100%", aspectRatio: "1 / 1", objectFit: "cover", display: "block", background: "#000" }}
+                      />
+                    </div>
+                    <div className="micro t3 mono" style={{ marginTop: 6 }}>{basecolor.file} · {basecolor.size}</div>
+                    <button className="btn btn-ghost btn-sm" style={{ marginTop: 6 }} onClick={() => downloadArtifact(basecolor.file)}><Icon name="download" size={11} /> Download texture</button>
+                  </div>
+                ) : (
+                  <div className="empty-note" style={{ flex: "none", width: 190, aspectRatio: "1 / 1", display: "grid", placeItems: "center", textAlign: "center", padding: 12 }}>
+                    <span className="col" style={{ gap: 6, alignItems: "center" }}>
+                      <Icon name="image" size={18} style={{ color: "var(--text-3)" }} />
+                      <span className="micro t3">No extracted basecolor artifact; texture is embedded in model.glb as WebP.</span>
+                    </span>
+                  </div>
+                )}
+                <div className="col" style={{ gap: 8, flex: 1, minWidth: 240 }}>
+                  <div className="kv-row"><span className="kv-k">Texture source</span><span className="kv-v">TRELLIS.2 bakes PBR maps (base color, metallic-roughness) from the source image into the GLB using WebP (EXT_texture_webp).</span></div>
+                  <div className="kv-row"><span className="kv-k">Where it renders</span><span className="kv-v">The native Vulkan inspector and the three.js scene editor both sample the baked maps; no runtime texture synthesis occurs.</span></div>
+                  <div className="kv-row"><span className="kv-k">Change the texture</span><span className="kv-v">Textures follow the source image. Pick a different source photo and rebuild, or regenerate with a new seed — the baked maps update with the generation.</span></div>
+                  <div className="row" style={{ gap: 8, marginTop: 2 }}>
+                    <button className="btn btn-secondary btn-sm" disabled={!hasGeneratedMesh} onClick={() => downloadArtifact("model.glb")}><Icon name="download" size={11} /> Download GLB with textures</button>
+                    <button className="btn btn-ghost btn-sm" onClick={reevaluate} disabled={reevaluating}><Icon name="refresh" size={11} /> Regenerate</button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+        </Card>
 
         {asset.sourcePhotos && asset.sourcePhotos.length > 0 && (
           <Card title="Source photo candidates" flush>

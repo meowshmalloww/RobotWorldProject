@@ -122,7 +122,7 @@ function SceneComposer({ assetId }: { assetId: string }) {
   const [rightW, setRightW] = usePanelSize(360, 240, 720, "robotworld.worlds.rightW");
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
-  const [shelfH, setShelfH] = usePanelSize(210, 100, 560, "robotworld.worlds.shelfH");
+  const [shelfH, setShelfH] = usePanelSize(210, 100, 560, "robotworld.worlds.shelfH", "row");
   const [shelfOpen, setShelfOpen] = useState(true);
 
   const activeAcceptance = acceptance?.scenarios.find((item) => item.id === acceptanceId);
@@ -584,7 +584,7 @@ function SceneComposer({ assetId }: { assetId: string }) {
                 )}
               </div>
             </div>
-            <ResizeHandle dir="col" onDrag={(d) => setLeftW((prev) => prev + d)} />
+            <ResizeHandle dir="col" onDrag={(d) => setLeftW((prev) => prev + d)} onReset={() => setLeftW(260)} />
           </>
         ) : (
           <PanelRail label="Hierarchy" side="left" onExpand={() => setLeftOpen(true)} />
@@ -613,10 +613,10 @@ function SceneComposer({ assetId }: { assetId: string }) {
           {/* Bottom Dockable Shelf */}
           {shelfOpen && (
             <>
-              <ResizeHandle dir="row" onDrag={(d) => setShelfH((prev) => prev - d)} />
+              <ResizeHandle dir="row" onDrag={(d) => setShelfH((prev) => prev - d)} onReset={() => setShelfH(210)} />
               <div className="card unity-shelf" style={{ height: shelfH, flex: "none", display: "flex", flexDirection: "column", minHeight: 0, borderRadius: 0, borderRight: 0, borderLeft: 0, borderBottom: 0 }}>
                 <header className="card-head" style={{ minHeight: 30, padding: "0 8px 0 10px", background: "var(--bg-panel-2)", borderBottom: "1px solid var(--border)" }}>
-                  <span className="tabs" style={{ border: 0, gap: 4 }}>
+                  <span className="tabs scrollable" style={{ border: 0, gap: 4 }}>
                     {(["Console", "Diagnostics", "Checks", "Variants"] as const).map((t) => (
                       <button
                         key={t}
@@ -715,7 +715,7 @@ function SceneComposer({ assetId }: { assetId: string }) {
         {/* Right: Unity Component Inspector */}
         {rightOpen ? (
           <>
-            <ResizeHandle dir="col" onDrag={(d) => setRightW((prev) => prev - d)} />
+            <ResizeHandle dir="col" onDrag={(d) => setRightW((prev) => prev - d)} onReset={() => setRightW(360)} />
             <div className="card unity-inspector" style={{ width: rightW, flex: "none", display: "flex", flexDirection: "column", minHeight: 0, borderRadius: 0, borderTop: 0, borderBottom: 0, borderRight: 0 }}>
               <header className="card-head" style={{ minHeight: 32, padding: "0 10px", background: "var(--bg-panel-2)", borderBottom: "1px solid var(--border)" }}>
                 <span className="row" style={{ gap: 6, alignItems: "center", minWidth: 0 }}>
@@ -724,7 +724,7 @@ function SceneComposer({ assetId }: { assetId: string }) {
                 </span>
               </header>
 
-              <div className="tabs" style={{ padding: "0 8px", background: "var(--bg-panel-1)", borderBottom: "1px solid var(--border)" }}>
+              <div className="tabs scrollable" style={{ padding: "0 8px", background: "var(--bg-panel-1)", borderBottom: "1px solid var(--border)" }}>
                 {(["Components", "Physics", "Provenance", "Agent", "Robots"] as const).map((t) => (
                   <button key={t} className={inspTab === t ? "on" : ""} onClick={() => setInspTab(t)} style={{ height: 26, fontSize: 11 }}>
                     {t}
@@ -825,26 +825,19 @@ function RobotAgentPanel({ tab, robots, robotId, setRobotId, instruction, setIns
   onRobotsChanged: () => void;
 }) {
   const toast = useToast();
-  const [preparingIsaac, setPreparingIsaac] = useState(false);
+  const [registeringFranka, setRegisteringFranka] = useState(false);
   const robot = robots.find((item) => item.id === robotId);
   const addFranka = async () => {
-    setPreparingIsaac(true);
+    setRegisteringFranka(true);
     try {
-      const value = await api.post<RobotManifest>("/robots/franka/isaac", {});
+      const command = await api.post<RobotCommandResponse>("/robots/franka/mujoco", {});
+      const value = command.result.robot;
+      if (!value) throw new Error("Franka registration command returned no robot manifest.");
       setRobotId(value.id);
       onRobotsChanged();
-      toast.push(value.readiness.executable ? "ok" : "info", "Franka Panda registered", value.readiness.executable ? "Isaac articulation is ready." : value.readiness.blockers[0] ?? "Readiness gates remain.");
+      toast.push(value.physicsReady ? "ok" : "info", "Franka Panda registered", value.physicsReady ? "Pinned MuJoCo model, gripper, front camera, and wrist camera passed validation." : value.readiness.blockers[0] ?? "Physics readiness gates remain.");
     } catch (e) { toast.push("err", "Franka registration failed", e instanceof ApiError ? e.message : String(e)); }
-    finally { setPreparingIsaac(false); }
-  };
-  const prepareIsaac = async () => {
-    setPreparingIsaac(true);
-    try {
-      const value = await api.post<{ runtimeReady: boolean; blockers: string[] }>("/simulation/isaac/prepare", {});
-      onRobotsChanged();
-      toast.push(value.runtimeReady ? "ok" : "info", "Isaac stage prepared", value.runtimeReady ? "OpenUSD physics and Franka launch manifest are ready." : value.blockers[0] ?? "Install Isaac Sim to launch.");
-    } catch (e) { toast.push("err", "Isaac stage preparation failed", e instanceof ApiError ? e.message : String(e)); }
-    finally { setPreparingIsaac(false); }
+    finally { setRegisteringFranka(false); }
   };
   const mapCamera = async (key: string, value: string) => {
     if (!robot) return;
@@ -857,8 +850,7 @@ function RobotAgentPanel({ tab, robots, robotId, setRobotId, instruction, setIns
   if (tab === "Robots") return <div className="col inspector-agent" style={{ minHeight: "100%", gap: 10 }}>
     <div className="col" style={{ gap: 7 }}>
       <select className="select" value={robotId} onChange={(e) => setRobotId(e.target.value)}><option value="">Select robot</option>{robots.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.format}</option>)}</select>
-      <div className="row" style={{ flexWrap: "wrap" }}><button className="btn btn-secondary btn-sm grow" disabled={preparingIsaac} onClick={() => void addFranka()}><Icon name="plus" size={11} /> Register Franka Panda</button>
-      <button className="btn btn-ghost btn-sm grow" disabled={preparingIsaac} onClick={() => void prepareIsaac()}><Icon name="worlds" size={11} /> Prepare Isaac stage</button></div>
+      <div className="row" style={{ flexWrap: "wrap" }}><button className="btn btn-secondary btn-sm grow" disabled={registeringFranka} onClick={() => void addFranka()}><Icon name="plus" size={11} /> {registeringFranka ? "Validating MuJoCo..." : "Register Franka Panda"}</button></div>
       <label className="empty-note center col" style={{ marginTop: 8, minHeight: 78, borderStyle: "dashed", cursor: "pointer" }} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); void onImport(e.dataTransfer.files[0]); }}>
         <Icon name="upload" size={17} /><span>{importing ? "Inspecting source..." : "Drop URDF, MJCF, OpenUSD, or GLB"}</span><input hidden type="file" accept=".urdf,.xml,.mjcf,.usd,.usda,.usdc,.glb" onChange={(e) => void onImport(e.target.files?.[0])} />
       </label>
@@ -906,7 +898,14 @@ function GeneratedWorldView({ placements, selectedAssetId, mode, onSelect, onCom
 interface RobotManifest {
   id: string; name: string; format: string; joints: number; cameras: number; cameraNames: string[];
   cameraMappings: Record<string, string>; policyAdapter?: string | null;
+  physicsReady?: boolean;
   readiness: { executable: boolean; blockers: string[] };
+}
+
+interface RobotCommandResponse {
+  commandId: string;
+  status: string;
+  result: { robot?: RobotManifest };
 }
 
 interface WorldCommandResult {
@@ -1061,7 +1060,7 @@ function GeneratedAssetInspector({ asset, placement, tab, onTransform, onRotatio
       <div className="kv-row"><span className="kv-k">Collision</span><span className="kv-v mono">{placement.collisionApproximation}</span></div>
       <div className="kv-row"><span className="kv-k">Mass</span><span className="kv-v mono">{finiteNumber(placement.massKg).toFixed(3)} kg · {placement.massSource}</span></div>
     </div></InspSection>
-    <p className="micro t3">OpenUSD collision and rigid-body metadata are authored into stage.usda. Isaac Sim must validate contacts and grasp/drop behavior; estimated mass remains visibly labeled and does not count as measured evidence.</p>
+    <p className="micro t3">OpenUSD collision and rigid-body metadata are authored into stage.usda; the active MuJoCo runtime compiler must separately validate contacts and grasp/drop behavior. Estimated mass remains visibly labeled and does not count as measured evidence.</p>
   </div>;
   if (placement && tab === "Provenance") return <div className="col" style={{ gap: 10 }}>
     <InspSection title="Generated artifact chain" defaultOpen={true}><div className="kv">

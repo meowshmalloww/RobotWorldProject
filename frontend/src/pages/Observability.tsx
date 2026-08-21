@@ -50,6 +50,7 @@ export default function Observability() {
     <div className="page">
       <div className="page-head">
         <div>
+          <div className="page-eyebrow">OpenTelemetry · SigNoz</div>
           <h1 className="page-title">Observability</h1>
           <p className="page-sub">Measured OpenTelemetry data from the durable local store, with optional export to self-hosted SigNoz.</p>
         </div>

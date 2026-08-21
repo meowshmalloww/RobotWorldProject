@@ -12,6 +12,7 @@ import "./styles/base.css";
 import "./styles/shell.css";
 import "./styles/components.css";
 import "./styles/pages.css";
+import "./styles/ui2.css";
 import App from "./App";
 
 createRoot(document.getElementById("root")!).render(

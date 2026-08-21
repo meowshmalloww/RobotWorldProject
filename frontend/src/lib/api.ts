@@ -14,6 +14,10 @@ export class ApiError extends Error {
 const configuredOrigin = (import.meta.env.VITE_API_ORIGIN as string | undefined)?.replace(/\/$/, "") ?? "";
 const BASE = `${configuredOrigin}/api`;
 
+export function apiUrl(path: string): string {
+  return `${BASE}${path}`;
+}
+
 /** Same-origin in development/production; explicit origin for a remote Spark API. */
 export function websocketUrl(path: string): string {
   if (configuredOrigin) {

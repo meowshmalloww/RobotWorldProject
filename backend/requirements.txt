@@ -24,6 +24,7 @@ wgpu==0.32.0
 pygfx==0.17.0
 pygltflib==1.16.5
 usd-core==26.8
+robot_descriptions==3.1.0
 
 # LLM agent
 openai==3.2.0

@@ -5,28 +5,23 @@ training runs, asset rows and telemetry. Empty DB yields honest zero states.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import json
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import (
-    AgentDecision,
     Artifact,
     Asset,
     CompileStage,
     Evaluation,
-    Job,
     RepairEvent,
     Scenario,
     ScenarioFamily,
     Skill,
     Source,
     TrainingRun,
-    Variant,
-    World,
 )
 from ..config import ASSETS_DIR
 from ..util import fmt_duration, fmt_size, rel_time
@@ -40,7 +35,6 @@ async def _skill_metrics(session: AsyncSession, skill_id: str) -> dict[str, Any]
     )
     fams = (await session.execute(select(ScenarioFamily).where(ScenarioFamily.skill_id == skill_id))).scalars().all()
     fam_success: dict[str, list[bool]] = {f.family: [] for f in fams}
-    fam_count = {f.family: 0 for f in fams}
     for e in evals:
         fam = next((f for f in fams if f.id == e.family_id), None)
         if fam:

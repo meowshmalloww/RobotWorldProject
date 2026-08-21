@@ -86,7 +86,7 @@ async def put_key(service: str, value: str) -> None:
         "port": "integrations.port.token",
         "port_client_secret": "integrations.port.clientSecret",
         "brightdata": "integrations.brightdata.apiKey",
-        "signoz": "integrations.signoz.ingestionKey",
+        "signoz": "integrations.signoz.apiKey",
         "signoz_api": "integrations.signoz.apiKey",
         "openai": "models.openaiKey",
         "policy": "models.policyApiKey",
@@ -110,7 +110,7 @@ async def secret_status() -> dict[str, bool]:
         "policy": bool(flat.get("models.policyApiKey")),
         "trellis": bool(flat.get("models.trellisApiKey")),
         "brightdata": bool(flat.get("integrations.brightdata.apiKey")),
-        "signoz": bool(flat.get("integrations.signoz.ingestionKey")),
+        "signoz": bool(flat.get("integrations.signoz.endpoint")),
         "signoz_api": bool(flat.get("integrations.signoz.apiKey")),
         "port": bool(flat.get("integrations.port.token") or (flat.get("integrations.port.clientId") and flat.get("integrations.port.clientSecret"))),
     }

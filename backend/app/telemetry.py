@@ -88,7 +88,7 @@ def _resource() -> Resource:
     return Resource.create({"service.name": SERVICE_NAME, "service.version": __version__})
 
 
-def init_otel(signoz_endpoint: str | None = None, signoz_key: str | None = None) -> None:
+def init_otel(signoz_endpoint: str | None = None) -> None:
     """Create providers once. If SigNoz is already configured at call time,
     all three OTLP exporters are attached (metric readers can only be added
     at MeterProvider construction, so this is the startup path)."""
@@ -102,17 +102,16 @@ def init_otel(signoz_endpoint: str | None = None, signoz_key: str | None = None)
     _logger_provider = LoggerProvider(resource=_resource())
 
     if signoz_endpoint:
-        headers = {"signoz-ingestion-key": signoz_key} if signoz_key else {}
         base = signoz_endpoint.rstrip("/")
         _tracer_provider.add_span_processor(
-            BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{base}/v1/traces", headers=headers))
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{base}/v1/traces"))
         )
         reader = PeriodicExportingMetricReader(
-            OTLPMetricExporter(endpoint=f"{base}/v1/metrics", headers=headers), export_interval_millis=30000
+            OTLPMetricExporter(endpoint=f"{base}/v1/metrics"), export_interval_millis=30000
         )
         _meter_provider = MeterProvider(resource=_resource(), metric_readers=[reader])
         _logger_provider.add_log_record_processor(
-            BatchLogRecordProcessor(OTLPLogExporter(endpoint=f"{base}/v1/logs", headers=headers))
+            BatchLogRecordProcessor(OTLPLogExporter(endpoint=f"{base}/v1/logs"))
         )
         logging.getLogger().addHandler(LoggingHandler(level=logging.INFO, logger_provider=_logger_provider))
         _otlp_attached = True
@@ -127,21 +126,20 @@ def init_otel(signoz_endpoint: str | None = None, signoz_key: str | None = None)
     logging.getLogger().setLevel(logging.INFO)
 
 
-async def configure_signoz(endpoint: str | None, ingestion_key: str | None) -> bool:
+async def configure_signoz(endpoint: str | None) -> bool:
     """Attach trace/log OTLP exporters at runtime (metrics reader attaches on
     next process start — a MeterProvider limitation in OTel Python)."""
     global _otlp_attached
     if _otlp_attached or not endpoint:
         return _otlp_attached
     init_otel()
-    headers = {"signoz-ingestion-key": ingestion_key} if ingestion_key else {}
     base = endpoint.rstrip("/")
     try:
         _tracer_provider.add_span_processor(
-            BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{base}/v1/traces", headers=headers))
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{base}/v1/traces"))
         )
         _logger_provider.add_log_record_processor(
-            BatchLogRecordProcessor(OTLPLogExporter(endpoint=f"{base}/v1/logs", headers=headers))
+            BatchLogRecordProcessor(OTLPLogExporter(endpoint=f"{base}/v1/logs"))
         )
         logging.getLogger().addHandler(LoggingHandler(level=logging.INFO, logger_provider=_logger_provider))
         _otlp_attached = True

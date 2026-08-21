@@ -236,6 +236,11 @@ export function StatusBadge({ status }: { status: string }) {
     draft: { tone: "grey", label: "Draft" },
     stopped: { tone: "grey", label: "Stopped" },
     error: { tone: "red", label: "Error", icon: "warning" },
+    PHYSICS_VALIDATED: { tone: "green", label: "Physics validated", icon: "check" },
+    STATIC_VALIDATED: { tone: "blue", label: "Static validated", icon: "check" },
+    COMPILED: { tone: "blue", label: "Compiled", icon: "refresh" },
+    IMPORTED: { tone: "grey", label: "Imported" },
+    REJECTED: { tone: "red", label: "Rejected", icon: "x" },
   };
   const m = map[status] ?? { tone: "grey" as const, label: status };
   return <Badge tone={m.tone} icon={m.icon}>{m.label}</Badge>;

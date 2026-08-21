@@ -7,8 +7,6 @@ import { Menu, MenuItem, SearchBox } from "../ui/controls";
 import { useToast } from "../ui/Toast";
 import { downloadFile } from "../ui/Modal";
 import { api, ApiError } from "../../lib/api";
-import { useApi } from "../../lib/useApi";
-import type { SkillGap } from "../../data/types";
 
 const isElectron = typeof window !== "undefined" && !!window.robotworld?.isElectron;
 
@@ -42,7 +40,10 @@ const SEARCHABLE: { label: string; path: string; icon: string }[] = [
   { label: "Skills & Coverage", path: "/skills", icon: "skills" },
   { label: "Assets", path: "/assets", icon: "assets" },
   { label: "Worlds - Scene Editor", path: "/worlds", icon: "worlds" },
+  { label: "Failure Analysis & Curriculum", path: "/failure-analysis", icon: "warning" },
+  { label: "Agent Control", path: "/agent-control", icon: "agent" },
   { label: "Sources", path: "/sources", icon: "sources" },
+  { label: "Scraper Repair", path: "/scraper-repair", icon: "refresh" },
   { label: "Policy readiness", path: "/training", icon: "training" },
   { label: "Observability", path: "/observability/services", icon: "observability" },
   { label: "Settings", path: "/settings", icon: "settings" },
@@ -72,7 +73,6 @@ export function Titlebar() {
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const searchRef = useRef<HTMLDivElement>(null);
-  const { data: overview } = useApi<{ skillGaps: SkillGap[] }>("/overview");
 
   useEffect(() => {
     if (!searchOpen) return;
@@ -86,20 +86,6 @@ export function Titlebar() {
   const searchResults = query.trim()
     ? SEARCHABLE.filter((s) => s.label.toLowerCase().includes(query.trim().toLowerCase()))
     : SEARCHABLE;
-
-  const runAgent = async () => {
-    const gap = overview?.skillGaps[0];
-    if (!gap) {
-      toast.push("err", "No skill gaps", "The agent needs a skill gap to target - check Overview once data loads");
-      return;
-    }
-    try {
-      const { jobId } = await api.post<{ jobId: string }>("/agent/run", { skillId: gap.name.toLowerCase().replace(/\s+/g, "-") });
-      toast.push("ok", "Agent iteration started", `Job ${jobId} - targeting ${gap.name}`);
-    } catch (e) {
-      toast.push("err", "Agent failed to start", e instanceof ApiError ? e.message : String(e));
-    }
-  };
 
   return (
     <header className="titlebar">
@@ -138,7 +124,7 @@ export function Titlebar() {
         </Menu>
         <Menu width={220} trigger={(open) => <button className={`tb-menu-btn ${open ? "open" : ""}`}>Run</button>}>
           <MenuItem icon="play" onClick={() => nav("/worlds?mode=live")}>Start live evaluation</MenuItem>
-          <MenuItem icon="workflow" onClick={runAgent}>Run diagnostics agent</MenuItem>
+          <MenuItem icon="workflow" onClick={() => nav("/agent-control")}>Open agent control</MenuItem>
           <MenuItem icon="refresh" onClick={() => nav("/worlds")}>Open scene editor</MenuItem>
         </Menu>
           <Menu width={190} trigger={(open) => <button className={`tb-menu-btn ${open ? "open" : ""}`}>Help</button>}>

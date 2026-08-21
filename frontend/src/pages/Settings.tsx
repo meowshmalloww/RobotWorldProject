@@ -25,7 +25,7 @@ export interface SettingsData {
   integrations: {
     port: { enabled: boolean; endpoint: string; clientId: string; clientSecret: string; token: string };
     brightdata: { enabled: boolean; accountId: string; serpZone: string; unlockerZone: string; apiKey: string };
-    signoz: { enabled: boolean; mode: string; endpoint: string; queryEndpoint: string; ingestionKey: string; apiKey: string; region: string };
+    signoz: { enabled: boolean; mode: string; endpoint: string; queryEndpoint: string; apiKey: string; region: string };
   };
   simulation: { engine: string; gravity: number; timestepHz: number; renderer: string; isaacRoot: string; isaacAssetRoot: string; isaacVersion: string };
   models: {
@@ -88,6 +88,7 @@ export default function Settings() {
     <div className="page">
       <div className="page-head">
         <div>
+          <div className="page-eyebrow">Workspace configuration</div>
           <h1 className="page-title">Settings</h1>
           <p className="page-sub">Configure the editor, appearance, runtime, and local workspace behavior.</p>
         </div>
@@ -341,6 +342,19 @@ export function ModelsPane({ draft, onChange }: { draft: SettingsData["models"];
       {incompatible && <div className="st-blocker"><b>Execution remains safety-blocked</b>{status?.vlaJepa.robotWorldContract?.blockers.map((value) => <span key={value}>{value}</span>)}<span>Fine-tune or reinitialize the camera, state, and action adapters for this robot before control is enabled.</span></div>}
     </Card>
 
+    <Card title="Policy inference endpoint" right={<Badge tone={draft.policyEndpoint ? "teal" : "grey"}>{draft.policyEndpoint ? "Configured" : "Not set"}</Badge>}>
+      <p className="small t2" style={{ marginBottom: 12 }}>
+        Run the VLA policy on a separate device — for example a Jetson Nano serving an OpenAI-compatible inference endpoint next to the robot. Leave empty to use the local workstation runtime.
+      </p>
+      <div className="st-grid">
+        <FormRow label="Endpoint URL"><input className="input mono" value={draft.policyEndpoint} onChange={(e) => setModel({ policyEndpoint: e.target.value })} placeholder="http://jetson-nano.local:8001/v1" /></FormRow>
+        <FormRow label="API key env var"><input className="input mono" value={draft.policyApiKey} onChange={(e) => setModel({ policyApiKey: e.target.value })} placeholder="ROBOTWORLD_POLICY_API_KEY (never the key itself)" /></FormRow>
+        <FormRow label="Embodiment tag"><input className="input mono" value={draft.policyEmbodiment} onChange={(e) => setModel({ policyEmbodiment: e.target.value })} placeholder="franka-panda" /></FormRow>
+        <FormRow label="Default instruction"><input className="input" value={draft.policyInstruction} onChange={(e) => setModel({ policyInstruction: e.target.value })} placeholder="Pick up the object and place it in the target." /></FormRow>
+      </div>
+      <p className="micro t3" style={{ marginTop: 8 }}>The endpoint is probed during evaluation. Observations and actions follow the RobotWorld policy contract; no weights are transferred through the editor.</p>
+    </Card>
+
     <Card title="Microsoft TRELLIS.2" right={<Badge tone="teal">Native</Badge>}>
       <div className="st-grid">
         <FormRow label="Runtime"><select className="select" value="native" onChange={() => undefined}><option value="native">Microsoft native BF16/FP16</option></select></FormRow>
@@ -365,10 +379,9 @@ export function ModelsPane({ draft, onChange }: { draft: SettingsData["models"];
 }
 
 function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]; onChange: (p: Partial<SettingsData["simulation"]>) => void }) {
-  const { data: isaac, error: isaacError, refetch } = useApi<{ ready: boolean; installed: boolean; version: string; root: string; frankaAsset: string; blockers: string[] }>("/simulation/isaac");
   return (
     <div className="st-stack">
-      <Card title="Engine">
+      <Card title="Authoritative physics engine" right={<Badge tone="teal">MuJoCo</Badge>}>
         <div className="st-grid">
           <FormRow label="Simulator">
             <input className="input mono" value="MuJoCo" readOnly aria-label="Simulator" />
@@ -376,24 +389,18 @@ function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]
             <FormRow label="Gravity (m/s2)"><input className="input mono" value={draft.gravity} onChange={(e) => onChange({ gravity: Number(e.target.value) || 0 })} /></FormRow>
           <FormRow label="Timestep (Hz)"><input className="input mono" value={draft.timestepHz} onChange={(e) => onChange({ timestepHz: Number(e.target.value) || 0 })} /></FormRow>
           <FormRow label="Renderer">
-            <input className="input mono" value="WebGL2 editor / Vulkan validation / MuJoCo physics" readOnly aria-label="Renderer" />
+            <input className="input mono" value="Browser editor preview / MuJoCo cameras + physics" readOnly aria-label="Renderer" />
           </FormRow>
         </div>
+        <p className="small t2" style={{ marginTop: 10 }}>
+          MuJoCo owns transforms, contacts, joints, cameras, and task predicates. The browser viewer is a preview and never invents authoritative motion.
+        </p>
         <SaveSection section="simulation" draft={draft} />
       </Card>
-      <Card title="NVIDIA Isaac Sim + Franka Panda" right={<Badge tone={isaac?.ready ? "teal" : "amber"}>{isaac?.ready ? "Ready" : "Setup required"}</Badge>}>
-        <div className="st-grid">
-          <FormRow label="Target version"><input className="input mono" value={draft.isaacVersion} readOnly /></FormRow>
-          <FormRow label="Isaac Sim root"><input className="input mono" value={draft.isaacRoot} onChange={(e) => onChange({ isaacRoot: e.target.value })} placeholder="C:\\isaacsim" /></FormRow>
-          <FormRow label="Asset root"><input className="input mono" value={draft.isaacAssetRoot} onChange={(e) => onChange({ isaacAssetRoot: e.target.value })} placeholder="Optional; Isaac 5.1 default asset server" /></FormRow>
-          <FormRow label="Franka asset"><span className="mono small">{isaac?.frankaAsset ?? "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"}</span></FormRow>
-        </div>
-        <div className="col" style={{ gap: 4, marginTop: 10 }}>
-          {isaacError && <span className="small g-red">{isaacError.message}</span>}
-          {isaac?.blockers.map((value) => <span className="micro t3" key={value}>BLOCK · {value}</span>)}
-          <div className="row"><button className="btn btn-secondary btn-sm" onClick={refetch}><Icon name="refresh" size={11} /> Recheck runtime</button><span className="micro t3">Physics runs in Isaac Sim; the web viewport remains the editor renderer.</span></div>
-        </div>
-        <SaveSection section="simulation" draft={draft} extra={refetch} />
+      <Card title="Backend boundary" right={<Badge tone="grey">Extensible</Badge>}>
+        <p className="small t2">
+          Runtime scenes are compiled for MuJoCo from versioned robot, world, and asset contracts. Isaac Sim is deferred and disabled; adding another engine must implement the simulation backend contract without changing product logic.
+        </p>
       </Card>
     </div>
   );

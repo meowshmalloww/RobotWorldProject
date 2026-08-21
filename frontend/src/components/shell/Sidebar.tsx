@@ -16,12 +16,21 @@ const NAV: NavGroup[] = [
   },
   {
     section: "Data",
-    items: [{ to: "/sources", label: "Sources", icon: "sources" }],
+    items: [
+      { to: "/evidence", label: "Evidence", icon: "book" },
+      { to: "/scraper-repair", label: "Scraper Repair", icon: "refresh" },
+      { to: "/sources", label: "Sources", icon: "sources" },
+    ],
   },
   {
     section: "Operate",
     items: [
-      { to: "/training", label: "Models & Evaluation", icon: "training" },
+      { to: "/models", label: "Models", icon: "hardDrive" },
+      { to: "/robots", label: "Robots & Embodiments", icon: "robot" },
+      { to: "/simulation", label: "Simulation & Evaluation", icon: "play" },
+      { to: "/failure-analysis", label: "Failure Analysis", icon: "warning" },
+      { to: "/agent-control", label: "Agent Control", icon: "agent" },
+      { to: "/training", label: "Policy & Evaluation", icon: "training" },
       { to: "/observability/services", label: "Observability", icon: "observability" },
     ],
   },

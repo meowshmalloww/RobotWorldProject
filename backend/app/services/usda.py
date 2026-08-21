@@ -164,7 +164,13 @@ def _validate(path: Path, root: str, *, expect_visual: bool = False, expect_phys
             raise RuntimeError("OpenUSD validation failed: generated GLB visual mesh is not composed into the asset layer")
 
 
-def write_visual_usdc(glb_path: Path, out_path: Path) -> tuple[Path, dict[str, int]]:
+def write_visual_usdc(
+    glb_path: Path,
+    out_path: Path,
+    *,
+    uniform_scale: float = 1.0,
+    translation_m: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> tuple[Path, dict[str, int]]:
     """Convert a verified GLB mesh into an actual OpenUSD visual layer.
 
     The physics layer remains separate: this layer contains the generated
@@ -179,8 +185,10 @@ def write_visual_usdc(glb_path: Path, out_path: Path) -> tuple[Path, dict[str, i
 
     if not glb_path.is_file():
         raise RuntimeError(f"GLB visual source is missing: {glb_path}")
-    loaded = trimesh.load(glb_path, force="scene")
-    mesh = loaded.dump(concatenate=True) if isinstance(loaded, trimesh.Scene) else loaded
+    if not 0 < uniform_scale < 1_000_000:
+        raise RuntimeError("OpenUSD visual scale must be finite and positive")
+    loaded = trimesh.load(glb_path, force="scene", process=False)
+    mesh = loaded.to_geometry() if isinstance(loaded, trimesh.Scene) else loaded
     if not isinstance(mesh, trimesh.Trimesh) or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
         raise RuntimeError("GLB did not contain a usable mesh for OpenUSD conversion")
 
@@ -195,6 +203,7 @@ def write_visual_usdc(glb_path: Path, out_path: Path) -> tuple[Path, dict[str, i
     # around X so the authored up-axis metadata matches the actual geometry.
     gltf_points = np.asarray(mesh.vertices, dtype=float)
     usd_points = np.stack((gltf_points[:, 0], -gltf_points[:, 2], gltf_points[:, 1]), axis=1)
+    usd_points = usd_points * float(uniform_scale) + np.asarray(translation_m, dtype=float)
     points = [tuple(map(float, row)) for row in usd_points]
     faces = np.asarray(mesh.faces, dtype=np.int32)
     usd_mesh.CreatePointsAttr(points)
@@ -344,7 +353,7 @@ def write_world_assembly(
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
     UsdGeom.SetStageMetersPerUnit(stage, 1.0)
     world = UsdGeom.Xform.Define(stage, "/RobotWorld")
-    assets = UsdGeom.Xform.Define(stage, "/RobotWorld/Assets")
+    UsdGeom.Xform.Define(stage, "/RobotWorld/Assets")
     stage.SetDefaultPrim(world.GetPrim())
 
     authored: list[str] = []
