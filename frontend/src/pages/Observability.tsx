@@ -51,7 +51,7 @@ export default function Observability() {
       <div className="page-head">
         <div>
           <h1 className="page-title">Observability</h1>
-          <p className="page-sub">Pipeline telemetry for every agent iteration — OpenTelemetry into SigNoz.</p>
+          <p className="page-sub">Measured OpenTelemetry data from the durable local store, with optional export to self-hosted SigNoz.</p>
         </div>
       </div>
 
@@ -293,11 +293,10 @@ function TracesTab() {
 
 /* ---- Metrics ------------------------------------------------------------------ */
 interface MetricsData {
-  labels: string[];
-  latency: number[];
-  error: number[];
-  gpu: number[];
-  throughput: number[];
+  series: { name: string; labels: string[]; values: number[]; count: number; latest: number | null; minimum: number | null; maximum: number | null }[];
+  pointCount: number;
+  store: string;
+  signozExporting: boolean;
 }
 
 function MetricsTab() {
@@ -307,7 +306,7 @@ function MetricsTab() {
   if (loading && !m) return <div className="card"><Skeleton rows={6} /></div>;
   if (error || !m) return <div className="card"><ErrorState message={error?.message ?? "Failed to load metrics"} onRetry={refetch} /></div>;
 
-  const empty = m.latency.length === 0 && m.throughput.length === 0;
+  const empty = m.series.length === 0;
 
   return (
     <div className="col" style={{ gap: 10 }}>
@@ -316,31 +315,17 @@ function MetricsTab() {
           {stats.map((s) => <StatCard key={s.label} stat={s} small />)}
         </div>
       )}
-      <Card title="Pipeline metrics" right={<CardLink onClick={refetch}>Refresh</CardLink>}>
+      <Card title="Pipeline metrics" right={<span className="row"><Badge tone={m.signozExporting ? "teal" : "grey"}>{m.signozExporting ? "SigNoz exporting" : "Local store"}</Badge><CardLink onClick={refetch}>Refresh</CardLink></span>}>
         {empty ? (
           <EmptyState icon="chartBar">No metric series yet — charts appear once the pipeline emits telemetry.</EmptyState>
         ) : (
-          <>
-            <div className="legend" style={{ marginBottom: 6 }}>
-              <span className="lg"><i style={{ background: "var(--series-1)" }} /> p95 latency</span>
-              <span className="lg"><i style={{ background: "var(--series-6)" }} /> Error rate</span>
-              <span className="lg"><i style={{ background: "var(--series-2)" }} /> GPU utilization</span>
-              <span className="lg"><i style={{ background: "var(--series-4)" }} /> Throughput</span>
-            </div>
-            <LineChart
-              series={[
-                { name: "p95 latency (m)", data: m.latency, color: "var(--series-1)" },
-                { name: "Error rate (%)", data: m.error, color: "var(--series-6)" },
-                { name: "GPU (%)", data: m.gpu.map((v) => v / 5.4), color: "var(--series-2)" },
-                { name: "Throughput (k spans/min)", data: m.throughput, color: "var(--series-4)" },
-              ]}
-              height={220}
-              yMin={0}
-              yTicks={4}
-              yFormat={(v) => `${v.toFixed(0)}`}
-              xLabels={m.labels}
-            />
-          </>
+          <div className="ob-metric-grid">
+            {m.series.map((series, index) => <section className="ob-metric" key={series.name}>
+              <div className="row between"><div className="col" style={{ gap: 2 }}><b className="mono small">{series.name}</b><span className="micro t3">{series.count} recorded points</span></div><span className="mono" style={{ fontSize: 18 }}>{series.latest === null ? "—" : Number(series.latest.toPrecision(4))}</span></div>
+              <LineChart series={[{ name: series.name, data: series.values, color: `var(--series-${index % 6 + 1})` }]} height={112} yTicks={3} xLabels={series.labels} />
+              <div className="row between micro t3"><span>min {series.minimum === null ? "—" : Number(series.minimum.toPrecision(4))}</span><span>max {series.maximum === null ? "—" : Number(series.maximum.toPrecision(4))}</span></div>
+            </section>)}
+          </div>
         )}
       </Card>
     </div>

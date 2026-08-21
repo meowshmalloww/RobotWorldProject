@@ -6,7 +6,8 @@ import { Delta, Pagination, SearchBox, StatusBadge } from "../components/ui/cont
 import { useToast } from "../components/ui/Toast";
 import { CoverageBands } from "../components/charts/CoverageBands";
 import { DonutGauge } from "../components/charts/DonutGauge";
-import { Heatmap, DistributionDonut } from "../components/charts/Heatmap";
+import { DistributionDonut } from "../components/charts/Heatmap";
+import { RadarChart } from "../components/charts/RadarChart";
 import { pctTone } from "../components/ui/helpers";
 import { useApi } from "../lib/useApi";
 import { EmptyState, ErrorState, Skeleton } from "../lib/states";
@@ -240,14 +241,15 @@ export default function Skills() {
             )}
           </Card>
 
-          {/* Coverage heatmap */}
-          <Card title="Coverage Heatmap" info collapsible>
-            {data && data.coverageDims.length > 0 ? (
-              <Heatmap rows={data.coverageDims.map((d) => ({ label: d.dimension, values: d.bands }))} />
+          <Card title="Measured Capability Profile" info collapsible>
+            {data && data.coverageDims.length >= 3 ? (
+              <div className="center" style={{ padding: "4px 0" }}>
+                <RadarChart data={data.coverageDims.map((d) => ({ label: d.dimension, value: d.coverage }))} />
+              </div>
             ) : loading && !data ? (
               <Skeleton rows={4} />
             ) : (
-              <EmptyState icon="grid">No coverage data yet.</EmptyState>
+              <EmptyState icon="gauge">A radar appears after at least three evaluated capability dimensions exist.</EmptyState>
             )}
           </Card>
 

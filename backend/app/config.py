@@ -125,7 +125,7 @@ DEFAULT_SETTINGS: dict = {
         "renderer": "mujoco-offscreen",
         "isaacRoot": env.isaac_sim_root or "",
         "isaacAssetRoot": env.isaacsim_asset_root or "",
-        "isaacVersion": "6.0",
+        "isaacVersion": "5.1",
     },
     "models": {
         "planner": env.openai_model,

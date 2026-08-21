@@ -65,9 +65,14 @@ def measured_fit(model_path: Path, target_width: float, target_height: float, ta
     }
 
 
-def world_bounds(fit: dict[str, Any], translation: tuple[float, float, float], rotation_z_deg: float = 0.0) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
-    low = fit["local_usd_low"]
-    high = fit["local_usd_high"]
+def world_bounds(
+    fit: dict[str, Any],
+    translation: tuple[float, float, float],
+    rotation_z_deg: float = 0.0,
+    scale_multiplier: tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    low = tuple(float(fit["local_usd_low"][index]) * scale_multiplier[index] for index in range(3))
+    high = tuple(float(fit["local_usd_high"][index]) * scale_multiplier[index] for index in range(3))
     angle = math.radians(float(rotation_z_deg))
     cosine, sine = math.cos(angle), math.sin(angle)
     corners = [(x, y) for x in (low[0], high[0]) for y in (low[1], high[1])]

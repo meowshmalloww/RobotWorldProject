@@ -1,4 +1,4 @@
-"""Isaac Sim 6.0 readiness and Franka launch contract.
+"""Isaac Sim 5.1 readiness and Franka launch contract.
 
 This module never imports Isaac packages inside FastAPI. Isaac Sim ships its
 own Python runtime; RobotWorld writes a launch manifest that the standalone
@@ -13,7 +13,7 @@ from typing import Any
 
 from ..config import WORLDS_DIR
 
-VERSION = "6.0"
+VERSION = "5.1"
 FRANKA_ASSET = "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
 
 
@@ -34,7 +34,7 @@ def inspect(configured_root: str = "", configured_asset_root: str = "") -> dict[
     installed = bool(root and python and launcher)
     blockers: list[str] = []
     if not installed:
-        blockers.append("Isaac Sim 6.0 runtime is not installed or simulation.isaacRoot is not configured.")
+        blockers.append("Isaac Sim 5.1 runtime is not installed or simulation.isaacRoot is not configured.")
     asset_root = configured_asset_root or os.environ.get("ISAACSIM_ASSET_ROOT", "")
     if installed and asset_root and not (asset_root.startswith("http://") or asset_root.startswith("https://") or Path(asset_root).exists()):
         blockers.append("Configured Isaac asset root is unreachable on this machine.")

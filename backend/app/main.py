@@ -56,6 +56,7 @@ from .services.remote_policy import PolicyClient, PolicyConfig, PolicyError
 log = logging.getLogger(__name__)
 STARTED_AT = time.monotonic()
 _tasks: set[asyncio.Task] = set()
+HIDDEN_LEGACY_SKILLS = {"open-refrigerator"}
 
 
 class AgentRunIn(BaseModel):
@@ -122,6 +123,7 @@ class SceneIn(BaseModel):
 class PlacementIn(BaseModel):
     translation: tuple[float, float, float] | None = None
     rotationZDeg: float | None = Field(default=None, ge=-36000, le=36000)
+    scaleMultiplier: tuple[float, float, float] | None = None
     visible: bool | None = None
     mobility: Literal["movable", "fixed"] | None = None
 
@@ -130,6 +132,16 @@ class PlacementIn(BaseModel):
     def finite_translation(cls, value):
         if value is not None and (any(not math.isfinite(item) for item in value) or any(abs(item) > 1000 for item in value)):
             raise ValueError("translation must contain finite world coordinates within 1000 metres")
+        return value
+
+    @field_validator("scaleMultiplier")
+    @classmethod
+    def finite_scale_multiplier(cls, value):
+        if value is not None and (
+            any(not math.isfinite(item) for item in value)
+            or any(item < 0.02 or item > 100 for item in value)
+        ):
+            raise ValueError("scaleMultiplier must contain finite values between 0.02 and 100")
         return value
 
 
@@ -287,13 +299,13 @@ LOOP_STAGES = [
 @app.get("/api/overview")
 async def overview():
     async with SessionLocal() as session:
-        skills = (await session.execute(select(Skill).order_by(Skill.name))).scalars().all()
+        skills = (await session.execute(select(Skill).where(Skill.id.not_in(HIDDEN_LEGACY_SKILLS)).order_by(Skill.name))).scalars().all()
         skill_rows = [await catalog.skill_summary(session, row) for row in skills]
         assets = (await session.execute(select(Asset).order_by(Asset.created_at.desc()))).scalars().all()
         sources = (await session.execute(select(Source).order_by(Source.created_at.desc()))).scalars().all()
-        runs = (await session.execute(select(TrainingRun).order_by(TrainingRun.created_at.desc()))).scalars().all()
+        runs = (await session.execute(select(TrainingRun).where((TrainingRun.skill_id.is_(None)) | (TrainingRun.skill_id.not_in(HIDDEN_LEGACY_SKILLS))).order_by(TrainingRun.created_at.desc()))).scalars().all()
         jobs = (await session.execute(select(Job).order_by(Job.updated_at.desc()).limit(8))).scalars().all()
-        evals = (await session.execute(select(Evaluation).order_by(Evaluation.created_at))).scalars().all()
+        evals = (await session.execute(select(Evaluation).where(Evaluation.skill_id.not_in(HIDDEN_LEGACY_SKILLS)).order_by(Evaluation.created_at))).scalars().all()
 
     total_evals = len(evals)
     pass_rate = 100 * sum(e.success for e in evals) / total_evals if total_evals else 0.0
@@ -357,7 +369,7 @@ async def overview():
 @app.get("/api/skills")
 async def skills_list():
     async with SessionLocal() as session:
-        rows = (await session.execute(select(Skill).order_by(Skill.name))).scalars().all()
+        rows = (await session.execute(select(Skill).where(Skill.id.not_in(HIDDEN_LEGACY_SKILLS)).order_by(Skill.name))).scalars().all()
         skills = [await catalog.skill_summary(session, row) for row in rows]
         details = [await catalog.skill_detail(session, row) for row in rows]
     avg_success = statistics.fmean([row["success"] for row in skills]) if skills else 0.0
@@ -397,6 +409,8 @@ async def skills_list():
 
 @app.get("/api/skills/{skill_id}")
 async def skill_detail(skill_id: str):
+    if skill_id in HIDDEN_LEGACY_SKILLS:
+        raise HTTPException(404, "Skill not found")
     async with SessionLocal() as session:
         row = await session.get(Skill, skill_id)
         if row is None:
@@ -1037,6 +1051,12 @@ def _world_assembly_rows(ids: list[str], by_id: dict[str, Asset], state: dict[st
         persisted = (state or {}).get(item["asset_id"], {})
         persisted_translation = persisted.get("translation")
         rotation_z_deg = float(persisted.get("rotationZDeg") or 0.0)
+        raw_multiplier = persisted.get("scaleMultiplier")
+        scale_multiplier = (
+            tuple(float(value) for value in raw_multiplier)
+            if isinstance(raw_multiplier, list) and len(raw_multiplier) == 3
+            else (1.0, 1.0, 1.0)
+        )
         fixed_terms = ("counter", "island", "table", "sink", "faucet", "tap", "cabinet", "wall", "blender")
         inferred_mobility = "fixed" if any(term in f"{category} {name}" for term in fixed_terms) else "movable"
         mobility = persisted.get("mobility") if persisted.get("mobility") in {"movable", "fixed"} else inferred_mobility
@@ -1063,15 +1083,19 @@ def _world_assembly_rows(ids: list[str], by_id: dict[str, Asset], state: dict[st
         else:
             translation = (float(item["index"]) * 0.4, 0.0, -low[2])
             anchor = {"mode": "floor", "surface": "world floor", "gap_m": 0.0}
-        bounds = world_geometry.world_bounds(fit, translation, rotation_z_deg)
+        final_scale = tuple(float(fit["scale"][index]) * scale_multiplier[index] for index in range(3))
+        scaled_dimensions = tuple(float(fit["target_dimensions"][index]) * scale_multiplier[index] for index in range(3))
+        bounds = world_geometry.world_bounds(fit, translation, rotation_z_deg, scale_multiplier)
         rows.append({
             **{key: value for key, value in item.items() if key not in {"fit", "category", "index"}},
             "translation": translation,
             "rotation_z_deg": rotation_z_deg,
-            "scale": fit["scale"],
+            "base_scale": fit["scale"],
+            "scale_multiplier": scale_multiplier,
+            "scale": final_scale,
             "raw_bounds": fit["raw_bounds"],
             "raw_extents": fit["raw_extents"],
-            "target_dimensions": fit["target_dimensions"],
+            "target_dimensions": scaled_dimensions,
             "world_bounds": bounds,
             "anchor": anchor,
             "mobility": mobility,
@@ -1087,6 +1111,8 @@ def _placement_api(row: dict[str, Any]) -> dict[str, Any]:
         "name": row["asset_name"],
         "translation": list(row["translation"]),
         "rotationZDeg": row["rotation_z_deg"],
+        "baseScale": list(row["base_scale"]),
+        "scaleMultiplier": list(row["scale_multiplier"]),
         "scale": list(row["scale"]),
         "rawBounds": [list(value) for value in row["raw_bounds"]],
         "rawExtents": list(row["raw_extents"]),
@@ -1188,6 +1214,9 @@ def _edit_placement(nodes: list[Any], asset_id: str, payload: PlacementIn) -> bo
                 node["visible"] = payload.visible
             if payload.rotationZDeg is not None:
                 node["rotationZDeg"] = float(payload.rotationZDeg) % 360.0
+            if payload.scaleMultiplier is not None:
+                node["scaleMultiplier"] = list(payload.scaleMultiplier)
+                node["anchor"] = {"mode": "manual", "surface": "user-authored transform", "gap_m": 0.0}
             if payload.mobility is not None:
                 node["mobility"] = payload.mobility
             changed = True
@@ -1221,7 +1250,10 @@ async def auto_layout_world():
             raise HTTPException(404, "No active world")
         ids = _placed_asset_ids(world.scene_tree)
         found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
-        rows = _world_assembly_rows(ids, {row.id: row for row in found}, _placement_state(world.scene_tree))
+        # Auto-layout is an explicit reset of manual transforms. Solve from the
+        # measured canonical dimensions rather than feeding prior bad offsets
+        # back into the support-surface calculation.
+        rows = _world_assembly_rows(ids, {row.id: row for row in found})
         if not rows:
             raise HTTPException(409, "Place generated assets before running auto-layout.")
 
@@ -1265,6 +1297,8 @@ async def auto_layout_world():
         for node in tree:
             if isinstance(node, dict) and node.get("assetId") in arranged:
                 node["translation"], node["anchor"] = arranged[str(node["assetId"])]
+                node["rotationZDeg"] = 0.0
+                node["scaleMultiplier"] = [1.0, 1.0, 1.0]
                 node["visible"] = True
         world.scene_tree = tree
         await _author_world_assembly(session, world, tree)
@@ -1470,8 +1504,6 @@ async def model_status():
     """Report installed weights, executable readiness, and real build timings."""
     flat = await settings_store.get_flat()
     native_path = str(flat.get("models.trellisNativePath") or r"D:\TRELLIS.2-4B")
-    gguf_path = str(flat.get("models.trellisGgufPath") or r"D:\TRELLIS.2-4B-Q4-GGUF")
-    cpp_path = str(flat.get("models.trellisCppPath") or r"D:\trellis.cpp-v0.6.0-cuda12")
     async with SessionLocal() as session:
         assets = (await session.execute(select(Asset).order_by(Asset.created_at.desc()))).scalars().all()
         stages = (await session.execute(select(CompileStage).order_by(CompileStage.asset_id, CompileStage.idx))).scalars().all()
@@ -1499,17 +1531,16 @@ async def model_status():
             "totalSeconds": round(sum(row.duration_s for row in rows), 3),
             "status": "failed" if any(row.status == "failed" for row in rows) else "completed",
         })
-    runtimes = await asyncio.to_thread(model_registry.inspect_trellis, native_path, gguf_path, cpp_path, r"D:\DINOv3")
-    runtime_names = {row["runtime"] for row in history if row["status"] == "completed"}
-    comparable = {"native", "gguf"}.issubset(runtime_names)
+    inspected = await asyncio.to_thread(model_registry.inspect_trellis, native_path, "", "", r"D:\DINOv3")
+    runtimes = [row for row in inspected if row.get("id") == "trellis-native"]
     return {
         "vlaJepa": await asyncio.to_thread(local_vla.inspect_checkpoint),
         "trellis": runtimes,
         "hardware": await asyncio.to_thread(performance.snapshot),
         "generationHistory": history[:30],
-        "benchmarkComparable": comparable,
-        "benchmarkRunnable": all(row.get("available") and row.get("status", "").startswith("ready") for row in runtimes),
-        "benchmarkBlocker": None if comparable else "Q4 and native need matched successful runs using the same source image, resolution, seed, matte, and warm/cold state.",
+        "benchmarkComparable": False,
+        "benchmarkRunnable": False,
+        "benchmarkBlocker": "Quantized TRELLIS is disabled for this workspace; only the native Microsoft pipeline is active.",
     }
 
 
@@ -1730,9 +1761,9 @@ async def approve_source_repair(source_id: str):
 @app.get("/api/training")
 async def training_data():
     async with SessionLocal() as session:
-        runs = (await session.execute(select(TrainingRun).order_by(TrainingRun.created_at.desc()))).scalars().all()
+        runs = (await session.execute(select(TrainingRun).where((TrainingRun.skill_id.is_(None)) | (TrainingRun.skill_id.not_in(HIDDEN_LEGACY_SKILLS))).order_by(TrainingRun.created_at.desc()))).scalars().all()
         decisions = (await session.execute(select(AgentDecision).order_by(AgentDecision.created_at.desc()).limit(1))).scalars().all()
-        evals = (await session.execute(select(Evaluation).order_by(Evaluation.created_at))).scalars().all()
+        evals = (await session.execute(select(Evaluation).where(Evaluation.skill_id.not_in(HIDDEN_LEGACY_SKILLS)).order_by(Evaluation.created_at))).scalars().all()
     successes = [100.0 if row.success else 0.0 for row in evals]
     collisions = [float(row.collisions) for row in evals]
     best_run = max(runs, key=lambda row: row.success_after or 0.0, default=None)
@@ -1742,7 +1773,7 @@ async def training_data():
         {"label": "Best policy", "value": best_run.policy if best_run else "—", "icon": "trophy", "tint": "amber", "foot": f"{best_run.success_after:.1f}% measured success" if best_run and best_run.success_after is not None else "no completed adaptation"},
         {"label": "Average improvement", "value": f"{avg_delta:+.1f}pp", "icon": "training", "tint": "green", "foot": "completed runs"},
         {"label": "Evaluation success", "value": f"{statistics.fmean(successes):.1f}%" if successes else "0.0%", "icon": "gauge", "tint": "green", "foot": f"{len(evals)} episodes", "donut": statistics.fmean(successes) / 100 if successes else 0},
-        {"label": "Current target", "value": "Open Refrigerator", "icon": "target", "tint": "purple", "foot": "configured canonical skill"},
+        {"label": "Current target", "value": runs[0].name if runs else "No active skill", "icon": "target", "tint": "purple", "foot": "latest persisted run" if runs else "attach a compatible robot policy"},
     ]
     decision = decisions[0] if decisions else None
     comparison = []
@@ -1753,8 +1784,8 @@ async def training_data():
         "stats": stats,
         "runs": [await catalog.training_run_out(row) for row in runs],
         "evalComparison": comparison,
-        "successCurve": {"best": successes, "baseline": successes[:-1]},
-        "collisionCurve": {"best": collisions, "baseline": collisions[:-1]},
+        "successCurve": {"measured": successes},
+        "collisionCurve": {"measured": collisions},
         "agentDecision": ({"title": decision.title, "decision": decision.decision, "evidence": decision.evidence, "nextStep": decision.next_step, "confidence": decision.confidence} if decision else None),
     }
 
@@ -1767,7 +1798,7 @@ async def queue_training():
 async def _obs_stats() -> list[dict[str, Any]]:
     async with SessionLocal() as session:
         spans = (await session.execute(select(Span).order_by(Span.created_at.desc()).limit(1000))).scalars().all()
-        evals = (await session.execute(select(Evaluation).order_by(Evaluation.created_at.desc()).limit(200))).scalars().all()
+        evals = (await session.execute(select(Evaluation).where(Evaluation.skill_id.not_in(HIDDEN_LEGACY_SKILLS)).order_by(Evaluation.created_at.desc()).limit(200))).scalars().all()
         repairs = (await session.execute(select(func.count(RepairEvent.id)))).scalar() or 0
     errors = sum(row.status == "error" for row in spans)
     durations = [row.duration_ms for row in spans]
@@ -1852,10 +1883,20 @@ async def observability_metrics():
     buckets: dict[str, list[MetricPoint]] = defaultdict(list)
     for row in rows:
         buckets[row.name].append(row)
-    names = list(buckets)[:4]
-    labels = [datetime.fromtimestamp(row.ts_ms / 1000).strftime("%H:%M:%S") for row in rows[-60:]]
-    series = {name: [point.value for point in buckets[name][-60:]] for name in names}
-    return {"labels": labels, "series": series, "metrics": names, "latency": series.get("http.server.duration_ms", []), "error": series.get("skill.failure", []), "gpu": [], "throughput": series.get("robot.evaluation", [])}
+    output = []
+    for name, points in list(buckets.items())[:8]:
+        sampled = points[-90:]
+        values = [float(point.value) for point in sampled]
+        output.append({
+            "name": name,
+            "labels": [datetime.fromtimestamp(point.ts_ms / 1000).strftime("%H:%M:%S") for point in sampled],
+            "values": values,
+            "count": len(points),
+            "latest": values[-1] if values else None,
+            "minimum": min(values) if values else None,
+            "maximum": max(values) if values else None,
+        })
+    return {"series": output, "pointCount": len(rows), "store": "local-opentelemetry-mirror", "signozExporting": signoz_exporting()}
 
 
 @app.get("/api/observability/logs")
@@ -1952,7 +1993,7 @@ async def put_key(service: str, payload: KeyIn):
 @app.post("/api/integrations/port/sync")
 async def sync_port_catalog():
     async with SessionLocal() as session:
-        skills = (await session.execute(select(Skill))).scalars().all()
+        skills = (await session.execute(select(Skill).where(Skill.id.not_in(HIDDEN_LEGACY_SKILLS)))).scalars().all()
         assets = (await session.execute(select(Asset))).scalars().all()
     synced = 0
     try:

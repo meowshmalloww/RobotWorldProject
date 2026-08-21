@@ -1,4 +1,4 @@
-"""Run with Isaac Sim 6.0's python.bat, never the RobotWorld venv.
+"""Run with Isaac Sim 5.1's python.bat, never the RobotWorld venv.
 
 Usage: <isaac-root>/python.bat backend/isaac_bridge.py <isaac-launch.json>
 The bridge composes RobotWorld's physics-authored stage and NVIDIA's official
@@ -29,8 +29,8 @@ def main() -> None:
         raise SystemExit("Expected one isaac-launch.json path.")
     manifest_path = Path(sys.argv[1]).resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf8"))
-    if manifest.get("simulatorVersion") != "6.0":
-        raise RuntimeError("This bridge targets Isaac Sim 6.0 exactly.")
+    if manifest.get("simulatorVersion") != "5.1":
+        raise RuntimeError("This bridge targets Isaac Sim 5.1 exactly.")
 
     world_stage = Path(manifest["worldStage"]).resolve()
     if not world_stage.is_file():

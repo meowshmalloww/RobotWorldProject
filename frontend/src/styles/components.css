@@ -503,6 +503,21 @@
 .world-editor .card { border-color: rgba(255,255,255,.09); }
 .world-editor .dockbar { background: #262626; }
 .viewport canvas { display: block; }
+.world-editor-canvas {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  outline: none;
+  background: #111419;
+  cursor: grab;
+}
+.world-editor-canvas:focus-visible {
+  box-shadow: inset 0 0 0 1px rgba(96, 165, 250, .72);
+}
+.world-editor-canvas:active { cursor: grabbing; }
+.world-editor-canvas canvas { width: 100%; height: 100%; display: block; }
 .vp-overlay { position: absolute; z-index: var(--z-vp-overlay); pointer-events: none; }
 .vp-overlay--stack {
   display: inline-flex;
@@ -787,6 +802,16 @@ body.col-resizing iframe, body.row-resizing iframe, body.col-resizing canvas, bo
   font-size: 10px; font-weight: 650; font-variant-numeric: tabular-nums;
 }
 
+.radar-chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.radar-grid { fill: rgba(94, 234, 212, .018); stroke: rgba(148, 163, 184, .26); stroke-width: 1; }
+.radar-axis { stroke: rgba(148, 163, 184, .19); stroke-width: 1; }
+.radar-value { fill: rgba(45, 212, 191, .18); stroke: #2dd4bf; stroke-width: 2; filter: drop-shadow(0 0 5px rgba(45, 212, 191, .18)); }
+.radar-chart text { fill: var(--text-2); font: 10px var(--font-sans); }
+
+.ob-metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: var(--border); }
+.ob-metric { min-width: 0; padding: 12px 14px 9px; background: var(--bg-panel-1); }
+@media (max-width: 980px) { .ob-metric-grid { grid-template-columns: 1fr; } }
+
 /* ---- Autonomous Loop stepper (compact) --------------------------------------- */
 .loop-stepper { display: flex; align-items: flex-start; gap: 0; overflow: hidden; }
 .loop-step {
@@ -855,7 +880,16 @@ body.col-resizing iframe, body.row-resizing iframe, body.col-resizing canvas, bo
 .unity-panel, .unity-inspector, .unity-shelf {
   background: #18191C !important;
   border-color: #27272A !important;
+  transition: width 120ms var(--ease), background-color 140ms var(--ease);
 }
+
+.unity-panel .tree-row,
+.unity-inspector .tabs button,
+.unity-shelf .tabs button {
+  transition: color 120ms var(--ease), background-color 120ms var(--ease), transform 120ms var(--ease);
+}
+
+.unity-panel .tree-row:hover { transform: translateX(1px); }
 
 .unity-axis-input {
   transition: border-color 0.12s ease;

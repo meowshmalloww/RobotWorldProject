@@ -18,7 +18,6 @@ def test_primary_read_contract() -> None:
         paths = [
             "/api/overview",
             "/api/skills",
-            "/api/skills/open-refrigerator",
             "/api/assets",
             "/api/worlds/scene",
             "/api/sources",
@@ -34,6 +33,7 @@ def test_primary_read_contract() -> None:
         for path in paths:
             response = client.get(path)
             assert response.status_code == 200, (path, response.text)
+        assert client.get("/api/skills/open-refrigerator").status_code == 404
 
 
 def test_write_only_secrets_survive_section_save() -> None:
@@ -85,7 +85,9 @@ def test_world_mutations_and_checks() -> None:
             assert placement["massKg"] > 0
             actual = [placement["worldBounds"][1][i] - placement["worldBounds"][0][i] for i in range(3)]
             assert max(abs(actual[i] - placement["targetDimensions"][i]) for i in range(3)) < 0.002
-            assert placement["anchor"]["surface"] in {"world floor", "countertop"}
+            assert isinstance(placement["anchor"]["surface"], str) and placement["anchor"]["surface"]
+            assert len(placement["baseScale"]) == 3
+            assert len(placement["scaleMultiplier"]) == 3
         assert client.put("/api/worlds/scene", json={"sceneTree": scene["sceneTree"], "variants": scene["variants"]}).status_code == 200
         checks = client.post("/api/worlds/checks/run", json={}).json()["physicsChecks"]
         assert checks and all(item["status"] in {"pass", "warn", "fail"} for item in checks)
@@ -93,11 +95,15 @@ def test_world_mutations_and_checks() -> None:
             assert any(item["check"].startswith("Measured mesh fit") for item in checks)
             first = scene["placements"][0]
             moved = [first["translation"][0] + 0.01, first["translation"][1], first["translation"][2]]
-            assert client.patch(f"/api/worlds/placements/{first['assetId']}", json={"translation": moved, "rotationZDeg": 15}).status_code == 200
+            assert client.patch(f"/api/worlds/placements/{first['assetId']}", json={"translation": moved, "rotationZDeg": 15, "scaleMultiplier": [1.1, 1.0, 1.0]}).status_code == 200
             updated = client.get("/api/worlds/scene").json()
-            actual = next(item for item in updated["placements"] if item["assetId"] == first["assetId"])["translation"]
+            updated_first = next(item for item in updated["placements"] if item["assetId"] == first["assetId"])
+            actual = updated_first["translation"]
             assert actual == moved
-            assert next(item for item in updated["placements"] if item["assetId"] == first["assetId"])["rotationZDeg"] == 15
+            assert updated_first["rotationZDeg"] == 15
+            assert updated_first["scaleMultiplier"] == [1.1, 1.0, 1.0]
+            assert client.patch(f"/api/worlds/placements/{first['assetId']}", json={"scaleMultiplier": [0, 1, 1]}).status_code == 422
+            assert client.put("/api/worlds/scene", json={"sceneTree": scene["sceneTree"], "variants": scene["variants"]}).status_code == 200
         camera_probe = client.post("/api/worlds/cameras/probe", json={})
         assert camera_probe.status_code == 200
         for camera in camera_probe.json()["cameras"].values():
@@ -126,7 +132,7 @@ def test_frontend_diagnostics_and_isaac_franka_fail_closed() -> None:
 
         status = client.get("/api/simulation/isaac")
         assert status.status_code == 200
-        assert status.json()["version"] == "6.0"
+        assert status.json()["version"] == "5.1"
         assert status.json()["franka"]["armDof"] == 7
         assert status.json()["franka"]["fingerJoints"] == 2
 

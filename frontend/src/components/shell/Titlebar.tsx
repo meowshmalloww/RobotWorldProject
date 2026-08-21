@@ -138,7 +138,7 @@ export function Titlebar() {
         </Menu>
         <Menu width={220} trigger={(open) => <button className={`tb-menu-btn ${open ? "open" : ""}`}>Run</button>}>
           <MenuItem icon="play" onClick={() => nav("/worlds?mode=live")}>Start live evaluation</MenuItem>
-          <MenuItem icon="robot" onClick={runAgent}>Run diagnostics agent</MenuItem>
+          <MenuItem icon="workflow" onClick={runAgent}>Run diagnostics agent</MenuItem>
           <MenuItem icon="refresh" onClick={() => nav("/worlds")}>Open scene editor</MenuItem>
         </Menu>
           <Menu width={190} trigger={(open) => <button className={`tb-menu-btn ${open ? "open" : ""}`}>Help</button>}>
@@ -193,7 +193,6 @@ export function Titlebar() {
 export function StatusBar() {
   const [performance, setPerformance] = useState<Performance | null>(null);
   const [down, setDown] = useState(false);
-  const [uiFps, setUiFps] = useState<number | null>(null);
   const [worldFrame, setWorldFrame] = useState<WorldFrameMetric | null>(null);
 
   useEffect(() => {
@@ -218,19 +217,6 @@ export function StatusBar() {
   }, []);
 
   useEffect(() => {
-    let frames = 0;
-    let startedAt = window.performance.now();
-    let frameId = 0;
-    const sample = (now: number) => {
-      frames += 1;
-      if (now - startedAt >= 1000) {
-        setUiFps(Math.round((frames * 1000) / (now - startedAt)));
-        frames = 0;
-        startedAt = now;
-      }
-      frameId = window.requestAnimationFrame(sample);
-    };
-    frameId = window.requestAnimationFrame(sample);
     const onWorldFrame = (event: Event) => {
       const detail = (event as CustomEvent<Omit<WorldFrameMetric, "at">>).detail;
       if (!detail || typeof detail.fps !== "number") return;
@@ -241,7 +227,6 @@ export function StatusBar() {
       setWorldFrame((current) => current && window.performance.now() - current.at > 1500 ? null : current);
     }, 1000);
     return () => {
-      window.cancelAnimationFrame(frameId);
       window.removeEventListener("robotworld:world-frame", onWorldFrame);
       window.clearInterval(stale);
     };
@@ -254,12 +239,10 @@ export function StatusBar() {
       <span className="sb-item">CPU {performance?.cpuPercent ?? "—"}{performance?.cpuPercent !== null && performance?.cpuPercent !== undefined ? "%" : ""}</span>
       <span className="sep" />
       <span className="sb-item">RAM {performance ? `${performance.memory.usedGb}/${performance.memory.totalGb} GB` : "—"}</span>
+      <span className="sep" />
+      <span className="sb-item" title="Measured frames rendered by the interactive world viewport">Editor {worldFrame?.active && worldFrame.fps > 0 ? `${worldFrame.fps} FPS` : "— FPS"}</span>
       <span className="grow" />
       <span className="sb-item">GPU {performance?.gpu.available ? `${performance.gpu.utilizationPercent}% · ${performance.gpu.memoryUsedMb}/${performance.gpu.memoryTotalMb} MB` : "unavailable"}</span>
-      <span className="sep" />
-      <span className="sb-item">World {worldFrame?.active && worldFrame.fps > 0 ? `${worldFrame.fps} FPS${worldFrame.latencyMs !== null ? ` · ${worldFrame.latencyMs} ms` : ""}` : "idle"}</span>
-      <span className="sep" />
-      <span className="sb-item" title="Browser requestAnimationFrame callbacks per second">UI rAF {uiFps === null ? "measuring" : `${uiFps}/s`}</span>
     </footer>
   );
 }

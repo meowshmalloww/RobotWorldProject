@@ -8,8 +8,7 @@ from __future__ import annotations
 from sqlalchemy import select
 
 from .db import SessionLocal
-from .models import Skill, Variant, World
-from .services import evaluator
+from .models import Variant, World
 
 
 SCENE_TREE = [
@@ -53,18 +52,6 @@ SCENE_TREE = [
 
 async def seed_definitions() -> None:
     async with SessionLocal() as session:
-        skill = await session.get(Skill, "open-refrigerator")
-        if skill is None:
-            skill = Skill(
-                id="open-refrigerator",
-                name="Open Refrigerator",
-                category="Manipulation",
-                description="Reach, grasp, and open an articulated refrigerator door across physical variations.",
-                icon="fridge",
-                target=85.0,
-            )
-            session.add(skill)
-
         world = await session.get(World, "door-validation-lab")
         if world is None:
             session.add(World(id="door-validation-lab", name="Articulated Door Validation Lab", scene_tree=SCENE_TREE, active=True))
@@ -82,7 +69,3 @@ async def seed_definitions() -> None:
                 )
             )
         await session.commit()
-
-    # Scenario rows are deterministic, persisted physical parameter sets.
-    async with SessionLocal() as session:
-        await evaluator.ensure_families(session, "open-refrigerator")

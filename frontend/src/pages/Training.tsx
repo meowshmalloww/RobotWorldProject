@@ -16,8 +16,8 @@ interface TrainingData {
   stats: Stat[];
   runs: TrainingRun[];
   evalComparison: EvalComparisonRow[];
-  successCurve: { best: number[]; baseline: number[] };
-  collisionCurve: { best: number[]; baseline: number[] };
+  successCurve: { measured: number[] };
+  collisionCurve: { measured: number[] };
   agentDecision: {
     title: string;
     decision: string;
@@ -199,16 +199,14 @@ export default function Training() {
             <Card title="Measured evaluation success history" info>
               {loading && !data ? (
                 <Skeleton rows={4} />
-              ) : data && data.successCurve.best.length > 1 ? (
+              ) : data && data.successCurve.measured.length > 1 ? (
                 <>
                   <div className="legend" style={{ marginBottom: 4 }}>
-                    <span className="lg"><i style={{ background: "var(--series-2)" }} /> Best</span>
-                    <span className="lg"><i style={{ background: "var(--series-1)" }} /> Baseline</span>
+                    <span className="lg"><i style={{ background: "var(--series-2)" }} /> Recorded episode outcome</span>
                   </div>
                   <LineChart
                     series={[
-                      { name: "Best", data: data.successCurve.best, color: "var(--series-2)", endLabel: `${data.successCurve.best.at(-1)?.toFixed(1)}%` },
-                      { name: "Baseline", data: data.successCurve.baseline, color: "var(--series-1)", endLabel: `${data.successCurve.baseline.at(-1)?.toFixed(1)}%` },
+                      { name: "Measured", data: data.successCurve.measured, color: "var(--series-2)", endLabel: `${data.successCurve.measured.at(-1)?.toFixed(1)}%` },
                     ]}
                     height={190}
                     yMin={0}
@@ -224,21 +222,19 @@ export default function Training() {
             <Card title="Measured collision history" info>
               {loading && !data ? (
                 <Skeleton rows={4} />
-              ) : data && data.collisionCurve.best.length > 1 ? (
+              ) : data && data.collisionCurve.measured.length > 1 ? (
                 <>
                   <div className="legend" style={{ marginBottom: 4 }}>
-                    <span className="lg"><i style={{ background: "var(--series-2)" }} /> Best</span>
-                    <span className="lg"><i style={{ background: "var(--series-1)" }} /> Baseline</span>
+                    <span className="lg"><i style={{ background: "var(--series-2)" }} /> Recorded collision count</span>
                   </div>
                   <LineChart
                     series={[
-                      { name: "Best", data: data.collisionCurve.best, color: "var(--series-2)", endLabel: `${data.collisionCurve.best.at(-1)?.toFixed(1)}%` },
-                      { name: "Baseline", data: data.collisionCurve.baseline, color: "var(--series-1)", endLabel: `${data.collisionCurve.baseline.at(-1)?.toFixed(1)}%` },
+                      { name: "Measured", data: data.collisionCurve.measured, color: "var(--series-2)", endLabel: `${data.collisionCurve.measured.at(-1)?.toFixed(0)}` },
                     ]}
                     height={190}
                     yMin={0}
                     yTicks={4}
-                    yFormat={(v) => `${v.toFixed(0)}%`}
+                    yFormat={(v) => `${v.toFixed(0)}`}
                   />
                 </>
               ) : (

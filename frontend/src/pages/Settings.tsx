@@ -11,7 +11,7 @@ import { ErrorState, Skeleton } from "../lib/states";
 
 const NAV: { id: Section; label: string; icon: IconName }[] = [
   { id: "general", label: "General", icon: "settings" },
-  { id: "models", label: "Models", icon: "robot" },
+  { id: "models", label: "Models", icon: "workflow" },
   { id: "integrations", label: "Integrations", icon: "link" },
   { id: "simulation", label: "Simulation", icon: "worlds" },
   { id: "appearance", label: "Appearance", icon: "sun" },
@@ -281,6 +281,13 @@ export function IntegrationsPane({ draft, onChange }: { draft: SettingsData["int
   );
 }
 
+function ModelSelect({ value, options, onChange }: { value: string; options: { value: string; label: string }[]; onChange: (value: string) => void }) {
+  const choices = options.some((option) => option.value === value) || !value
+    ? options
+    : [{ value, label: `${value} (current)` }, ...options];
+  return <select className="select model-select" value={value} onChange={(event) => onChange(event.target.value)}>{choices.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>;
+}
+
 interface ModelStatusData {
   vlaJepa: { available: boolean; robotWorldContract?: { compatible: boolean; blockers: string[] } };
   trellis: Array<{ id: string; label: string; path: string; precision: string; weightsBytes: number; status: string; blockers?: string[]; conditioningPath?: string; conditioningReady?: boolean }>;
@@ -293,24 +300,8 @@ interface ModelStatusData {
 export function ModelsPane({ draft, onChange }: { draft: SettingsData["models"]; onChange: (p: Partial<SettingsData["models"]>) => void }) {
   const toast = useToast();
   const [probingTrellis, setProbingTrellis] = useState(false);
-  const [openaiKey, setOpenaiKey] = useState("");
-  const [savingKey, setSavingKey] = useState(false);
   const { data: status, error: statusError, refetch: refetchStatus } = useApi<ModelStatusData>("/models/status");
   const setModel = (patch: Partial<SettingsData["models"]>) => onChange(patch);
-
-  const rotateOpenAIKey = async () => {
-    if (!openaiKey.trim()) return;
-    setSavingKey(true);
-    try {
-      await api.put("/settings/keys/openai", { key: openaiKey.trim() });
-      setOpenaiKey("");
-      toast.push("ok", "OpenAI credential updated", "Stored server-side; the editor cannot read it back.");
-    } catch (e) {
-      toast.push("err", "Could not update OpenAI key", e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setSavingKey(false);
-    }
-  };
 
   const probeTrellis = async () => {
     setProbingTrellis(true);
@@ -326,123 +317,52 @@ export function ModelsPane({ draft, onChange }: { draft: SettingsData["models"];
 
   const incompatible = status?.vlaJepa.robotWorldContract && !status.vlaJepa.robotWorldContract.compatible;
   return <div className="st-stack">
-    <Card title="OpenAI reasoning">
+    <Card title="Reasoning and vision models">
       <div className="st-grid">
-        <FormRow label="Planner model"><input className="input mono" value={draft.planner} onChange={(e) => setModel({ planner: e.target.value })} /></FormRow>
-        <FormRow label="VLM / orchestrator"><input className="input mono" value={draft.vlm} onChange={(e) => setModel({ vlm: e.target.value })} /></FormRow>
-        <FormRow label="Evidence model"><input className="input mono" value={draft.assetAnalysisModel} onChange={(e) => setModel({ assetAnalysisModel: e.target.value })} /></FormRow>
-        <FormRow label="Provider"><select className="select" value={draft.provider} onChange={(e) => setModel({ provider: e.target.value })}><option value="openai-compatible">OpenAI / compatible</option><option value="openai">OpenAI official</option><option value="local">Local compatible endpoint</option></select></FormRow>
+        <FormRow label="Planner model"><ModelSelect value={draft.planner} onChange={(planner) => setModel({ planner })} options={[{ value: "gpt-5.6-luna", label: "Luna 5.6" }, { value: "gpt-5.6-terra", label: "Terra 5.6" }, { value: "gpt-5.6-sol", label: "Sol 5.6" }]} /></FormRow>
+        <FormRow label="VLM / orchestrator"><ModelSelect value={draft.vlm} onChange={(vlm) => setModel({ vlm })} options={[{ value: "gpt-5.6-luna", label: "Luna 5.6" }, { value: "gpt-5.6-terra", label: "Terra 5.6" }, { value: "gpt-5.6-sol", label: "Sol 5.6" }]} /></FormRow>
+        <FormRow label="Evidence model"><ModelSelect value={draft.assetAnalysisModel} onChange={(assetAnalysisModel) => setModel({ assetAnalysisModel })} options={[{ value: "gpt-5.6-luna", label: "Luna 5.6" }, { value: "gpt-5.6-terra", label: "Terra 5.6" }]} /></FormRow>
+        <FormRow label="Provider"><select className="select" value={draft.provider} onChange={(e) => setModel({ provider: e.target.value })}><option value="openai">Managed OpenAI</option><option value="openai-compatible">Workspace managed</option><option value="local">Local runtime</option></select></FormRow>
         <FormRow label="Reasoning effort"><select className="select" value={draft.reasoningEffort} onChange={(e) => setModel({ reasoningEffort: e.target.value })}>{["none", "low", "medium", "high", "xhigh", "max"].map((value) => <option value={value} key={value}>{value}</option>)}</select></FormRow>
         <FormRow label="Response detail"><select className="select" value={draft.verbosity} onChange={(e) => setModel({ verbosity: e.target.value })}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></FormRow>
-        <FormRow label="OpenAI base URL"><input className="input mono" value={draft.openaiBaseUrl} onChange={(e) => setModel({ openaiBaseUrl: e.target.value })} /></FormRow>
         <FormRow label="Timeout (s)"><input className="input mono" type="number" value={draft.timeoutS} onChange={(e) => setModel({ timeoutS: Number(e.target.value) || 0 })} /></FormRow>
       </div>
-      <div className="st-secret-row"><div><b>OpenAI API key</b><span className="micro t3">Stored: {draft.openaiKey ? "yes" : "no"}. Write-only.</span></div><input className="input mono" type="password" autoComplete="new-password" value={openaiKey} onChange={(e) => setOpenaiKey(e.target.value)} placeholder="Paste replacement key" /><button className="btn btn-secondary btn-sm" disabled={savingKey || !openaiKey.trim()} onClick={rotateOpenAIKey}>{savingKey ? "Saving..." : "Update key"}</button></div>
+      <p className="small t3" style={{ marginTop: 12 }}>Credentials and network endpoints are managed by the local RobotWorld service and are never exposed in the editor.</p>
     </Card>
 
     <Card title="Robot policy / VLA-JEPA" right={<Badge tone={incompatible ? "amber" : "teal"}>{incompatible ? "Adaptation required" : "Detected"}</Badge>}>
       <div className="st-grid">
-        <FormRow label="Default checkpoint"><input className="input mono" value={draft.policyId} onChange={(e) => setModel({ policyId: e.target.value })} /></FormRow>
-        <FormRow label="Local checkpoint"><input className="input mono" value={draft.policyPath} onChange={(e) => setModel({ policyPath: e.target.value })} /></FormRow>
-        <FormRow label="Policy endpoint"><input className="input mono" value={draft.policyEndpoint} onChange={(e) => setModel({ policyEndpoint: e.target.value })} /></FormRow>
-        <FormRow label="Policy revision"><input className="input mono" value={draft.policyModelRevision} onChange={(e) => setModel({ policyModelRevision: e.target.value })} /></FormRow>
+        <FormRow label="Default checkpoint"><ModelSelect value={draft.policyId} onChange={(policyId) => setModel({ policyId })} options={[{ value: "VLA-JEPA-Pretrain", label: "VLA-JEPA Pretrain (local)" }, { value: "", label: "No policy selected" }]} /></FormRow>
+        <FormRow label="Detected checkpoint"><input className="input mono" value={draft.policyPath || "Not detected"} readOnly /></FormRow>
+        <FormRow label="Policy revision"><input className="input mono" value={draft.policyModelRevision || "Unpinned"} readOnly /></FormRow>
         <FormRow label="Execution timeout"><input className="input mono" type="number" value={draft.policyTimeoutS} onChange={(e) => setModel({ policyTimeoutS: Number(e.target.value) || 0 })} /></FormRow>
         <FormRow label="Action horizon"><input className="input mono" type="number" value={draft.policyExecutionHorizon} onChange={(e) => setModel({ policyExecutionHorizon: Number(e.target.value) || 0 })} /></FormRow>
       </div>
       {incompatible && <div className="st-blocker"><b>Execution remains safety-blocked</b>{status?.vlaJepa.robotWorldContract?.blockers.map((value) => <span key={value}>{value}</span>)}<span>Fine-tune or reinitialize the camera, state, and action adapters for this robot before control is enabled.</span></div>}
     </Card>
 
-    <Card title="Microsoft TRELLIS.2" right={<Badge tone={draft.trellisRuntime === "native" ? "teal" : "amber"}>{draft.trellisRuntime === "native" ? "Native" : "GGUF"}</Badge>}>
+    <Card title="Microsoft TRELLIS.2" right={<Badge tone="teal">Native</Badge>}>
       <div className="st-grid">
-        <FormRow label="Runtime"><select className="select" value={draft.trellisRuntime} onChange={(e) => setModel({ trellisRuntime: e.target.value })}><option value="native">Microsoft native BF16/FP16</option><option value="gguf">GGUF / trellis.cpp</option></select></FormRow>
+        <FormRow label="Runtime"><select className="select" value="native" onChange={() => undefined}><option value="native">Microsoft native BF16/FP16</option></select></FormRow>
         <FormRow label="Resolution"><select className="select" value={draft.trellisResolution} onChange={(e) => setModel({ trellisResolution: Number(e.target.value) })}><option value={512}>512 - preview</option><option value={1024}>1024 - balanced</option><option value={1536}>1536 - maximum</option></select></FormRow>
         <FormRow label="Seed"><input className="input mono" type="number" min={0} max={2147483647} value={draft.trellisSeed} onChange={(e) => setModel({ trellisSeed: Math.max(0, Number(e.target.value) || 0) })} /></FormRow>
         <FormRow label="Foreground matte"><select className="select" value={draft.trellisBackgroundRemoval ? "on" : "off"} onChange={(e) => setModel({ trellisBackgroundRemoval: e.target.value === "on" })}><option value="on">BiRefNet/U2-Net enabled</option><option value="off">Use source alpha</option></select></FormRow>
-        <FormRow label="Gateway endpoint"><input className="input mono" value={draft.trellisEndpoint} onChange={(e) => setModel({ trellisEndpoint: e.target.value })} /></FormRow>
-        <FormRow label="Model"><input className="input mono" value={draft.trellisModel} onChange={(e) => setModel({ trellisModel: e.target.value })} /></FormRow>
-        <FormRow label="Native weights"><input className="input mono" value={draft.trellisNativePath} onChange={(e) => setModel({ trellisNativePath: e.target.value })} /></FormRow>
-        <FormRow label="Q4 GGUF bundle"><input className="input mono" value={draft.trellisGgufPath} onChange={(e) => setModel({ trellisGgufPath: e.target.value })} /></FormRow>
-        <FormRow label="trellis.cpp v0.6 runtime"><input className="input mono" value={draft.trellisCppPath} onChange={(e) => setModel({ trellisCppPath: e.target.value })} /></FormRow>
+        <FormRow label="Model"><ModelSelect value={draft.trellisModel} onChange={(trellisModel) => setModel({ trellisModel })} options={[{ value: "TRELLIS.2-4B", label: "TRELLIS.2 4B" }, { value: "microsoft/TRELLIS.2-4B", label: "Microsoft TRELLIS.2 4B" }]} /></FormRow>
+        <FormRow label="Native weights"><input className="input mono" value={draft.trellisNativePath || "Auto-detecting"} readOnly /></FormRow>
         <FormRow label="Timeout (s)"><input className="input mono" type="number" value={draft.trellisTimeoutS} onChange={(e) => setModel({ trellisTimeoutS: Number(e.target.value) || 0 })} /></FormRow>
       </div>
       <p className="small t2" style={{ marginTop: 10 }}>Official modes are 512, 1024, and 1536. The requested 500/1584 choices map to supported 512/1536 modes.</p>
-      <div className="row" style={{ marginTop: 10 }}><button className="btn btn-secondary btn-sm" disabled={probingTrellis} onClick={probeTrellis}><Icon name="shield" size={12} /> {probingTrellis ? "Checking..." : "Verify endpoint"}</button></div>
+      <div className="row" style={{ marginTop: 10 }}><button className="btn btn-secondary btn-sm" disabled={probingTrellis} onClick={probeTrellis}><Icon name="shield" size={12} /> {probingTrellis ? "Checking..." : "Verify native runtime"}</button></div>
     </Card>
 
     <Card title="Installed runtimes" right={<button className="btn btn-ghost btn-sm" onClick={refetchStatus}><Icon name="refresh" size={12} /> Rescan</button>}>
       {statusError && <span className="small" style={{ color: "var(--red)" }}>{statusError.message}</span>}
       {status?.trellis.map((runtime) => <div className="st-runtime" key={runtime.id}><div><b>{runtime.label}</b><span className="mono micro t3">{runtime.path}</span>{runtime.conditioningPath && <span className="mono micro t3">DINOv3: {runtime.conditioningPath}</span>}</div><span className="mono small">{runtime.precision} - {(runtime.weightsBytes / 1024 ** 3).toFixed(1)} GB</span><Badge tone={runtime.status.startsWith("ready") ? "teal" : "amber"}>{runtime.status.replaceAll("_", " ")}</Badge>{runtime.blockers?.map((value) => <span className="micro t3 st-runtime-note" key={value}>{value}</span>)}</div>)}
-      {status && draft.trellisRuntime === "gguf" && !status.benchmarkComparable && <div className="st-blocker"><b>{status.benchmarkRunnable ? "Matched benchmark not run yet" : "Quantized comparison not runnable"}</b><span>{status.benchmarkBlocker}</span><span>No quantized timing or quality score is fabricated.</span></div>}
       {status?.generationHistory.length ? <div className="table-scroll" style={{ marginTop: 10 }}><table className="table"><thead><tr><th>Asset</th><th>Runtime</th><th>Resolution</th><th style={{ textAlign: "right" }}>Total</th></tr></thead><tbody>{status.generationHistory.slice(0, 8).map((row) => <tr key={row.assetId}><td>{row.name}</td><td className="mono">{row.runtime}</td><td className="mono">{row.resolution}</td><td className="mono" style={{ textAlign: "right" }}>{row.totalSeconds.toFixed(1)} s</td></tr>)}</tbody></table></div> : null}
     </Card>
     <Card><SaveSection section="models" draft={draft} /></Card>
   </div>;
 }
-
-function LegacyModelsPane({ draft, onChange }: { draft: SettingsData["models"]; onChange: (p: Partial<SettingsData["models"]>) => void }) {
-  const toast = useToast();
-  const [probingTrellis, setProbingTrellis] = useState(false);
-
-  const setModel = (p: Partial<SettingsData["models"]>) => onChange(p);
-
-  const probeTrellis = async () => {
-    setProbingTrellis(true);
-    try {
-      const result = await api.post<{ compatible: boolean; schemaVersion: string; model: string; output: string; articulation: boolean; pbr: boolean }>(
-        "/integrations/trellis/probe",
-        {},
-      );
-      toast.push("ok", "TRELLIS contract", `${result.model} • ${result.output} • schema ${result.schemaVersion}`);
-    } catch (e) {
-      toast.push("err", "TRELLIS contract check failed", e instanceof ApiError ? e.message : String(e));
-    } finally {
-      setProbingTrellis(false);
-    }
-  };
-
-  return (
-    <div className="st-stack">
-      <Card title="Planning and policies">
-        <div className="st-grid">
-          <FormRow label="Planner model"><input className="input mono" value={draft.planner} onChange={(e) => setModel({ planner: e.target.value })} /></FormRow>
-          <FormRow label="VLM / orchestration model"><input className="input mono" value={draft.vlm} onChange={(e) => setModel({ vlm: e.target.value })} /></FormRow>
-          <FormRow label="OpenAI base URL"><input className="input mono" value={draft.openaiBaseUrl} onChange={(e) => setModel({ openaiBaseUrl: e.target.value })} /></FormRow>
-          <FormRow label="OpenAI API key"><input className="input mono" value={draft.openaiKey} onChange={(e) => setModel({ openaiKey: e.target.value })} /></FormRow>
-          <FormRow label="Model timeout (s)"><input className="input mono" type="number" value={draft.timeoutS} onChange={(e) => setModel({ timeoutS: Number(e.target.value) || 0 })} /></FormRow>
-        </div>
-      </Card>
-      <Card title="Policy / VLA settings">
-        <div className="st-grid">
-          <FormRow label="Policy endpoint"><input className="input mono" value={draft.policyEndpoint} onChange={(e) => setModel({ policyEndpoint: e.target.value })} /></FormRow>
-          <FormRow label="Policy API key"><input className="input mono" value={draft.policyApiKey} onChange={(e) => setModel({ policyApiKey: e.target.value })} /></FormRow>
-          <FormRow label="Policy revision"><input className="input mono" value={draft.policyModelRevision} onChange={(e) => setModel({ policyModelRevision: e.target.value })} /></FormRow>
-          <FormRow label="Policy execution timeout (s)"><input className="input mono" type="number" value={draft.policyTimeoutS} onChange={(e) => setModel({ policyTimeoutS: Number(e.target.value) || 0 })} /></FormRow>
-          <FormRow label="Policy horizon"><input className="input mono" type="number" value={draft.policyExecutionHorizon} onChange={(e) => setModel({ policyExecutionHorizon: Number(e.target.value) || 0 })} /></FormRow>
-        </div>
-      </Card>
-      <Card title="TRELLIS.2 visual generator">
-        <div className="st-grid">
-          <FormRow label="Gateway endpoint">
-            <input className="input mono" value={draft.trellisEndpoint} onChange={(e) => setModel({ trellisEndpoint: e.target.value })} />
-          </FormRow>
-          <FormRow label="Gateway token"><input className="input mono" value={draft.trellisApiKey} onChange={(e) => setModel({ trellisApiKey: e.target.value })} /></FormRow>
-          <FormRow label="Model"><input className="input mono" value={draft.trellisModel} onChange={(e) => setModel({ trellisModel: e.target.value })} /></FormRow>
-          <FormRow label="Timeout (s)"><input className="input mono" type="number" value={draft.trellisTimeoutS} onChange={(e) => setModel({ trellisTimeoutS: Number(e.target.value) || 0 })} /></FormRow>
-        </div>
-        <div className="row" style={{ marginTop: 10 }}>
-          <button className="btn btn-secondary btn-sm" disabled={probingTrellis} onClick={probeTrellis}>
-            <Icon name="shield" size={12} /> {probingTrellis ? "Checking TRELLIS ..." : "Verify TRELLIS endpoint"}
-          </button>
-          <span className="small t3">Checks the gateway schema + compatibility before a real TRELLIS build.</span>
-        </div>
-      </Card>
-      <Card>
-        <SaveSection section="models" draft={draft} />
-      </Card>
-    </div>
-  );
-}
-void LegacyModelsPane;
 
 function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]; onChange: (p: Partial<SettingsData["simulation"]>) => void }) {
   const { data: isaac, error: isaacError, refetch } = useApi<{ ready: boolean; installed: boolean; version: string; root: string; frankaAsset: string; blockers: string[] }>("/simulation/isaac");
@@ -456,7 +376,7 @@ function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]
             <FormRow label="Gravity (m/s2)"><input className="input mono" value={draft.gravity} onChange={(e) => onChange({ gravity: Number(e.target.value) || 0 })} /></FormRow>
           <FormRow label="Timestep (Hz)"><input className="input mono" value={draft.timestepHz} onChange={(e) => onChange({ timestepHz: Number(e.target.value) || 0 })} /></FormRow>
           <FormRow label="Renderer">
-            <input className="input mono" value="Native Vulkan viewport / MuJoCo physics" readOnly aria-label="Renderer" />
+            <input className="input mono" value="WebGL2 editor / Vulkan validation / MuJoCo physics" readOnly aria-label="Renderer" />
           </FormRow>
         </div>
         <SaveSection section="simulation" draft={draft} />
@@ -465,7 +385,7 @@ function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]
         <div className="st-grid">
           <FormRow label="Target version"><input className="input mono" value={draft.isaacVersion} readOnly /></FormRow>
           <FormRow label="Isaac Sim root"><input className="input mono" value={draft.isaacRoot} onChange={(e) => onChange({ isaacRoot: e.target.value })} placeholder="C:\\isaacsim" /></FormRow>
-          <FormRow label="Asset root"><input className="input mono" value={draft.isaacAssetRoot} onChange={(e) => onChange({ isaacAssetRoot: e.target.value })} placeholder="Optional; Isaac 6.0 default asset server" /></FormRow>
+          <FormRow label="Asset root"><input className="input mono" value={draft.isaacAssetRoot} onChange={(e) => onChange({ isaacAssetRoot: e.target.value })} placeholder="Optional; Isaac 5.1 default asset server" /></FormRow>
           <FormRow label="Franka asset"><span className="mono small">{isaac?.frankaAsset ?? "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"}</span></FormRow>
         </div>
         <div className="col" style={{ gap: 4, marginTop: 10 }}>
