@@ -32,5 +32,9 @@ fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 foundryctl gauge -f "${script_dir}/casting.yaml"
 foundryctl cast -f "${script_dir}/casting.yaml"
+docker compose \
+  -f "${script_dir}/pours/deployment/compose.yaml" \
+  -f "${script_dir}/compose.override.yaml" \
+  up -d
 curl --fail --silent --show-error http://127.0.0.1:8080/api/v1/health?live=1 >/dev/null
 echo "SigNoz Community is healthy: http://127.0.0.1:8080"

@@ -9,6 +9,7 @@ import { useToast } from "../components/ui/Toast";
 import { api, apiUrl, ApiError } from "../lib/api";
 import { useApi } from "../lib/useApi";
 import { EmptyState, ErrorState, Skeleton } from "../lib/states";
+import { AssetVariantViewer } from "../components/three/AssetVariantViewer";
 import type { Asset, Source, Stat } from "../data/types";
 
 const KIND_LABEL = { articulated: "Articulated", rigid: "Rigid", environment: "Environment" } as const;
@@ -85,6 +86,25 @@ interface ModelListResponse {
   }[];
 }
 
+interface TrellisQ4Proof {
+  model: string;
+  runtime: string;
+  device: string;
+  seed: number;
+  geometryResolution: number;
+  textureResolution: number;
+  durationSeconds: number;
+  sizeBytes: number;
+  sha256: string;
+  vertices: number;
+  faces: number;
+  pbrMaterialCount: number;
+  textureSemantics: string[];
+  truth: string;
+  sourceUrl: string;
+  images: { conditioning: string; baseColor: string };
+}
+
 interface OracleEnvelope {
   commandId: string;
   status: "SUCCEEDED" | "FAILED";
@@ -112,6 +132,7 @@ export default function Assets() {
   } = useApi<CompiledAssetsData>("/asset-versions");
   const { data: robotData } = useApi<RobotListResponse>("/robots");
   const { data: modelData } = useApi<ModelListResponse>("/models");
+  const { data: q4Proof } = useApi<TrellisQ4Proof>("/trellis/q4-proof");
   const [q, setQ] = useState("");
   const [kind, setKind] = useState("All types");
   const [status, setStatus] = useState("All status");
@@ -137,6 +158,8 @@ export default function Assets() {
   const [vlaModelId, setVlaModelId] = useState("");
   const [vlaRunning, setVlaRunning] = useState<string | null>(null);
   const [vlaInstruction, setVlaInstruction] = useState("Pick up the object and place it in the target.");
+  const [showPhysicalVersions, setShowPhysicalVersions] = useState(false);
+  const [showQ4Proof, setShowQ4Proof] = useState(false);
 
   const assets = useMemo(() => data?.assets ?? [], [data]);
   const compiledVersions = useMemo(() => compiledData?.assetVersions ?? [], [compiledData]);
@@ -432,6 +455,27 @@ export default function Assets() {
         </span>
       </div>
 
+      {q4Proof && (
+        <Card
+          title="Local TRELLIS.2 Q4 result"
+          right={<button className="btn btn-secondary btn-sm" onClick={() => setShowQ4Proof((value) => !value)}><Icon name="cube" size={11} /> {showQ4Proof ? "Hide preview" : "View real GLB"}</button>}
+          style={{ marginBottom: 10 }}
+        >
+          <div className="row" style={{ gap: 16, flexWrap: "wrap" }}>
+            <span className="small"><b>{q4Proof.durationSeconds.toFixed(1)} s</b> measured generation</span>
+            <span className="small mono">{q4Proof.vertices.toLocaleString()} vertices · {q4Proof.faces.toLocaleString()} faces</span>
+            <span className="small">{q4Proof.textureResolution}px PBR · {(q4Proof.sizeBytes / 1024 ** 2).toFixed(1)} MB</span>
+            <span className="micro t3 mono">seed {q4Proof.seed} · {q4Proof.runtime}</span>
+          </div>
+          {showQ4Proof && <div style={{ display: "grid", gridTemplateColumns: "minmax(320px, 2fr) repeat(2, minmax(150px, 1fr))", gap: 10, marginTop: 10 }}>
+            <AssetVariantViewer url={apiUrl(q4Proof.sourceUrl.replace(/^\/api/, ""))} label="Recorded local TRELLIS Q4 PBR GLB" />
+            <figure style={{ margin: 0 }}><img src={apiUrl(q4Proof.images.conditioning.replace(/^\/api/, ""))} alt="TRELLIS conditioning image" style={{ width: "100%", height: 230, objectFit: "contain", background: "#050505", border: "1px solid var(--border)" }} /><figcaption className="micro t3" style={{ marginTop: 4 }}>Conditioning cutout</figcaption></figure>
+            <figure style={{ margin: 0 }}><img src={apiUrl(q4Proof.images.baseColor.replace(/^\/api/, ""))} alt="TRELLIS baked base color" style={{ width: "100%", height: 230, objectFit: "contain", background: "#050505", border: "1px solid var(--border)" }} /><figcaption className="micro t3" style={{ marginTop: 4 }}>Baked base color</figcaption></figure>
+          </div>}
+          <div className="micro t3" style={{ marginTop: 8 }}>This is recorded local visual geometry with embedded PBR textures. It is not called physics-ready until the separate immutable physical compiler and oracle gates pass.</div>
+        </Card>
+      )}
+
       {newPhysicalCompile && (
         <Modal
           title="Compile immutable rigid asset"
@@ -533,10 +577,13 @@ export default function Assets() {
       )}
 
       <Card
-        title={<span>Canonical physical versions <span className="micro t3" style={{ marginLeft: 8 }}>authoritative MuJoCo validation</span></span>}
+        title={<span>Physical validation <span className="micro t3" style={{ marginLeft: 8 }}>advanced asset versions</span></span>}
         flush
-        right={(
+        right={!showPhysicalVersions ? (
+          <button className="btn btn-secondary btn-sm" onClick={() => setShowPhysicalVersions(true)}><Icon name="shield" size={11} /> Show {compiledVersions.length} versions</button>
+        ) : (
           <span className="row" style={{ gap: 7 }}>
+            <button className="btn btn-ghost btn-sm" onClick={() => setShowPhysicalVersions(false)}><Icon name="chevronLeft" size={11} /> Hide</button>
             <select className="select" value={oracleRobotId} onChange={(event) => setOracleRobotId(event.target.value)} aria-label="Oracle robot">
               {availableRobots.length === 0 ? <option value="">No active AVAILABLE robot</option> : availableRobots.map((registration) => {
                 const robot = robotData?.robots.find((item) => item.id === registration.id);
@@ -561,7 +608,11 @@ export default function Assets() {
         )}
         style={{ marginBottom: 10 }}
       >
-        {compiledError ? (
+        {!showPhysicalVersions ? (
+          <div className="empty-note" style={{ margin: 10 }}>
+            The main asset library remains below. Open this advanced section only when you need collision, mass, drop/settle, Franka-oracle, VLA, or promotion evidence for a specific immutable version.
+          </div>
+        ) : compiledError ? (
           <ErrorState message={compiledError.message} onRetry={refetchCompiled} />
         ) : compiledLoading && !compiledData ? (
           <Skeleton rows={3} />
@@ -698,7 +749,7 @@ export default function Assets() {
       </div>
 
       <Card
-        title={<span>Legacy asset records <span className="micro t3" style={{ marginLeft: 8 }}>not authoritative until represented above</span></span>}
+        title={<span>Asset library <span className="micro t3" style={{ marginLeft: 8 }}>original records and generated builds</span></span>}
         flush
         right={
           <span className="row" style={{ gap: 7 }}>

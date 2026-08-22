@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from ..config import MODELS_DIR
+from ..config import DEFAULT_SETTINGS, MODELS_DIR, TRAINING_RUNS_DIR
 
 
 MODEL_PATH_ENV_VARS = (
@@ -54,7 +54,10 @@ def configured_model_roots() -> list[Path]:
     artifact-model directory is always safe.
     """
 
-    values: list[str] = [str(MODELS_DIR)]
+    # TRAINING_RUNS_DIR is application-owned and contains immutable candidate
+    # checkpoints produced by the approval-gated local optimizer worker.
+    values: list[str] = [str(MODELS_DIR), str(TRAINING_RUNS_DIR)]
+    values.extend(str(value) for value in (DEFAULT_SETTINGS.get("models", {}).get("modelRoots") or []))
     for name in MODEL_PATH_ENV_VARS:
         raw = str(os.environ.get(name) or "").strip()
         if not raw:

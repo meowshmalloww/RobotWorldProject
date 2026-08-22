@@ -157,6 +157,10 @@ export function Titlebar() {
       </div>
 
       <div className="tb-actions">
+        <button className="tb-copilot" title="Open RobotWorld AI chat" onClick={() => window.dispatchEvent(new Event("robotworld:toggle-copilot"))}>
+          <Icon name="spark" size={13} />
+          AI Chat
+        </button>
         <Menu
           align="right"
           width={180}

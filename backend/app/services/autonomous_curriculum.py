@@ -157,6 +157,13 @@ def _activity_attempt(state: dict[str, Any]) -> int:
     return int((state.get("activityRetries") or {}).get(key, 0))
 
 
+def _planner_episode_ceiling(historical_attempts: int, episode_budget: int, consumed_episodes: int) -> int:
+    """Translate a run-local budget into the shared planner's absolute ceiling."""
+
+    remaining = max(0, episode_budget - consumed_episodes)
+    return max(1, min(100_000, historical_attempts + remaining))
+
+
 async def _record_retry(
     run_id: str,
     state: dict[str, Any],
@@ -207,6 +214,16 @@ async def _advance_plan(
     if remaining_worlds <= 0:
         await _finish(run_id, "STOPPED", "world_budget_exhausted")
         return True
+    historical_attempts = await curriculum_catalog.terminal_attempt_count(
+        robot_id=request.robot_id,
+        model_id=request.model_id,
+        lookback_limit=request.lookback_limit,
+    )
+    planner_episode_ceiling = _planner_episode_ceiling(
+        historical_attempts,
+        request.budgets.max_evaluation_episodes,
+        int(consumed.get("evaluationEpisodes") or 0),
+    )
     attempt = _activity_attempt(state)
     with span("curriculum.autonomous.plan", run_id=run_id, iteration=iteration):
         envelope = await curriculum_catalog.plan_next(
@@ -216,7 +233,7 @@ async def _advance_plan(
                 taskFamily=request.task_family,
                 targetSuccessRate=request.target_success_rate,
                 minimumAttempts=request.minimum_attempts,
-                maxEvaluationEpisodes=request.budgets.max_evaluation_episodes,
+                maxEvaluationEpisodes=planner_episode_ceiling,
                 maxNewScenarios=remaining_worlds,
                 lookbackLimit=request.lookback_limit,
                 allowedAssetVersionIds=request.allowed_asset_version_ids,

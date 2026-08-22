@@ -86,6 +86,54 @@ class TrainingRun(Base):
     created_at: Mapped[datetime] = mapped_column(default=_utcnow, index=True)
 
 
+class PolicyTrainingRunRecord(Base):
+    """Canonical local policy-training candidate; legacy dashboard runs stay separate."""
+
+    __tablename__ = "policy_training_run_records"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), default="REQUESTED", index=True)
+    dataset_id: Mapped[str] = mapped_column(String(64), index=True)
+    base_model_id: Mapped[str] = mapped_column(String(64), index=True)
+    configuration: Mapped[dict] = mapped_column(JSON, default=dict)
+    input_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    artifact_dir: Mapped[str] = mapped_column(String(1000))
+    candidate_checkpoint_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    candidate_checkpoint_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    validation: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(80), default="user")
+    started_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=_utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)
+
+
+class PolicyCandidateDecisionRecord(Base):
+    """Auditable promotion/rejection state for one immutable policy candidate."""
+
+    __tablename__ = "policy_candidate_decision_records"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    training_run_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    candidate_model_id: Mapped[str] = mapped_column(String(64), index=True)
+    previous_model_id: Mapped[str] = mapped_column(String(64), index=True)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), index=True)
+    evaluation_ids: Mapped[list] = mapped_column(JSON, default=list)
+    evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    reason: Mapped[str] = mapped_column(Text)
+    command_id: Mapped[str] = mapped_column(String(64), index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(80), default="user")
+    promoted_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    rolled_back_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=_utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(default=_utcnow, onupdate=_utcnow)
+
+
 class Asset(Base):
     __tablename__ = "assets"
 

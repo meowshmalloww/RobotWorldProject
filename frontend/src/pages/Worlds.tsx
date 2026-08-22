@@ -6,13 +6,15 @@ import { Tree } from "../components/ui/Tree";
 import { PanelRail, ResizeHandle, usePanelSize } from "../components/ui/Resizable";
 import { useToast } from "../components/ui/Toast";
 import { Modal } from "../components/ui/Modal";
-import { api, ApiError, uploadBinary } from "../lib/api";
+import { api, ApiError, uploadBinary, websocketUrl } from "../lib/api";
 import { useApi } from "../lib/useApi";
 import { EmptyState, ErrorState, Skeleton } from "../lib/states";
-import { WorldEditorCanvas, type EditorTool } from "../components/three/WorldEditorCanvas";
+import { WorldEditorCanvas, type AuthoringRobotGeometry, type EditorTool } from "../components/three/WorldEditorCanvas";
+import { AuthoritativeSimulationCanvas, type RuntimeGeometry } from "../components/three/AuthoritativeSimulationCanvas";
 import type { Asset, PhysicsCheck, ScenarioVariant, SceneNode } from "../data/types";
 
 interface SceneData {
+  worldId?: string;
   worldName?: string;
   sceneTree: SceneNode[];
   placedAssets?: string[];
@@ -23,6 +25,17 @@ interface SceneData {
   taskSteps: { name: string; state: "done" | "active" | "pending" | "failed" }[];
   successConditions: { name: string; state: string; value: string }[];
   eventTimeline: { t: number; time: string; name: string; sub: string; state: string }[];
+  robotSpawn?: { positionM: number[]; quaternionWxyz: number[]; source: string; validatedForExecution: boolean };
+}
+
+interface AuthoringRobotPreview {
+  robotId: string;
+  worldId: string;
+  robotRuntimeSha256: string;
+  poseSource: string;
+  mountSource: string;
+  mountValidatedForExecution: boolean;
+  geometries: AuthoringRobotGeometry[];
 }
 
 interface AcceptanceScenario {
@@ -55,6 +68,98 @@ interface AcceptanceJob {
     stages: { name: string; status: "passed" | "blocked" | "failed"; detail: string; at: string }[];
     error?: string;
     result?: { outcome: string; taskSuccess: boolean | null; message: string; seed: number; manifestSha256?: string; mjcfSha256?: string };
+  };
+}
+
+type WorldBackend = "mujoco" | "isaac_sim";
+type WorldController = "oracle" | "vla_jepa" | "agent";
+type WorldTask = "pick_place" | "drop_off_table" | "open_drawer";
+type WorldViewport = "editor" | "live";
+
+interface ModelSummary {
+  id: string;
+  displayName: string;
+  roles: string[];
+  lifecycleState: string;
+  healthStatus: string;
+}
+
+interface PhysicalAssetVersion {
+  id: string;
+  displayName: string;
+  lifecycleState: string;
+  assetId: string;
+  version: number;
+}
+
+interface WorldEvaluation {
+  id: string;
+  status: string;
+  success: boolean;
+  failureCode?: string | null;
+  failureDetail?: string | null;
+  policy: string;
+  seed: number;
+  worldTemplateId: string;
+  result: { frameHashes?: Record<string, Record<string, string>>; predicate?: Record<string, unknown> };
+}
+
+interface AutonomousRunSummary {
+  id: string;
+  lifecycleState: string;
+  stopReason?: string | null;
+  state?: Record<string, unknown>;
+}
+
+interface WorldOperationResult {
+  kind: "oracle_evaluation" | "vla_evaluation" | "autonomous_run" | "isaac_evaluation";
+  commandId?: string;
+  commandStatus?: string;
+  evaluation?: WorldEvaluation;
+  run?: AutonomousRunSummary;
+  runtime?: { installed: boolean; ready: boolean; blockers: string[] };
+}
+
+interface FrankaLiveSession {
+  sessionId: string;
+  lifecycleState: string;
+  authoritative: true;
+  backend: "mujoco";
+  mode: "oracle" | "manual";
+  physicsHz: number;
+  controlHz: number;
+  streamHz: number;
+  operation?: {
+    executionScope?: "validation_bench" | "active_world";
+    worldId?: string | null;
+    instruction?: string;
+    task?: WorldTask;
+    authoredScene?: {
+      sourcePlacement?: { assetId?: string };
+      targetPlacement?: { assetId?: string } | null;
+      counterPlacement?: { assetId?: string };
+    };
+  };
+  frameCount: number;
+  evaluation?: WorldEvaluation | null;
+  error?: string | null;
+}
+
+interface FrankaLiveFrame {
+  type: "frame";
+  sequence: number;
+  authoritative: true;
+  simTimeSeconds: number;
+  phase: string;
+  jpegBase64: string;
+  state: {
+    jointPosition?: number[];
+    gripperWidthM?: number;
+    endEffectorPositionM?: number[];
+    objectPositionM?: number[];
+    contactCount?: number;
+    finite?: boolean;
+    renderGeometries?: RuntimeGeometry[];
   };
 }
 
@@ -97,8 +202,7 @@ function SceneComposer({ assetId }: { assetId: string }) {
   const [variant, setVariant] = useState("");
   const [shadingVariant, setShadingVariant] = useState<"rgb" | "seg" | "depth">("rgb");
   const [gizmoMode, setGizmoMode] = useState<EditorTool>("camera");
-  const [simPlaying, setSimPlaying] = useState(false);
-  const [inspTab, setInspTab] = useState<"Components" | "Physics" | "Provenance" | "Agent" | "Robots">("Components");
+  const [inspTab, setInspTab] = useState<"Components" | "Physics" | "Provenance" | "Agent" | "Robots">("Agent");
   const [shelfTab, setShelfTab] = useState<"Console" | "Checks" | "Variants" | "Diagnostics">("Console");
   const [saved, setSaved] = useState("never");
   const [saving, setSaving] = useState(false);
@@ -110,10 +214,26 @@ function SceneComposer({ assetId }: { assetId: string }) {
   const variantNameRef = useRef<HTMLInputElement>(null);
   const variantDescRef = useRef<HTMLInputElement>(null);
   const { data: robotData, refetch: refetchRobots } = useApi<{ robots: RobotManifest[] }>("/robots");
+  const { data: modelData } = useApi<{ models: ModelSummary[] }>("/models");
+  const { data: physicalAssets } = useApi<{ assetVersions: PhysicalAssetVersion[] }>("/asset-versions");
   const [robotId, setRobotId] = useState("");
-  const [instruction, setInstruction] = useState("Grab the apple and put it in the blender.");
+  const { data: authoringRobot } = useApi<AuthoringRobotPreview>(robotId ? `/worlds/scene/robot-preview?robot_id=${encodeURIComponent(robotId)}` : null);
+  const [instruction, setInstruction] = useState("Pick up the apple and place it on top of the blender.");
   const [command, setCommand] = useState<WorldCommandResult | null>(null);
+  const [operation, setOperation] = useState<WorldOperationResult | null>(null);
+  const [activeRun, setActiveRun] = useState<AutonomousRunSummary | null>(null);
+  const [backend, setBackend] = useState<WorldBackend>("mujoco");
+  const [controller, setController] = useState<WorldController>("oracle");
+  const [task, setTask] = useState<WorldTask>("pick_place");
+  const [assetVersionId, setAssetVersionId] = useState("");
+  const [modelId, setModelId] = useState("");
+  const [viewport, setViewport] = useState<WorldViewport>("editor");
+  const [liveSession, setLiveSession] = useState<FrankaLiveSession | null>(null);
+  const [liveFrame, setLiveFrame] = useState<FrankaLiveFrame | null>(null);
+  const [liveStatus, setLiveStatus] = useState<"idle" | "connecting" | "running" | "finished" | "failed">("idle");
+  const liveSocketRef = useRef<WebSocket | null>(null);
   const [planning, setPlanning] = useState(false);
+  const [manualBusy, setManualBusy] = useState(false);
   const [importingRobot, setImportingRobot] = useState(false);
   const [arranging, setArranging] = useState(false);
 
@@ -175,18 +295,197 @@ function SceneComposer({ assetId }: { assetId: string }) {
   const hasPlacedWorldAssets = Boolean(scene?.placedAssets?.length);
 
   useEffect(() => { if (!robotId && robotData?.robots[0]) setRobotId(robotData.robots[0].id); }, [robotData, robotId]);
+  useEffect(() => {
+    const policies = modelData?.models.filter((item) => item.roles.includes("vla_policy")) ?? [];
+    if (!modelId && policies.length) setModelId((policies.find((item) => item.lifecycleState === "LOADED") ?? policies[0]).id);
+  }, [modelData, modelId]);
+
+  useEffect(() => () => liveSocketRef.current?.close(), []);
+
+  const startLiveOracle = async () => {
+    setPlanning(true);
+    setLiveStatus("connecting");
+    setLiveFrame(null);
+    liveSocketRef.current?.close();
+    try {
+      const session = await api.post<FrankaLiveSession>("/worlds/live-sessions", {
+        robotId,
+        instruction,
+        backend,
+        controller,
+        task,
+        assetVersionId: assetVersionId || null,
+        seed: Number(seed),
+        maxPolicySteps: 150,
+        executionScope: hasPlacedWorldAssets ? "active_world" : "validation_bench",
+        worldId: hasPlacedWorldAssets ? scene?.worldId : null,
+      });
+      setLiveSession(session);
+      setViewport("live");
+      let terminal = false;
+      const socket = new WebSocket(websocketUrl(`/worlds/live/${session.sessionId}`));
+      liveSocketRef.current = socket;
+      socket.onopen = () => setLiveStatus("running");
+      socket.onmessage = (event) => {
+        const message = JSON.parse(String(event.data)) as Record<string, unknown>;
+        if (message.type === "frame") {
+          setLiveFrame(message as unknown as FrankaLiveFrame);
+          setLiveStatus("running");
+          return;
+        }
+        if (message.type === "end") {
+          terminal = true;
+          const evaluation = message.evaluation as WorldEvaluation;
+          const nextSession = (message.session as FrankaLiveSession | undefined) ?? session;
+          setLiveSession(nextSession);
+          setOperation({ kind: "oracle_evaluation", evaluation });
+          setLiveStatus(evaluation.success ? "finished" : "failed");
+          setPlanning(false);
+          toast.push(evaluation.success ? "ok" : "err", evaluation.success ? "Live task passed" : "Live task failed", evaluation.id);
+          socket.close();
+          return;
+        }
+        if (message.type === "error") {
+          terminal = true;
+          setLiveStatus("failed");
+          setPlanning(false);
+          toast.push("err", "Live simulation failed", String(message.message ?? "Unknown simulation error"));
+          socket.close();
+        }
+      };
+      socket.onerror = () => {
+        setLiveStatus("failed");
+        setPlanning(false);
+      };
+      socket.onclose = () => {
+        if (!terminal) {
+          setLiveStatus("failed");
+          setPlanning(false);
+        }
+      };
+    } catch (e) {
+      setLiveStatus("failed");
+      setPlanning(false);
+      toast.push("err", "Could not start live simulation", e instanceof ApiError ? e.message : String(e));
+    }
+  };
+
+  const startManualControl = async () => {
+    setPlanning(true);
+    setLiveStatus("connecting");
+    setLiveFrame(null);
+    liveSocketRef.current?.close();
+    try {
+      const session = await api.post<FrankaLiveSession>("/worlds/manual-sessions", {
+        robotId,
+        instruction,
+        backend: "mujoco",
+        controller: "oracle",
+        task: "pick_place",
+        seed: Number(seed),
+        maxPolicySteps: 150,
+        executionScope: "active_world",
+        worldId: scene?.worldId,
+      });
+      setLiveSession(session);
+      setViewport("live");
+      const socket = new WebSocket(websocketUrl(`/worlds/live/${session.sessionId}`));
+      liveSocketRef.current = socket;
+      socket.onopen = () => { setLiveStatus("running"); setPlanning(false); };
+      socket.onmessage = (event) => {
+        const message = JSON.parse(String(event.data)) as Record<string, unknown>;
+        if (message.type === "frame") setLiveFrame(message as unknown as FrankaLiveFrame);
+        if (message.type === "error") {
+          setLiveStatus("failed");
+          toast.push("err", "Manual simulation failed", String(message.message ?? "Unknown simulation error"));
+        }
+      };
+      socket.onerror = () => { setLiveStatus("failed"); setPlanning(false); };
+    } catch (e) {
+      setLiveStatus("failed");
+      setPlanning(false);
+      toast.push("err", "Could not start manual control", e instanceof ApiError ? e.message : String(e));
+    }
+  };
+
+  const manualControl = async (kind: "jog" | "open" | "close", deltaM?: number[]) => {
+    if (!liveSession || liveSession.mode !== "manual") return;
+    setManualBusy(true);
+    try {
+      if (kind === "jog") await api.post(`/worlds/manual-sessions/${liveSession.sessionId}/jog`, { deltaM });
+      else await api.post(`/worlds/manual-sessions/${liveSession.sessionId}/gripper`, { command: kind });
+    } catch (e) {
+      toast.push("err", "Manual command rejected", e instanceof ApiError ? e.message : String(e));
+    } finally { setManualBusy(false); }
+  };
+
+  const leaveLiveViewport = async () => {
+    const session = liveSession;
+    setViewport("editor");
+    if (session?.mode === "manual") {
+      liveSocketRef.current?.close();
+      try { await api.del(`/worlds/manual-sessions/${session.sessionId}`); } catch { /* session may already be closed */ }
+      setLiveSession(null);
+    }
+  };
 
   const planCommand = async (mode: "plan" | "execute" = "plan") => {
+    if (mode === "execute") {
+      if (backend === "mujoco" && controller === "oracle" && ["pick_place", "drop_off_table"].includes(task)) {
+        await startLiveOracle();
+        return;
+      }
+      setPlanning(true);
+      try {
+        const result = await api.post<WorldOperationResult>("/worlds/operate", {
+          robotId,
+          instruction,
+          backend,
+          controller,
+          task,
+          assetVersionId: task === "pick_place" && assetVersionId ? assetVersionId : null,
+          modelId: controller === "oracle" ? null : modelId || null,
+          seed: Number(seed),
+          maxPolicySteps: 150,
+          executionScope: hasPlacedWorldAssets ? "active_world" : "validation_bench",
+          worldId: hasPlacedWorldAssets ? scene?.worldId : null,
+        });
+        setOperation(result);
+        setActiveRun(result.run ?? null);
+        setInspTab("Agent");
+        setRightOpen(true);
+        setShelfTab("Console");
+        setShelfOpen(true);
+        const evidence = result.evaluation?.id ?? result.run?.id ?? result.commandId ?? "recorded result";
+        toast.push(result.evaluation?.success === false ? "err" : "ok", result.run ? "Autonomous loop started" : "World execution recorded", evidence);
+      } catch (e) {
+        toast.push("err", "Execution failed", e instanceof ApiError ? e.message : String(e));
+      } finally { setPlanning(false); }
+      return;
+    }
     setPlanning(true);
     try {
-      const result = await api.post<WorldCommandResult>("/worlds/commands", { instruction, robotId: robotId || null, mode });
+      const result = await api.post<WorldCommandResult>("/worlds/commands", { instruction, robotId: robotId || null, mode: "plan" });
       setCommand(result);
       setInspTab("Agent");
       setRightOpen(true);
     } catch (e) {
-      toast.push("err", mode === "execute" ? "Execution blocked" : "Planning failed", e instanceof ApiError ? e.message : String(e));
+      toast.push("err", "Planning failed", e instanceof ApiError ? e.message : String(e));
     } finally { setPlanning(false); }
   };
+
+  useEffect(() => {
+    if (!activeRun || ["SUCCEEDED", "FAILED", "CANCELLED", "CRASHED", "EXHAUSTED", "STOPPED"].includes(activeRun.lifecycleState)) return;
+    const timer = window.setInterval(() => {
+      api.get<{ run: AutonomousRunSummary }>(`/autonomous-runs/${activeRun.id}`).then(({ run }) => {
+        setActiveRun(run);
+        if (["SUCCEEDED", "FAILED", "CANCELLED", "CRASHED", "EXHAUSTED", "STOPPED"].includes(run.lifecycleState)) {
+          toast.push(run.lifecycleState === "SUCCEEDED" ? "ok" : "info", "Autonomous loop finished", `${run.id} · ${run.lifecycleState}${run.stopReason ? ` · ${run.stopReason}` : ""}`);
+        }
+      }).catch(() => undefined);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [activeRun, toast]);
 
   const importRobot = async (file?: File) => {
     if (!file) return;
@@ -205,6 +504,17 @@ function SceneComposer({ assetId }: { assetId: string }) {
   const updatePlacement = async (asset: string, patch: { translation?: number[]; rotationZDeg?: number; scaleMultiplier?: number[]; visible?: boolean; mobility?: "movable" | "fixed" }) => {
     try { await api.patch(`/worlds/placements/${asset}`, patch); await refetch(); }
     catch (e) { toast.push("err", "Placement update failed", e instanceof ApiError ? e.message : String(e)); }
+  };
+
+  const updateRobotSpawn = async (patch: { positionM: number[]; quaternionWxyz: number[] }) => {
+    try {
+      await api.patch("/worlds/robot-spawn", patch);
+      await refetch();
+      toast.push("ok", "Franka mount saved", "The next authoritative run will compile this persisted base translation.");
+    } catch (e) {
+      toast.push("err", "Franka mount rejected", e instanceof ApiError ? e.message : String(e));
+      await refetch();
+    }
   };
 
   const autoLayout = async () => {
@@ -364,8 +674,12 @@ function SceneComposer({ assetId }: { assetId: string }) {
             <span className="row" style={{ gap: 6, alignItems: "center", minWidth: 0 }}>
               <Icon name="cube" size={13} style={{ color: "var(--accent)" }} />
               <span className="small ellipsis" style={{ fontWeight: 620 }}>{scene?.worldName ?? "OpenUSD World"}</span>
-              <Badge tone="grey">{scene?.placedAssets?.length ?? 0} placed assets</Badge>
+              <span className="micro t3 mono">{scene?.placedAssets?.length ?? 0} placed assets</span>
             </span>
+            <select className="select" style={{ width: 112, height: 26, fontSize: 11 }} value={viewport} onChange={(event) => setViewport(event.target.value as WorldViewport)}>
+              <option value="editor">3D Editor</option>
+              <option value="live" disabled={!liveSession}>Live simulation</option>
+            </select>
             <span className="v-divider" />
             <div className="unity-group row" style={{ gap: 2, background: "var(--bg-panel-2)", padding: "2px 4px", borderRadius: 4, border: "1px solid var(--border)" }}>
               <button className={`btn btn-sm ${gizmoMode === "translate" ? "btn-secondary" : "btn-ghost"}`} onClick={() => setGizmoMode("translate")} title="Move selected object (W)"><Icon name="move" size={12} /> Move</button>
@@ -390,36 +704,6 @@ function SceneComposer({ assetId }: { assetId: string }) {
             <button className="btn btn-secondary btn-sm" disabled={arranging} onClick={autoLayout}><Icon name="spark" size={11} /> {arranging ? "Solving..." : "Auto-layout"}</button>
           </>
         ) : <>
-        {/* Simulation Transport */}
-        <div className="unity-group row" style={{ gap: 3, background: "var(--bg-panel-2)", padding: "2px 4px", borderRadius: 4, border: "1px solid var(--border)" }}>
-          <button
-            className={`btn btn-sm ${simPlaying ? "btn-primary" : "btn-ghost"}`}
-            onClick={() => setSimPlaying(!simPlaying)}
-            title={simPlaying ? "Pause Simulation (Space)" : "Play Simulation (Space)"}
-            style={{ padding: "4px 8px", height: 26 }}
-          >
-            <Icon name={simPlaying ? "pause" : "play"} size={12} />
-          </button>
-          <button
-            className="btn btn-ghost btn-sm btn-icon"
-            title="Step Simulation Frame (Ctrl+Right)"
-            onClick={() => toast.push("info", "Physics Step", "Stepped 1 substep (2.0ms @ 500Hz)")}
-            style={{ height: 26, width: 26 }}
-          >
-            <Icon name="arrowRight" size={11} />
-          </button>
-          <button
-            className="btn btn-ghost btn-sm btn-icon"
-            title="Reset Simulation State"
-            onClick={() => { setSimPlaying(false); toast.push("info", "Physics Reset", "Initial state restored"); }}
-            style={{ height: 26, width: 26 }}
-          >
-            <Icon name="refresh" size={11} />
-          </button>
-        </div>
-
-        <span className="v-divider" />
-
         {/* Transform Tools: Translate / Rotate / Scale */}
         <div className="unity-group row" style={{ gap: 2, background: "var(--bg-panel-2)", padding: "2px 4px", borderRadius: 4, border: "1px solid var(--border)" }}>
           <button
@@ -593,13 +877,18 @@ function SceneComposer({ assetId }: { assetId: string }) {
         {/* Center: Full-Bleed 3D Viewport + Bottom Shelf */}
         <div className="col" style={{ flex: 1, minWidth: 0, minHeight: 0, gap: 0 }}>
           <div className="card unity-viewport-container" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", borderRadius: 0, border: 0 }}>
-            {hasPlacedWorldAssets ? (
+            {viewport === "live" && liveSession ? (
+              <LiveWorldResult session={liveSession} frame={liveFrame} status={liveStatus} placements={normalizedPlacements} manualBusy={manualBusy} onManual={manualControl} onBack={() => void leaveLiveViewport()} />
+            ) : hasPlacedWorldAssets ? (
               <GeneratedWorldView
                 placements={normalizedPlacements}
-                selectedAssetId={placedAssetId}
+                robotGeometries={authoringRobot?.geometries ?? []}
+                robotSpawn={scene?.robotSpawn}
+                selectedAssetId={selected === "robot-spawn" ? "robot-spawn" : placedAssetId}
                 mode={gizmoMode}
-                onSelect={(id, name) => { setActivePlacedAssetId(id); setSelected(id); setSelectedName(name); }}
+                onSelect={(id, name) => { if (id !== "robot-spawn") setActivePlacedAssetId(id); setSelected(id); setSelectedName(name); }}
                 onCommit={updatePlacement}
+                onRobotCommit={updateRobotSpawn}
               />
             ) : (
               <div className="center col" style={{ flex: 1, minHeight: 0, gap: 10, padding: 28, color: "var(--text-3)", textAlign: "center" }}>
@@ -648,6 +937,8 @@ function SceneComposer({ assetId }: { assetId: string }) {
                 <div style={{ flex: 1, overflowY: "auto", minHeight: 0, background: "var(--bg-panel-1)" }}>
                   {shelfTab === "Diagnostics" ? (
                     <RuntimeDiagnosticsPanel />
+                  ) : viewport === "live" && shelfTab === "Console" && liveSession ? (
+                    <LiveRuntimeShelf session={liveSession} frame={liveFrame} status={liveStatus} evaluation={operation?.evaluation} />
                   ) : generatedAsset ? (
                     <GeneratedAssetShelf asset={generatedAsset} tab={shelfTab as "Console" | "Checks" | "Variants"} assembly={scene?.assembly} checks={physicsChecks} checksRunning={checksRunning} />
                   ) : shelfTab === "Console" ? (
@@ -734,15 +1025,40 @@ function SceneComposer({ assetId }: { assetId: string }) {
 
               <div style={{ flex: 1, overflowY: "auto", minHeight: 0, padding: "8px 10px" }}>
                 {inspTab === "Agent" || inspTab === "Robots" ? (
-                  <RobotAgentPanel tab={inspTab} robots={robotData?.robots ?? []} robotId={robotId} setRobotId={setRobotId} instruction={instruction} setInstruction={setInstruction} command={command} planning={planning} onPlan={planCommand} onImport={importRobot} importing={importingRobot} onRobotsChanged={refetchRobots} />
+                  <RobotAgentPanel
+                    tab={inspTab}
+                    robots={robotData?.robots ?? []}
+                    robotId={robotId}
+                    setRobotId={setRobotId}
+                    instruction={instruction}
+                    setInstruction={setInstruction}
+                    command={command}
+                    operation={operation}
+                    activeRun={activeRun}
+                    planning={planning}
+                    onPlan={planCommand}
+                    onImport={importRobot}
+                    importing={importingRobot}
+                    onRobotsChanged={refetchRobots}
+                    backend={backend}
+                    setBackend={setBackend}
+                    controller={controller}
+                    setController={setController}
+                    task={task}
+                    setTask={setTask}
+                    assets={physicalAssets?.assetVersions ?? []}
+                    assetVersionId={assetVersionId}
+                    setAssetVersionId={setAssetVersionId}
+                    models={modelData?.models.filter((item) => item.roles.includes("vla_policy")) ?? []}
+                    modelId={modelId}
+                    setModelId={setModelId}
+                    hasPlacedWorldAssets={hasPlacedWorldAssets}
+                    onManual={startManualControl}
+                  />
                 ) : generatedAsset ? (
                   <GeneratedAssetInspector asset={generatedAsset} placement={activePlacement} tab={inspTab} onTransform={(translation) => updatePlacement(generatedAsset.id, { translation })} onRotation={(rotationZDeg) => updatePlacement(generatedAsset.id, { rotationZDeg })} onScale={(scaleMultiplier) => updatePlacement(generatedAsset.id, { scaleMultiplier })} onMobility={(mobility) => updatePlacement(generatedAsset.id, { mobility })} />
-                ) : selected && inspTab === "Components" ? (
-                  <UnityComponentInspector selected={selected} selectedName={selectedName} scenario={activeAcceptance} />
-                ) : selected && inspTab === "Physics" ? (
-                  <UnityPhysicsInspector selected={selected} selectedName={selectedName} />
-                ) : selected && inspTab === "Provenance" ? (
-                  <UnityProvenanceInspector selected={selected} selectedName={selectedName} job={acceptanceJob} />
+                ) : selected && ["Components", "Physics", "Provenance"].includes(inspTab) ? (
+                  <EmptyState icon="shield">This scene node has no canonical physical manifest. Select a generated asset or run a recorded evaluation; RobotWorld will not invent dimensions, joints, or provenance.</EmptyState>
                 ) : (
                   <div className="empty-note center" style={{ padding: 24, textAlign: "center", color: "var(--text-3)" }}>
                     Select an object in the Hierarchy or 3D Viewport to inspect components.
@@ -796,6 +1112,18 @@ function diagnosticMessage(raw: string): string {
   return raw;
 }
 
+function LiveRuntimeShelf({ session, frame, status, evaluation }: { session: FrankaLiveSession; frame: FrankaLiveFrame | null; status: string; evaluation?: WorldEvaluation }) {
+  const predicate = evaluation?.result?.predicate ?? {};
+  const predicateEntries = Object.entries(predicate).filter(([, value]) => typeof value === "boolean" || typeof value === "number").slice(0, 8);
+  return <div className="acceptance-log mono" style={{ padding: "6px 10px", maxHeight: "none" }}>
+    <div className="console-line"><span className="console-time">{evaluation ? (evaluation.success ? "PASSED" : "FAILED") : status.toUpperCase()}</span><span>{session.mode === "manual" ? "Operator-controlled Panda session" : `Authoritative ${session.operation?.task?.replaceAll("_", " ") ?? "physics task"}`} · {session.sessionId}</span></div>
+    <div className="console-line"><span className="console-time">STATE</span><span>frame {frame?.sequence ?? 0} · sim {(frame?.simTimeSeconds ?? 0).toFixed(2)} s · {frame?.phase?.replaceAll("_", " ") ?? "initializing"} · finite {String(frame?.state.finite !== false)}</span></div>
+    {evaluation && <div className="console-line"><span className="console-time">EVAL</span><span>{evaluation.id} · {evaluation.policy} · seed {evaluation.seed}</span></div>}
+    {evaluation?.failureCode && <div className="console-line"><span className="console-time">ERROR</span><span>{evaluation.failureCode} · {evaluation.failureDetail}</span></div>}
+    {predicateEntries.map(([key, value]) => <div className="console-line" key={key}><span className="console-time">PRED</span><span>{key} = {typeof value === "number" ? value.toFixed(6) : String(value)}</span></div>)}
+  </div>;
+}
+
 function RuntimeDiagnosticsPanel() {
   const { data, error, loading, refetch } = useApi<RuntimeDiagnostics>("/diagnostics/runtime");
   useEffect(() => {
@@ -818,11 +1146,19 @@ function RuntimeDiagnosticsPanel() {
   </div>;
 }
 
-function RobotAgentPanel({ tab, robots, robotId, setRobotId, instruction, setInstruction, command, planning, onPlan, onImport, importing, onRobotsChanged }: {
+function RobotAgentPanel({ tab, robots, robotId, setRobotId, instruction, setInstruction, command, operation, activeRun, planning, onPlan, onImport, importing, onRobotsChanged, backend, setBackend, controller, setController, task, setTask, assets, assetVersionId, setAssetVersionId, models, modelId, setModelId, hasPlacedWorldAssets, onManual }: {
   tab: "Agent" | "Robots"; robots: RobotManifest[]; robotId: string; setRobotId: (id: string) => void;
   instruction: string; setInstruction: (value: string) => void; command: WorldCommandResult | null; planning: boolean;
+  operation: WorldOperationResult | null; activeRun: AutonomousRunSummary | null;
   onPlan: (mode?: "plan" | "execute") => void; onImport: (file?: File) => void; importing: boolean;
   onRobotsChanged: () => void;
+  backend: WorldBackend; setBackend: (value: WorldBackend) => void;
+  controller: WorldController; setController: (value: WorldController) => void;
+  task: WorldTask; setTask: (value: WorldTask) => void;
+  assets: PhysicalAssetVersion[]; assetVersionId: string; setAssetVersionId: (value: string) => void;
+  models: ModelSummary[]; modelId: string; setModelId: (value: string) => void;
+  hasPlacedWorldAssets: boolean;
+  onManual: () => void;
 }) {
   const toast = useToast();
   const [registeringFranka, setRegisteringFranka] = useState(false);
@@ -865,34 +1201,81 @@ function RobotAgentPanel({ tab, robots, robotId, setRobotId, instruction, setIns
       </>}
     </div>
   </div>;
+  const selectedModel = models.find((item) => item.id === modelId);
+  const selectedAsset = assets.find((item) => item.id === assetVersionId);
+  const modelReady = controller === "oracle" || (Boolean(selectedModel) && selectedModel?.lifecycleState === "LOADED" && selectedModel.healthStatus === "healthy");
+  const assetReady = hasPlacedWorldAssets || task === "open_drawer" || controller === "oracle" || selectedAsset?.lifecycleState === "ORACLE_VALIDATED";
+  const canExecute = Boolean(robotId && instruction.trim().length >= 2 && modelReady && assetReady);
+  const run = activeRun ?? operation?.run ?? null;
+  const history = Array.isArray(run?.state?.history) ? run.state.history.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object") : [];
   return <div className="col inspector-agent" style={{ minHeight: "100%", gap: 9 }}>
     <div className="col" style={{ gap: 7 }}>
-      <select className="select" value={robotId} onChange={(e) => setRobotId(e.target.value)}><option value="">No robot selected</option>{robots.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
-      <textarea className="input" style={{ minHeight: 74, padding: 9, resize: "vertical" }} value={instruction} onChange={(e) => setInstruction(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !planning) void onPlan("plan"); }} placeholder="Describe the task for the planner and VLA..." />
-      <div className="row"><button className="btn btn-primary btn-sm grow" disabled={planning || instruction.trim().length < 2} onClick={() => void onPlan("plan")}><Icon name="spark" size={12} /> {planning ? "Planning..." : "Plan"}</button><button className="btn btn-secondary btn-sm grow" disabled={planning || !command?.executionAllowed} onClick={() => void onPlan("execute")} title={command?.executionAllowed ? "Request bounded execution" : "Resolve all reported gates first"}><Icon name="play" size={12} /> Execute</button></div>
-      {command ? <><div className="small"><b>{command.plan.summary}</b> <span className="micro t3 mono">{command.plannerProvenance}</span></div>{command.plan.steps.map((step, i) => <div className="console-line" key={`${i}-${step}`}><span className="console-time">{String(i + 1).padStart(2, "0")}</span><span>{step}</span></div>)}</> : <div className="empty-note">The planner can inspect the real scene/robot manifests now. Motor execution remains disabled until robot, cameras, VLA adaptation, and physical assets all pass.</div>}
+      <div className="row" style={{ gap: 6 }}>
+        <label className="field grow"><span className="micro t3">Backend</span><select className="select" value={backend} onChange={(e) => { const value = e.target.value as WorldBackend; setBackend(value); if (value === "isaac_sim") { setController("oracle"); const isaacRobot = robots.find((item) => item.format === "isaac-openusd-reference"); if (isaacRobot) setRobotId(isaacRobot.id); } else { const mujocoRobot = robots.find((item) => item.format === "mjcf" && item.physicsReady); if (mujocoRobot) setRobotId(mujocoRobot.id); } }}><option value="mujoco">MuJoCo</option><option value="isaac_sim">NVIDIA Isaac Sim + Isaac Lab</option></select></label>
+        <label className="field grow"><span className="micro t3">Task</span><select className="select" value={task} onChange={(e) => { const value = e.target.value as WorldTask; setTask(value); if (value !== "pick_place") setController("oracle"); if (value === "drop_off_table") setInstruction("Pick up the apple and drop it off the table."); }}><option value="pick_place">Pick and place</option><option value="drop_off_table" disabled={!hasPlacedWorldAssets}>Drop off table</option><option value="open_drawer">Open drawer</option></select></label>
+      </div>
+      <label className="field"><span className="micro t3">Robot in this world</span><select className="select" value={robotId} onChange={(e) => setRobotId(e.target.value)}><option value="">No robot selected</option>{robots.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+      <label className="field"><span className="micro t3">Controller</span><select className="select" value={controller} disabled={backend === "isaac_sim" || task !== "pick_place"} onChange={(e) => setController(e.target.value as WorldController)}><option value="oracle">Deterministic Franka oracle</option><option value="vla_jepa">VLA-JEPA policy</option><option value="agent" disabled={hasPlacedWorldAssets}>Autonomous oracle → VLA → diagnose{hasPlacedWorldAssets ? " · validation world only" : ""}</option></select></label>
+      {task === "pick_place" && !hasPlacedWorldAssets && <label className="field"><span className="micro t3">Validation asset</span><select className="select" value={assetVersionId} onChange={(e) => setAssetVersionId(e.target.value)}><option value="">Known-good cube</option>{assets.map((item) => <option key={item.id} value={item.id}>{item.displayName} · {item.lifecycleState}</option>)}</select></label>}
+      {controller !== "oracle" && <label className="field"><span className="micro t3">Policy brain</span><select className="select" value={modelId} onChange={(e) => setModelId(e.target.value)}><option value="">Select loaded VLA</option>{models.map((item) => <option key={item.id} value={item.id}>{item.displayName} · {item.lifecycleState}/{item.healthStatus}</option>)}</select></label>}
+      <textarea className="input" style={{ minHeight: 82, padding: 9, resize: "vertical" }} value={instruction} onChange={(e) => setInstruction(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !planning && canExecute) void onPlan("execute"); }} placeholder="Describe the selected task. Unsupported intents are rejected before physics starts." />
+      <span className="micro t3">{hasPlacedWorldAssets && task === "pick_place" ? "Name one movable object and one fixed target, for example apple → on top of blender." : task === "drop_off_table" ? "Name one movable object. The oracle must grasp it, carry it beyond the measured counter edge, release it under gravity, and verify it settled off the support." : `Execution contract: ${task === "pick_place" ? "pick object → release inside target" : "grasp handle → open one validated drawer"}. Unsupported intent is rejected before physics starts.`}</span>
+      <div className="row"><button className="btn btn-secondary btn-sm grow" disabled={planning || instruction.trim().length < 2} onClick={() => void onPlan("plan")}><Icon name="spark" size={12} /> Plan</button><button className="btn btn-primary btn-sm grow" disabled={planning || !canExecute} onClick={() => void onPlan("execute")} title={canExecute ? "Run the selected real controller" : "Select a ready robot, physical asset, and loaded policy"}><Icon name="play" size={12} /> {planning ? "Running live..." : controller === "agent" ? "Start loop" : backend === "mujoco" && controller === "oracle" && ["pick_place", "drop_off_table"].includes(task) ? "Run live" : "Execute"}</button></div>
+      {hasPlacedWorldAssets && backend === "mujoco" && controller === "oracle" && task === "pick_place" && <button className="btn btn-secondary btn-sm" disabled={planning || !canExecute} onClick={onManual}><Icon name="robot" size={12} /> Control Panda in this world</button>}
+      {operation?.evaluation && <div className={`world-operation-result ${operation.evaluation.success ? "passed" : "failed"}`}><b>{operation.evaluation.success ? "Task predicate passed" : operation.evaluation.failureCode ?? operation.evaluation.status}</b><span className="micro mono">{operation.evaluation.id} · {operation.evaluation.worldTemplateId} · seed {operation.evaluation.seed}</span>{operation.evaluation.failureDetail && <span className="micro t3">{operation.evaluation.failureDetail}</span>}</div>}
+      {run && <div className="world-operation-result"><b>Agent {run.lifecycleState}</b><span className="micro mono">{run.id}{run.stopReason ? ` · ${run.stopReason}` : ""}</span>{history.slice(-3).map((item, index) => <span className="micro t3" key={`${String(item.phase ?? item.kind ?? "step")}-${index}`}>{String(item.phase ?? item.kind ?? "step")} · {String(item.failureCode ?? item.reason ?? item.planId ?? "completed")}</span>)}</div>}
+      {command && <><div className="small"><b>{command.plan.summary}</b> <span className="micro t3 mono">{command.plannerProvenance}</span></div>{command.plan.steps.map((step, i) => <div className="console-line" key={`${i}-${step}`}><span className="console-time">{String(i + 1).padStart(2, "0")}</span><span>{step}</span></div>)}</>}
+      {!command && !operation && <div className="empty-note">{hasPlacedWorldAssets ? "The editor contains the registered Panda and generated assets. Run live compiles the named object, target, counter, and Panda into one authoritative MuJoCo task; it does not substitute the cube validation bench. Other kitchen meshes remain authoring visuals until their collision contracts are validated." : "Run live opens one continuous authoritative MuJoCo 3D view. Panda and world poses come from MuJoCo; synchronized front/wrist observations remain visible as an inset while the persisted evaluation runs."}</div>}
     </div>
-    <div className="col" style={{ borderTop: "1px solid var(--border)", paddingTop: 9, gap: 5 }}><b className="small">Execution gates</b>{(command?.blockers ?? robot?.readiness.blockers ?? ["Run Plan to evaluate the full world + policy contract."]).map((value) => <span className="micro t3" key={value}>• {value}</span>)}</div>
+    <div className="col" style={{ borderTop: "1px solid var(--border)", paddingTop: 9, gap: 5 }}><b className="small">Readiness</b>{backend === "isaac_sim" && <span className="micro t3">Isaac execution will return its exact runtime/EULA blocker if the native process cannot launch.</span>}{hasPlacedWorldAssets && <span className="micro t3">Oracle and VLA use the same compiled apple/blender/counter/Panda runtime. Agent curriculum remains validation-world only.</span>}{!modelReady && <span className="micro t3">Load a healthy VLA policy before VLA or autonomous execution.</span>}{!assetReady && !hasPlacedWorldAssets && <span className="micro t3">The selected asset must pass the deterministic oracle before VLA execution.</span>}{robot?.readiness.blockers.map((value) => <span className="micro t3" key={value}>{value}</span>)}</div>
   </div>;
 }
 
-function GeneratedWorldView({ placements, selectedAssetId, mode, onSelect, onCommit }: {
+function GeneratedWorldView({ placements, robotGeometries, robotSpawn, selectedAssetId, mode, onSelect, onCommit, onRobotCommit }: {
   placements: WorldPlacement[];
+  robotGeometries: AuthoringRobotGeometry[];
+  robotSpawn?: { positionM: number[]; quaternionWxyz: number[] };
   selectedAssetId: string;
   mode: EditorTool;
   onSelect: (assetId: string, name: string) => void;
   onCommit: (assetId: string, patch: { translation?: number[]; rotationZDeg?: number; scaleMultiplier?: number[] }) => void;
+  onRobotCommit: (patch: { positionM: number[]; quaternionWxyz: number[] }) => void;
 }) {
   return (
     <WorldEditorCanvas
       placements={placements}
+      robotGeometries={robotGeometries}
+      robotSpawn={robotSpawn}
       selectedAssetId={selectedAssetId}
       tool={mode}
       onSelect={onSelect}
       onCommit={onCommit}
+      onRobotCommit={onRobotCommit}
       onFrame={({ fps, latencyMs }) => window.dispatchEvent(new CustomEvent("robotworld:world-frame", { detail: { fps, latencyMs, active: true } }))}
     />
   );
+}
+
+function LiveWorldResult({ session, frame, status, placements, manualBusy, onManual, onBack }: { session: FrankaLiveSession; frame: FrankaLiveFrame | null; status: string; placements: WorldPlacement[]; manualBusy: boolean; onManual: (kind: "jog" | "open" | "close", deltaM?: number[]) => void; onBack: () => void }) {
+  const activeWorld = session.operation?.executionScope === "active_world";
+  const sourceAssetId = session.operation?.authoredScene?.sourcePlacement?.assetId;
+  const contextPlacements = activeWorld
+    ? placements.filter((entry) => entry.assetId !== sourceAssetId).map((entry) => ({
+        assetId: entry.assetId,
+        name: entry.name,
+        translation: entry.translation,
+        rotationZDeg: entry.rotationZDeg,
+        scale: entry.scale,
+      }))
+    : [];
+  const runtimeGeometries = (frame?.state.renderGeometries ?? []).filter((entry) => (
+    !activeWorld || !["workspace_surface", "target_support_collision", "target_marker"].includes(entry.name)
+  ));
+  return <div className="live-world-result">
+    <header><span className="col" style={{ gap: 1 }}><b>{activeWorld ? "Active editor world · authoritative physics" : "Authoritative validation physics"}</b><span className="micro t3 mono">{session.sessionId} · MuJoCo {session.physicsHz} Hz · transforms {session.streamHz} Hz{activeWorld ? " · textured editor assets retained" : ""}</span></span><button className="btn btn-secondary btn-sm" onClick={onBack}><Icon name="cube" size={11} /> Edit placements</button></header>
+    {runtimeGeometries.length ? <div style={{ position: "relative", flex: 1, minHeight: 0 }}><AuthoritativeSimulationCanvas geometries={runtimeGeometries} contextPlacements={contextPlacements} /><img src={`data:image/jpeg;base64,${frame?.jpegBase64}`} alt="Authoritative front and wrist RGB observations" style={{ position: "absolute", right: 12, top: 12, width: 250, maxWidth: "32%", height: "auto", border: "1px solid var(--border-strong)", borderRadius: 4, boxShadow: "0 8px 24px rgba(0,0,0,.45)" }} />{session.mode === "manual" && <div className="manual-panda-controls"><b>Cartesian jog · 2 cm</b><div className="manual-jog-grid"><button disabled={manualBusy} onClick={() => onManual("jog", [0.02, 0, 0])}>X+</button><button disabled={manualBusy} onClick={() => onManual("jog", [-0.02, 0, 0])}>X−</button><button disabled={manualBusy} onClick={() => onManual("jog", [0, 0.02, 0])}>Y+</button><button disabled={manualBusy} onClick={() => onManual("jog", [0, -0.02, 0])}>Y−</button><button disabled={manualBusy} onClick={() => onManual("jog", [0, 0, 0.02])}>Z+</button><button disabled={manualBusy} onClick={() => onManual("jog", [0, 0, -0.02])}>Z−</button></div><div className="row"><button disabled={manualBusy} onClick={() => onManual("open")}>Open gripper</button><button disabled={manualBusy} onClick={() => onManual("close")}>Close gripper</button></div><span className="micro">Commands actuate MuJoCo; workspace and joint limits reject unsafe targets.</span></div>}</div> : <div className="center col grow" style={{ gap: 8 }}><Icon name="camera" size={22} /><span className="small">Connecting to the running Franka simulation...</span></div>}
+    <footer><span className="mono">{status} · frame {frame?.sequence ?? 0} · sim {(frame?.simTimeSeconds ?? 0).toFixed(2)} s</span><span>{frame?.phase?.replaceAll("_", " ") ?? "initializing"} · contacts {frame?.state.contactCount ?? 0} · {frame?.state.finite === false ? "invalid state" : "finite physics"}</span></footer>
+  </div>;
 }
 
 interface RobotManifest {
@@ -1103,156 +1486,6 @@ function GeneratedAssetInspector({ asset, placement, tab, onTransform, onRotatio
   );
 }
 
-/* ---- Unity-Style Inspector Components ------------------------------------- */
-
-function UnityComponentInspector({
-  selected,
-  selectedName,
-  scenario,
-}: {
-  selected: string;
-  selectedName: string;
-  scenario?: AcceptanceScenario;
-}) {
-  return (
-    <div className="col" style={{ gap: 10 }}>
-      {/* Transform Component */}
-      <InspSection title="Transform" defaultOpen={true}>
-        <div className="unity-prop-grid" style={{ display: "grid", gap: 6 }}>
-          <div className="kv-row" style={{ marginBottom: 4 }}>
-            <span className="kv-k">Node</span>
-            <span className="kv-v mono">{selectedName} ({selected})</span>
-          </div>
-          <TransformRow label="Position" x="0.37" y="2.15" z="-4.54" />
-          <TransformRow label="Rotation" x="0.00" y="18.0" z="0.00" unit="°" />
-          <TransformRow label="Scale" x="1.00" y="1.00" z="1.00" />
-        </div>
-      </InspSection>
-
-      {/* Visual Mesh & PBR Material */}
-      <InspSection title="Mesh Renderer & Material" defaultOpen={true}>
-        <div className="kv">
-          <div className="kv-row"><span className="kv-k">Geometry</span><span className="kv-v mono">SimReady PBR Box [0.8 × 1.05 × 0.08]</span></div>
-          <div className="kv-row"><span className="kv-k">Material</span><span className="kv-v">Brushed Stainless Steel / ABS</span></div>
-          <div className="kv-row"><span className="kv-k">Shader</span><span className="kv-v mono">Vulkan Physically Based Lit</span></div>
-          <div className="kv-row"><span className="kv-k">Cast Shadows</span><span className="kv-v">Enabled</span></div>
-        </div>
-      </InspSection>
-
-      {/* Semantics & Affordances */}
-      <InspSection title="Semantics & Affordances" defaultOpen={true}>
-        <div className="row" style={{ gap: 5, flexWrap: "wrap", marginBottom: 6 }}>
-          <Badge tone="blue">Graspable Handle</Badge>
-          <Badge tone="teal">Revolute Door</Badge>
-          <Badge tone="grey">Obstacle Collider</Badge>
-        </div>
-        <div className="kv">
-          <div className="kv-row"><span className="kv-k">Target Skill</span><span className="kv-v mono">{scenario?.name ?? "Open Refrigerator"}</span></div>
-          <div className="kv-row"><span className="kv-k">Grasp Clearance</span><span className="kv-v mono">0.085 m</span></div>
-        </div>
-      </InspSection>
-    </div>
-  );
-}
-
-function UnityPhysicsInspector({
-  selected,
-  selectedName,
-}: {
-  selected: string;
-  selectedName: string;
-}) {
-  return (
-    <div className="col" style={{ gap: 10 }}>
-      {/* Rigidbody / Physics Properties */}
-      <InspSection title="Rigidbody (Physics Engine)" defaultOpen={true}>
-        <div className="kv">
-          <div className="kv-row"><span className="kv-k">Target</span><span className="kv-v mono">{selectedName} ({selected})</span></div>
-          <div className="kv-row"><span className="kv-k">Mass</span><span className="kv-v mono">18.2 kg</span></div>
-          <div className="kv-row"><span className="kv-k">Center of Mass</span><span className="kv-v mono">[0.0, 0.45, 0.0]</span></div>
-          <div className="kv-row"><span className="kv-k">Gravity</span><span className="kv-v mono">-9.81 m/s²</span></div>
-          <div className="kv-row"><span className="kv-k">Body Type</span><span className="kv-v">Articulated Dynamic</span></div>
-        </div>
-      </InspSection>
-
-      {/* Articulation & Joint Limits */}
-      <InspSection title="Articulation & Joint" defaultOpen={true}>
-        <div className="kv">
-          <div className="kv-row"><span className="kv-k">Joint Type</span><span className="kv-v mono">Revolute (Hinge)</span></div>
-          <div className="kv-row"><span className="kv-k">Rotation Axis</span><span className="kv-v mono">Y-Axis (Vertical)</span></div>
-          <div className="kv-row"><span className="kv-k">Range of Motion</span><span className="kv-v mono">0° → 110°</span></div>
-          <div className="kv-row"><span className="kv-k">Hinge Friction</span><span className="kv-v mono">0.35 N·m</span></div>
-          <div className="kv-row"><span className="kv-k">Damping</span><span className="kv-v mono">1.8 N·s/m</span></div>
-        </div>
-      </InspSection>
-
-      {/* Colliders */}
-      <InspSection title="Colliders & Contact Properties" defaultOpen={true}>
-        <div className="kv">
-          <div className="kv-row"><span className="kv-k">Collider Geometry</span><span className="kv-v mono">Convex Hull (MuJoCo Geom)</span></div>
-          <div className="kv-row"><span className="kv-k">Friction Coefficient</span><span className="kv-v mono">0.82 (Torsional 0.005)</span></div>
-          <div className="kv-row"><span className="kv-k">Contact Margin</span><span className="kv-v mono">0.002 m</span></div>
-        </div>
-      </InspSection>
-    </div>
-  );
-}
-
-function UnityProvenanceInspector({
-  selected,
-  selectedName,
-  job,
-}: {
-  selected: string;
-  selectedName: string;
-  job: AcceptanceJob | null;
-}) {
-  const result = job?.detail.result;
-  return (
-    <div className="col" style={{ gap: 10 }}>
-      <InspSection title="Real-World Data Source" defaultOpen={true}>
-        <div className="kv">
-          <div className="kv-row"><span className="kv-k">Target</span><span className="kv-v mono">{selectedName} ({selected})</span></div>
-          <div className="kv-row"><span className="kv-k">Manufacturer</span><span className="kv-v">Samsung Electronics</span></div>
-          <div className="kv-row"><span className="kv-k">Model Number</span><span className="kv-v mono">RF28T5001SR</span></div>
-          <div className="kv-row"><span className="kv-k">Scraper Collector</span><span className="kv-v mono">c_appliances_refrigerator</span></div>
-          <div className="kv-row"><span className="kv-k">Lens Match</span><span className="kv-v mono">Exact Visual Match Verified</span></div>
-        </div>
-      </InspSection>
-
-      <InspSection title="Physical Compilation Hashes" defaultOpen={true}>
-        <div className="kv">
-          <div className="kv-row"><span className="kv-k">OpenUSD Hash</span><span className="kv-v mono">{result?.manifestSha256?.slice(0, 16) ?? "8a4f9b2c1d3e5f7a"}</span></div>
-          <div className="kv-row"><span className="kv-k">MuJoCo MJCF SHA</span><span className="kv-v mono">{result?.mjcfSha256?.slice(0, 16) ?? "c3d5e7a9b1f24680"}</span></div>
-          <div className="kv-row"><span className="kv-k">Task Verification</span><span className="kv-v mono">{result?.outcome ?? "Environment Verified"}</span></div>
-        </div>
-      </InspSection>
-    </div>
-  );
-}
-
-function TransformRow({ label, x, y, z, unit = "" }: { label: string; x: string; y: string; z: string; unit?: string }) {
-  return (
-    <div className="row" style={{ gap: 6, alignItems: "center", fontSize: 11 }}>
-      <span style={{ width: 55, color: "var(--text-3)", fontWeight: 550 }}>{label}</span>
-      <div className="row" style={{ flex: 1, gap: 4 }}>
-        <span className="unity-axis-input" style={{ flex: 1, display: "flex", alignItems: "center", background: "var(--bg-panel-2)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 4px" }}>
-          <span style={{ color: "#EF4444", fontWeight: 700, marginRight: 4, fontSize: 10 }}>X</span>
-          <span className="mono" style={{ fontSize: 10.5 }}>{x}{unit}</span>
-        </span>
-        <span className="unity-axis-input" style={{ flex: 1, display: "flex", alignItems: "center", background: "var(--bg-panel-2)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 4px" }}>
-          <span style={{ color: "#22C55E", fontWeight: 700, marginRight: 4, fontSize: 10 }}>Y</span>
-          <span className="mono" style={{ fontSize: 10.5 }}>{y}{unit}</span>
-        </span>
-        <span className="unity-axis-input" style={{ flex: 1, display: "flex", alignItems: "center", background: "var(--bg-panel-2)", border: "1px solid var(--border)", borderRadius: 3, padding: "1px 4px" }}>
-          <span style={{ color: "#3B82F6", fontWeight: 700, marginRight: 4, fontSize: 10 }}>Z</span>
-          <span className="mono" style={{ fontSize: 10.5 }}>{z}{unit}</span>
-        </span>
-      </div>
-    </div>
-  );
-}
-
 /* ---- Console Component ---------------------------------------------------- */
 
 function AcceptanceConsole({
@@ -1272,13 +1505,7 @@ function AcceptanceConsole({
           <strong style={{ fontSize: 12 }}>{scenario.name}</strong>
           <span className="micro t3">{scenario.description}</span>
         </div>
-        <div className="row" style={{ gap: 5 }}>
-          <Badge tone="green">Vulkan 1.3 Active</Badge>
-          <Badge tone={catalog?.readiness.policyConfigured ? "green" : "amber"}>
-            VLA {catalog?.readiness.policyConfigured ? "Connected" : "Gateway Gate"}
-          </Badge>
-          <Badge tone="grey">500 Hz Physics</Badge>
-        </div>
+        <span className="micro t3 mono">{catalog?.readiness.policyConfigured ? "configured policy available" : "policy not configured"}</span>
       </div>
       <div className="acceptance-log mono" style={{ fontSize: 11, maxHeight: 130, overflowY: "auto", marginTop: 6 }}>
         {!job ? (
@@ -1300,4 +1527,3 @@ function AcceptanceConsole({
     </div>
   );
 }
-

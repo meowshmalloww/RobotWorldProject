@@ -9,16 +9,20 @@ domain-randomized downstream — never faked as exact.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 import re
 import time
 import urllib.parse
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
 
 from ..config import ASSETS_DIR
+from ..contracts import PartGraph
 from ..db import SessionLocal
 from ..models import Artifact, Asset, CompileStage, Source
 from ..telemetry import span
@@ -122,6 +126,159 @@ def _flat(spec: dict[str, Any]) -> dict[str, Any]:
         else:
             out[k] = v
     return out
+
+
+def _part_graph(
+    asset_id: str,
+    spec: dict[str, Any],
+    spec_triples: dict[str, Any],
+    validation: dict[str, Any],
+) -> dict[str, Any]:
+    """Build and validate the canonical Z-up part graph for one hinged link."""
+
+    def evidence(key: str) -> tuple[list[str], float]:
+        value = spec_triples.get(key)
+        if isinstance(value, tuple) and len(value) == 3:
+            return [f"{key}:{value[1]}"], float(value[2])
+        return [f"{key}:unrecorded"], 0.0
+
+    width = float(spec.get("width_m", 0.7))
+    height = float(spec.get("height_m", 1.7))
+    depth = float(spec.get("depth_m", 0.65))
+    door_width = float(spec.get("door_width_m", width * 0.5))
+    door_mass = float(spec.get("door_mass_kg", 12.0))
+    total_mass = max(float(spec.get("mass_kg", door_mass + 1.0)), door_mass + 0.36)
+    handle_mass = 0.35
+    body_mass = max(0.01, total_mass - door_mass - handle_mass)
+    handle_height = float(spec.get("handle_height_m", 1.05))
+    hinge_side = str(spec.get("hinge_side", "left"))
+    hinge_x = -width / 2 if hinge_side == "left" else width / 2 - door_width
+    max_open_rad = math.radians(float(spec.get("max_open_deg", 110.0)))
+    mass_evidence, mass_confidence = evidence("mass_kg")
+    door_mass_evidence, door_mass_confidence = evidence("door_mass_kg")
+    hinge_evidence, hinge_confidence = evidence("hinge_side")
+    limit_evidence, limit_confidence = evidence("max_open_deg")
+    handle_evidence, handle_confidence = evidence("handle_height_m")
+    lifecycle = (
+        "PHYSICS_VALIDATED"
+        if validation.get("success") is True and (validation.get("jointSweep") or {}).get("passed") is True
+        else "REJECTED"
+    )
+    errors = [] if lifecycle == "PHYSICS_VALIDATED" else [
+        str(validation.get("failure_detail") or "articulation physics validation failed")
+    ]
+    value: dict[str, Any] = {
+        "id": f"{asset_id}-partgraph",
+        "revision": 1,
+        "assetId": asset_id,
+        "rootPartId": "body",
+        "coordinateConvention": {
+            "units": "metres",
+            "upAxis": "Z",
+            "handedness": "right",
+            "runtimeMapping": {"backend": "mujoco_legacy", "canonicalZ": "runtimeY"},
+        },
+        "parts": [
+            {
+                "id": "body",
+                "semanticLabel": "cabinet_body",
+                "parentPartId": None,
+                "visualArtifacts": ["model.glb#node=body"],
+                "collisionArtifacts": ["runtime.mjcf#geom=appliance_body"],
+                "massKg": body_mass,
+                "centerOfMassM": [0.0, 0.0, height / 2],
+                "confidence": mass_confidence,
+                "evidence": mass_evidence,
+            },
+            {
+                "id": "door",
+                "semanticLabel": "hinged_door",
+                "parentPartId": "body",
+                "visualArtifacts": ["model.glb#node=door"],
+                "collisionArtifacts": ["runtime.mjcf#geom=door_panel"],
+                "massKg": door_mass,
+                "centerOfMassM": [door_width / 2, 0.0, height * 0.62],
+                "confidence": door_mass_confidence,
+                "evidence": door_mass_evidence,
+            },
+            {
+                "id": "handle",
+                "semanticLabel": "door_handle",
+                "parentPartId": "door",
+                "visualArtifacts": ["model.glb#node=handle"],
+                "collisionArtifacts": ["runtime.mjcf#geom=handle"],
+                "massKg": handle_mass,
+                "centerOfMassM": [door_width - 0.06, 0.09, handle_height - height * 0.62],
+                "confidence": handle_confidence,
+                "evidence": handle_evidence,
+            },
+        ],
+        "joints": [
+            {
+                "id": "door_hinge",
+                "jointType": "revolute",
+                "parentPartId": "body",
+                "childPartId": "door",
+                "axis": [0.0, 0.0, 1.0],
+                "originXyzM": [hinge_x, depth / 2 + 0.0305, 0.0],
+                "lower": 0.0,
+                "upper": max_open_rad,
+                "damping": 1.2,
+                "friction": float(spec.get("hinge_friction", 2.5)),
+                "confidence": min(hinge_confidence, limit_confidence),
+                "evidence": hinge_evidence + limit_evidence,
+            },
+            {
+                "id": "handle_mount",
+                "jointType": "fixed",
+                "parentPartId": "door",
+                "childPartId": "handle",
+                "axis": [0.0, 0.0, 1.0],
+                "originXyzM": [door_width - 0.06, 0.09, handle_height - height * 0.62],
+                "lower": 0.0,
+                "upper": 0.0,
+                "damping": 0.0,
+                "friction": 0.0,
+                "confidence": handle_confidence,
+                "evidence": handle_evidence,
+            },
+        ],
+        "affordances": [
+            {
+                "id": "open_door_handle",
+                "semantic": "grasp_and_open",
+                "parentPartId": "handle",
+                "action": "follow_revolute_arc",
+                "confidence": handle_confidence,
+                "evidence": handle_evidence,
+                "graspFrames": [
+                    {
+                        "id": "handle_center_grasp",
+                        "parentPartId": "handle",
+                        "translationM": [0.0, 0.0, 0.0],
+                        "quaternionWxyz": [1.0, 0.0, 0.0, 0.0],
+                        "approachAxis": [0.0, -1.0, 0.0],
+                        "jawAxis": [1.0, 0.0, 0.0],
+                        "requiredWidthM": 0.032,
+                    }
+                ],
+            }
+        ],
+        "lifecycleState": lifecycle,
+        "validationErrors": errors,
+        "reviewReason": None if not errors else "physics_or_oracle_review_required",
+        "graphSha256": "0" * 64,
+        "createdBy": "asset_pipeline",
+        "source": "evidence_backed_parametric_compiler",
+        "createdAt": datetime.now(timezone.utc),
+    }
+    candidate = PartGraph.model_validate(value)
+    wire = candidate.model_dump(mode="json", by_alias=True)
+    wire.pop("graphSha256")
+    value["graphSha256"] = hashlib.sha256(
+        json.dumps(wire, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf8")
+    ).hexdigest()
+    return PartGraph.model_validate(value).model_dump(mode="json", by_alias=True)
 
 
 def parse_dimensions(text: str) -> dict[str, tuple[float, str, float]]:
@@ -339,6 +496,14 @@ async def build_asset(
             asset.status = "building"
         await session.commit()
 
+    if generator == "trellis2" and kind == "articulated":
+        reason = (
+            "TRELLIS.2 produced geometry cannot be labeled articulated without a validated PartGraph and separate "
+            "moving-link meshes. Use the rigid visual route or the dedicated articulated compiler."
+        )
+        await _fail_asset(asset_id, stages, reason)
+        raise trellis.TrellisError(reason)
+
     async def stage(name: str, fn):
         t0 = time.time()
         try:
@@ -522,17 +687,25 @@ async def build_asset(
             "robot_base": robot_base,
         }
         world = World(scen, asset_spec)
+        joint_sweep = world.joint_sweep_report()
         r = run_rollout(world, ScriptedController, record=False)
+        success = bool(r.success and joint_sweep["passed"])
+        failure_mode = r.failure_mode
+        failure_detail = r.failure_detail
+        if not joint_sweep["passed"]:
+            failure_mode = "invalid_joint"
+            failure_detail = "; ".join(joint_sweep["errors"])
         return {
-            "success": r.success,
+            "success": success,
             "door_deg": round(r.door_angle_deg, 3),
             "door_peak_deg": round(r.door_peak_deg, 3),
             "threshold_deg": 60.0,
             "collisions": r.collisions,
             "duration_s": round(r.duration_s, 3),
-            "failure_mode": r.failure_mode,
-            "failure_detail": r.failure_detail,
+            "failure_mode": failure_mode,
+            "failure_detail": failure_detail,
             "robot_base_xz_m": list(robot_base),
+            "jointSweep": joint_sweep,
         }
 
     try:
@@ -546,8 +719,9 @@ async def build_asset(
         raise
 
     physics_validity = round(100.0 if validation["success"] else 65.0 if validation.get("door_deg", 0) > 15 else 35.0, 1) if validation["success"] is not None else 0.0
-    articulation = 100.0 if kind == "articulated" else 0.0
+    articulation = 100.0 if kind == "articulated" and validation["success"] is True else 0.0
     readiness = round(0.4 * physics_validity + 0.3 * confidence_mean + 0.3 * articulation, 1)
+    part_graph = _part_graph(asset_id, spec, spec_triples, validation) if kind == "articulated" else None
 
     spec_path = ASSETS_DIR / asset_id / "spec.json"
     spec_payload = {
@@ -564,6 +738,7 @@ async def build_asset(
         "openusdWorld": str(world_path.name) if world_path else None,
         "openusdValidated": usd_validated,
         "physicsValidation": validation,
+        "partGraph": part_graph,
     }
     spec_path.write_text(__import__("json").dumps(spec_payload, indent=2), encoding="utf8")
 
@@ -573,12 +748,13 @@ async def build_asset(
         asset.spec = {
             **{k: ({"value": v[0], "source": v[1], "confidence": v[2]} if isinstance(v, tuple) else v) for k, v in spec_triples.items()},
             "geometry": spec_payload["geometry"],
+            **({"partGraph": part_graph} if part_graph is not None else {}),
         }
         asset.parts = parts
         visual_only = generator == "trellis2" and kind != "articulated"
         asset.properties = {
             "jointType": "Revolute (hinge)" if kind == "articulated" else "None",
-            "axis": "Y (vertical)" if kind == "articulated" else "—",
+            "axis": "Z canonical (mapped to -Y in legacy MuJoCo runtime)" if kind == "articulated" else "—",
             "limits": f"0° – {spec.get('max_open_deg', 110):.0f}°" if kind == "articulated" else "—",
             "mass": f"{spec.get('mass_kg', 0):.1f} kg ({'inferred' if visual_only else 'spec-derived'})",
             "material": f"{', '.join(spec.get('materials', ['unknown']))}{' (inferred)' if visual_only else ''}",

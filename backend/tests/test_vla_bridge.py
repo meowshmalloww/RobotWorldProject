@@ -56,6 +56,27 @@ def _checkpoint_without_state_feature(root: Path) -> Path:
 
 
 def test_vla_action_bridge_round_trip_and_bounds() -> None:
+    assert vla_bridge.supported_action_contract(
+        {
+            "actionDimension": 7,
+            "embodimentAdapterRevision": vla_bridge.DROID_ADAPTER_REVISION,
+            "actionRepresentation": "droid_base_cartesian_velocity",
+        }
+    )
+    assert vla_bridge.supported_action_contract(
+        {
+            "actionDimension": 7,
+            "embodimentAdapterRevision": vla_bridge.ADAPTER_REVISION,
+            "actionRepresentation": "end_effector_local_delta",
+        }
+    )
+    assert not vla_bridge.supported_action_contract(
+        {
+            "actionDimension": 7,
+            "embodimentAdapterRevision": vla_bridge.DROID_ADAPTER_REVISION,
+            "actionRepresentation": "end_effector_local_delta",
+        }
+    )
     normalized = VlaNormalizedAction(
         values=(-1.0, -0.5, 0.0, 0.5, 1.0, -1.0, 0.25),
         adapterRevision=vla_bridge.ADAPTER_REVISION,
@@ -68,6 +89,21 @@ def test_vla_action_bridge_round_trip_and_bounds() -> None:
         vla_bridge.encode_action([0.051, 0, 0, 0, 0, 0, 1])
     with pytest.raises(ValueError, match="revision"):
         vla_bridge.decode_action(VlaNormalizedAction(values=(0, 0, 0, 0, 0, 0, 0), adapterRevision="wrong"))
+
+    checkpoint = vla_bridge.decode_checkpoint_action([0.2, -0.4, 0.0, 0.5, 0.0, -0.25, 1.0])
+    assert checkpoint["physical"] == pytest.approx([0.015, -0.03, 0.0, 0.075, 0.0, -0.0375, 1.0])
+    assert checkpoint["frame"] == "robot_base_delta"
+    assert checkpoint["additionalBinarizationApplied"] is False
+    closed = vla_bridge.decode_checkpoint_action([0, 0, 0, 0, 0, 0, -1.0])
+    assert closed["physical"][-1] == 0.0
+    trained = vla_bridge.decode_checkpoint_action(
+        [0.01, -0.02, 0.03, 0.04, -0.05, 0.06, 1.0],
+        adapter_revision=vla_bridge.ADAPTER_REVISION,
+    )
+    assert trained["physical"] == pytest.approx([0.01, -0.02, 0.03, 0.04, -0.05, 0.06, 1.0])
+    assert trained["frame"] == "end_effector_local_delta"
+    with pytest.raises(ValueError, match="binary"):
+        vla_bridge.decode_checkpoint_action([0, 0, 0, 0, 0, 0, 0.25])
 
 
 def test_unmodified_droid_checkpoint_is_shape_compatible_but_not_executable(
@@ -108,8 +144,7 @@ def test_unmodified_droid_checkpoint_is_shape_compatible_but_not_executable(
         assert bridge["actionContract"]["actionDimension"] == 7
         assert bridge["actionContract"]["checkpointBinarizeGripper"] is True
         assert bridge["actionContract"]["postBridgeBinarization"] is False
-        assert any("franka-cartesian-delta-v1" in blocker for blocker in bridge["blockers"])
-        assert any("end_effector_local_delta" in blocker for blocker in bridge["blockers"])
+        assert any("supported, matching Franka action adapter" in blocker for blocker in bridge["blockers"])
         assert any("not explicitly bound" in blocker for blocker in bridge["blockers"])
 
         decoded = client.post(

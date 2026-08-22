@@ -58,6 +58,8 @@ def _apply_cartesian_delta(
     physical: list[float],
     *,
     physics_substeps: int,
+    frame: str,
+    workspace_bounds_m: np.ndarray = CARTESIAN_BOUNDS_M,
 ) -> dict[str, Any]:
     model, data = backend._require()
     values = np.asarray(physical, dtype=np.float64)
@@ -65,10 +67,20 @@ def _apply_cartesian_delta(
         raise ValueError("Decoded Franka action must contain seven finite values.")
     current_position = data.site_xpos[backend.ee_site].copy()
     current_rotation = data.site_xmat[backend.ee_site].reshape(3, 3).copy()
-    target_position = current_position + current_rotation @ values[:3]
-    if np.any(target_position < CARTESIAN_BOUNDS_M[:, 0]) or np.any(target_position > CARTESIAN_BOUNDS_M[:, 1]):
+    if frame == "robot_base_delta":
+        target_position = current_position + values[:3]
+        target_rotation = _rotation_xyz(values[3:6]) @ current_rotation
+        translation_frame = "robot_base"
+        rotation_convention = "extrinsic_xyz_radians"
+    elif frame == "end_effector_local_delta":
+        target_position = current_position + current_rotation @ values[:3]
+        target_rotation = current_rotation @ _rotation_xyz(values[3:6])
+        translation_frame = "end_effector_local"
+        rotation_convention = "intrinsic_xyz_radians"
+    else:
+        raise ValueError(f"Unsupported Cartesian action frame: {frame}")
+    if np.any(target_position < workspace_bounds_m[:, 0]) or np.any(target_position > workspace_bounds_m[:, 1]):
         raise ValueError(f"Cartesian target is outside the configured Franka workspace safety box: {target_position.tolist()}")
-    target_rotation = current_rotation @ _rotation_xyz(values[3:6])
     position_error = target_position - current_position
     rotation_error = _orientation_error(current_rotation, target_rotation)
     jacp = np.zeros((3, model.nv))
@@ -95,8 +107,8 @@ def _apply_cartesian_delta(
     backend.step(physics_substeps)
     return {
         "targetPositionM": [float(value) for value in target_position],
-        "translationFrame": "end_effector_local",
-        "rotationConvention": "intrinsic_xyz_radians",
+        "translationFrame": translation_frame,
+        "rotationConvention": rotation_convention,
         "targetJointPosition": [float(value) for value in target_qpos],
         "jointDeltaNormRad": float(np.linalg.norm(joint_delta)),
         "gripperOpenFraction": float(values[6]),
@@ -127,16 +139,20 @@ def run_compiled_asset_policy(
     max_policy_steps: int,
     infer_action: Callable[..., dict[str, Any]],
     placement_request: PlacementRequest | dict[str, Any] | None = None,
+    template_override: dict[str, Any] | None = None,
+    artifact_dir_override: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if not bridge.get("executable"):
         raise ValueError("VLA bridge is not executable: " + "; ".join(bridge.get("blockers") or []))
-    template = franka_pick_place.compile_compiled_asset_world_template(
-        robot_id,
-        asset_version,
-        placement_request=placement_request,
+    template = template_override or franka_pick_place.compile_compiled_asset_world_template(
+        robot_id, asset_version, placement_request=placement_request,
     )
-    artifact_dir = (WORLDS_DIR / franka_pick_place.TEMPLATE_ID / "evaluations" / run_id).resolve()
-    expected = (WORLDS_DIR / franka_pick_place.TEMPLATE_ID / "evaluations").resolve()
+    expected = (
+        Path(template["runtimePath"]).resolve().parent.parent / "evaluations"
+        if template_override is not None
+        else WORLDS_DIR / franka_pick_place.TEMPLATE_ID / "evaluations"
+    ).resolve()
+    artifact_dir = (artifact_dir_override or (expected / run_id)).resolve()
     if expected not in artifact_dir.parents:
         raise ValueError("Invalid VLA evaluation artifact target.")
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -154,6 +170,9 @@ def run_compiled_asset_policy(
     if policy_control_hz <= 0 or franka_pick_place.PHYSICS_HZ % policy_control_hz:
         raise ValueError("Validated policy control rate no longer divides the physics rate.")
     physics_substeps = franka_pick_place.PHYSICS_HZ // policy_control_hz
+    workspace_bounds = np.asarray(template.get("workspaceSafetyBoundsM") or CARTESIAN_BOUNDS_M, dtype=np.float64)
+    if workspace_bounds.shape != (3, 2) or not np.isfinite(workspace_bounds).all():
+        raise ValueError("World template contains an invalid Cartesian workspace safety box.")
     image_size = capabilities.get("imageSize") or [224, 224]
     if not isinstance(image_size, list) or len(image_size) != 2:
         image_size = [224, 224]
@@ -220,11 +239,17 @@ def run_compiled_asset_policy(
                     values=tuple(inference.get("normalizedAction") or ()),
                     adapterRevision=vla_bridge.ADAPTER_REVISION,
                 )
-                decoded = vla_bridge.decode_action(normalized)
+                checkpoint_action = tuple(inference.get("checkpointAction") or ())
+                decoded = vla_bridge.decode_checkpoint_action(
+                    checkpoint_action,
+                    adapter_revision=str(bridge.get("adapterRevision") or ""),
+                )
                 controller = _apply_cartesian_delta(
                     backend,
                     decoded["physical"],
                     physics_substeps=physics_substeps,
+                    frame=str(decoded["frame"]),
+                    workspace_bounds_m=workspace_bounds,
                 )
             except vla_policy_worker.VlaWorkerError as exc:
                 failure = ("worker_crash", str(exc))
@@ -254,6 +279,7 @@ def run_compiled_asset_policy(
                     "step": step_index,
                     "instruction": instruction,
                     "normalizedAction": list(normalized.values),
+                    "checkpointAction": list(checkpoint_action),
                     "physicalAction": list(decoded["physical"]),
                     "controller": controller,
                     "inferenceDurationSeconds": inference.get("inferenceDurationSeconds"),
@@ -299,9 +325,11 @@ def run_compiled_asset_policy(
         capture("final", persist=True)
         final_state = backend.state()
         final_contacts = backend.contacts()
+        target = template["targetVolumes"][0]
+        support_body = str(target.get("supportBody", "workspace_calibration"))
         support_contact = any(
             "pick_object" in {contact.body_a, contact.body_b}
-            and "workspace_calibration" in {contact.body_a, contact.body_b}
+            and support_body in {contact.body_a, contact.body_b}
             for contact in final_contacts
         )
         finger_contact = any(
@@ -309,7 +337,6 @@ def run_compiled_asset_policy(
             and ({contact.body_a, contact.body_b} & {"left_finger", "right_finger"})
             for contact in final_contacts
         )
-        target = template["targetVolumes"][0]
         target_center = np.asarray(target["centerM"], dtype=np.float64)
         final_grasp = backend.data.site_xpos[backend.asset_grasp_site].copy()
         target_error = float(np.linalg.norm(final_grasp[:2] - target_center[:2]))
@@ -363,7 +390,8 @@ def run_compiled_asset_policy(
             "modelRevision": model.get("modelRevision"),
             "modelContentSha256": model.get("contentSha256"),
             "normalizationRevision": normalization_revision,
-            "adapterRevision": vla_bridge.ADAPTER_REVISION,
+            "adapterRevision": bridge.get("adapterRevision"),
+            "actionRepresentation": (bridge.get("actionContract") or {}).get("checkpointRepresentation"),
             "instruction": instruction,
             "contained": contained,
             "onSupportSurface": support_contact,
@@ -396,6 +424,7 @@ def run_compiled_asset_policy(
             "durationSeconds": time.perf_counter() - started,
             "physicsHz": franka_pick_place.PHYSICS_HZ,
             "controlHz": policy_control_hz,
+            "actionContract": dict(bridge.get("actionContract") or {}),
             "phases": phases,
             "trajectory": trajectory,
             "contactSummary": {

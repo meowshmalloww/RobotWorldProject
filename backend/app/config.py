@@ -27,9 +27,11 @@ WORLDS_DIR = DATA_DIR / "worlds"
 ROBOTS_DIR = DATA_DIR / "robots"
 WORKERS_DIR = DATA_DIR / "workers"
 EVIDENCE_DIR = DATA_DIR / "evidence"
+DATASETS_DIR = DATA_DIR / "datasets"
+TRAINING_RUNS_DIR = DATA_DIR / "training-runs"
 DB_PATH = DATA_DIR / "robotworld.db"
 
-for _d in (DATA_DIR, ASSETS_DIR, DEMOS_DIR, MODELS_DIR, WORLDS_DIR, ROBOTS_DIR, WORKERS_DIR, EVIDENCE_DIR):
+for _d in (DATA_DIR, ASSETS_DIR, DEMOS_DIR, MODELS_DIR, WORLDS_DIR, ROBOTS_DIR, WORKERS_DIR, EVIDENCE_DIR, DATASETS_DIR, TRAINING_RUNS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
@@ -54,6 +56,7 @@ class EnvSettings(BaseSettings):
     trellis_endpoint: str | None = None
     trellis_api_key: str | None = None
     isaac_sim_root: str | None = None
+    isaac_lab_root: str | None = None
     isaacsim_asset_root: str | None = None
 
     # Current Bright Data documentation calls this an API token. Keep the
@@ -120,15 +123,28 @@ DEFAULT_SETTINGS: dict = {
         },
     },
     "simulation": {
-        "engine": "mujoco",
+        # Isaac is the requested primary runtime. MuJoCo remains the tested,
+        # backend-compatible fallback while the local Isaac worker is offline.
+        "engine": "isaac_sim",
         "gravity": -9.81,
-        "timestepHz": 500,
-        "renderer": "mujoco-offscreen",
-        "isaacRoot": env.isaac_sim_root or "",
+        "timestepHz": 100,
+        "renderer": "isaac-rtx",
+        "isaacRoot": env.isaac_sim_root or r"D:\RobotWorldRuntimes\isaac-env",
+        "isaacLabRoot": env.isaac_lab_root or r"D:\IsaacLab",
         "isaacAssetRoot": env.isaacsim_asset_root or "",
-        "isaacVersion": "5.1",
+        "isaacVersion": "6.0.1",
+        "fallbackEngine": "mujoco",
     },
     "models": {
+        "modelRoots": [
+            r"D:\TRELLIS.2-4B",
+            r"D:\TRELLIS.2-4B-Q4-GGUF",
+            r"D:\TRELLIS.2-runtime",
+            r"D:\TRELLIS.2-windows-adapter",
+            r"D:\trellis.cpp-v0.6.0-cuda12",
+            r"D:\VLA-JEPA-Pretrain",
+            r"D:\DINOv3",
+        ],
         "planner": env.openai_model,
         "vlm": env.openai_model,
         # Evidence extraction is an explicit, audited action.  It is not the
@@ -155,8 +171,11 @@ DEFAULT_SETTINGS: dict = {
         "trellisEndpoint": env.trellis_endpoint or "http://127.0.0.1:8188",
         "trellisApiKey": env.trellis_api_key or "",
         "trellisModel": "microsoft/TRELLIS.2-4B",
-        "trellisRuntime": "native",
-        "trellisResolution": 1024,
+        # The Q4 CUDA runtime is the executable path sized for this host's
+        # 12 GiB RTX 4080 Laptop GPU. The native 4B repository remains
+        # registered for higher-memory workers and is never silently used.
+        "trellisRuntime": "gguf",
+        "trellisResolution": 512,
         "trellisSeed": 1048576,
         "trellisBackgroundRemoval": True,
         "trellisNativePath": r"D:\TRELLIS.2-4B",

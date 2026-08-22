@@ -355,18 +355,18 @@ export function ModelsPane({ draft, onChange }: { draft: SettingsData["models"];
       <p className="micro t3" style={{ marginTop: 8 }}>The endpoint is probed during evaluation. Observations and actions follow the RobotWorld policy contract; no weights are transferred through the editor.</p>
     </Card>
 
-    <Card title="Microsoft TRELLIS.2" right={<Badge tone="teal">Native</Badge>}>
+    <Card title="Microsoft TRELLIS.2" right={<Badge tone="teal">{draft.trellisRuntime === "gguf" ? "CUDA Q4" : "Native"}</Badge>}>
       <div className="st-grid">
-        <FormRow label="Runtime"><select className="select" value="native" onChange={() => undefined}><option value="native">Microsoft native BF16/FP16</option></select></FormRow>
+        <FormRow label="Runtime"><select className="select" value={draft.trellisRuntime} onChange={(e) => setModel({ trellisRuntime: e.target.value })}><option value="gguf">trellis.cpp CUDA Q4 · 12 GiB path</option><option value="native">Microsoft native BF16/FP16 · high-memory worker</option></select></FormRow>
         <FormRow label="Resolution"><select className="select" value={draft.trellisResolution} onChange={(e) => setModel({ trellisResolution: Number(e.target.value) })}><option value={512}>512 - preview</option><option value={1024}>1024 - balanced</option><option value={1536}>1536 - maximum</option></select></FormRow>
         <FormRow label="Seed"><input className="input mono" type="number" min={0} max={2147483647} value={draft.trellisSeed} onChange={(e) => setModel({ trellisSeed: Math.max(0, Number(e.target.value) || 0) })} /></FormRow>
         <FormRow label="Foreground matte"><select className="select" value={draft.trellisBackgroundRemoval ? "on" : "off"} onChange={(e) => setModel({ trellisBackgroundRemoval: e.target.value === "on" })}><option value="on">BiRefNet/U2-Net enabled</option><option value="off">Use source alpha</option></select></FormRow>
         <FormRow label="Model"><ModelSelect value={draft.trellisModel} onChange={(trellisModel) => setModel({ trellisModel })} options={[{ value: "TRELLIS.2-4B", label: "TRELLIS.2 4B" }, { value: "microsoft/TRELLIS.2-4B", label: "Microsoft TRELLIS.2 4B" }]} /></FormRow>
-        <FormRow label="Native weights"><input className="input mono" value={draft.trellisNativePath || "Auto-detecting"} readOnly /></FormRow>
+        <FormRow label="Active weights"><input className="input mono" value={(draft.trellisRuntime === "gguf" ? draft.trellisGgufPath : draft.trellisNativePath) || "Auto-detecting"} readOnly /></FormRow>
         <FormRow label="Timeout (s)"><input className="input mono" type="number" value={draft.trellisTimeoutS} onChange={(e) => setModel({ trellisTimeoutS: Number(e.target.value) || 0 })} /></FormRow>
       </div>
       <p className="small t2" style={{ marginTop: 10 }}>Official modes are 512, 1024, and 1536. The requested 500/1584 choices map to supported 512/1536 modes.</p>
-      <div className="row" style={{ marginTop: 10 }}><button className="btn btn-secondary btn-sm" disabled={probingTrellis} onClick={probeTrellis}><Icon name="shield" size={12} /> {probingTrellis ? "Checking..." : "Verify native runtime"}</button></div>
+      <div className="row" style={{ marginTop: 10 }}><button className="btn btn-secondary btn-sm" disabled={probingTrellis} onClick={probeTrellis}><Icon name="shield" size={12} /> {probingTrellis ? "Checking..." : "Verify selected runtime"}</button></div>
     </Card>
 
     <Card title="Installed runtimes" right={<button className="btn btn-ghost btn-sm" onClick={refetchStatus}><Icon name="refresh" size={12} /> Rescan</button>}>
@@ -379,6 +379,10 @@ export function ModelsPane({ draft, onChange }: { draft: SettingsData["models"];
 }
 
 function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]; onChange: (p: Partial<SettingsData["simulation"]>) => void }) {
+  const { data: isaac, error: isaacError } = useApi<{
+    version: string; installed: boolean; root: string; isaacLabRoot: string; isaacLabRevision: string;
+    ready: boolean; configuredReady: boolean; eulaAcceptedForApiProcess: boolean; blockers: string[]; frankaAsset: string;
+  }>("/simulation/isaac");
   return (
     <div className="st-stack">
       <Card title="Authoritative physics engine" right={<Badge tone="teal">MuJoCo</Badge>}>
@@ -397,10 +401,18 @@ function SimulationPane({ draft, onChange }: { draft: SettingsData["simulation"]
         </p>
         <SaveSection section="simulation" draft={draft} />
       </Card>
-      <Card title="Backend boundary" right={<Badge tone="grey">Extensible</Badge>}>
-        <p className="small t2">
-          Runtime scenes are compiled for MuJoCo from versioned robot, world, and asset contracts. Isaac Sim is deferred and disabled; adding another engine must implement the simulation backend contract without changing product logic.
+      <Card title="NVIDIA Isaac Sim + Isaac Lab" right={<Badge tone={isaac?.ready ? "teal" : isaac?.installed ? "amber" : "grey"}>{isaac?.ready ? "Ready" : isaac?.installed ? "Installed · blocked" : "Not detected"}</Badge>}>
+        {isaacError ? <ErrorState message={isaacError.message} /> : <div className="st-grid">
+          <FormRow label="Isaac Sim"><input className="input mono" readOnly value={isaac ? `${isaac.version} · ${isaac.root}` : "Inspecting local runtime…"} /></FormRow>
+          <FormRow label="Isaac Lab"><input className="input mono" readOnly value={isaac ? `${isaac.isaacLabRevision.slice(0, 12)} · ${isaac.isaacLabRoot}` : "Inspecting local runtime…"} /></FormRow>
+          <FormRow label="Franka OpenUSD"><input className="input mono" readOnly value={isaac?.frankaAsset ?? "Inspecting local asset reference…"} /></FormRow>
+        </div>}
+        {isaac?.configuredReady && !isaac.eulaAcceptedForApiProcess && <FormRow label="Accept EULA"><input className="input mono" readOnly value={'[Environment]::SetEnvironmentVariable("OMNI_KIT_ACCEPT_EULA","YES","User")'} /></FormRow>}
+        <p className="small t2" style={{ marginTop: 10 }}>
+          The Worlds page dispatches Isaac selections to the isolated native Isaac worker. MuJoCo remains available through the same world command contract; neither backend is represented by a browser-only animation.
         </p>
+        {isaac?.configuredReady && !isaac.eulaAcceptedForApiProcess && <p className="small t2" style={{ marginTop: 8 }}>After reading and accepting NVIDIA's license, run the PowerShell command above and restart RobotWorld so the API and isolated worker inherit it.</p>}
+        {isaac?.blockers.map((blocker) => <div className="callout callout-warn" style={{ margin: "8px 0 0" }} key={blocker}><Icon name="warning" size={13} /><span>{blocker}</span></div>)}
       </Card>
     </div>
   );

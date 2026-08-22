@@ -4,8 +4,399 @@ import time
 
 from fastapi.testclient import TestClient
 
-from app.main import app
-from app.services import brightdata, llm
+from app.contracts import WorldOperateRequest
+from app.main import ChatIn, ChatMessageIn, ManualJogIn, _chat_offline_intent, _chat_tool_catalog, _select_vla_status_registration, app
+from app.services import brightdata, franka_live, llm
+
+
+def test_manual_jog_contract_and_bounded_live_summary() -> None:
+    assert ManualJogIn(deltaM=(0.02, 0.0, 0.0)).deltaM == (0.02, 0.0, 0.0)
+    for invalid in ((0.0, 0.0, 0.0), (0.031, 0.0, 0.0), (0.03, 0.03, 0.0)):
+        try:
+            ManualJogIn(deltaM=invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"unsafe manual jog was accepted: {invalid}")
+    summary = franka_live.evaluation_summary({
+        "id": "eval_test",
+        "status": "SUCCEEDED",
+        "success": True,
+        "result": {"predicate": {"settled": True}, "trajectory": [{"large": "payload"}] * 1000},
+    })
+    assert summary["result"] == {"predicate": {"settled": True}, "contactSummary": None}
+    assert "trajectory" not in summary["result"]
+
+
+def test_vla_status_selects_resident_checkpoint_not_first_registration() -> None:
+    candidate = {
+        "id": "candidate",
+        "roles": ["vla_policy"],
+        "localPath": r"D:\RobotWorldProject\data\training_runs\candidate",
+        "lifecycleState": "AVAILABLE",
+        "capabilities": {"configType": "vla_jepa"},
+    }
+    base = {
+        "id": "base",
+        "roles": ["vla_policy"],
+        "localPath": r"D:\VLA-JEPA-Pretrain",
+        "lifecycleState": "LOADED",
+        "capabilities": {"configType": "vla_jepa"},
+    }
+    selected = _select_vla_status_registration(
+        [candidate, base],
+        {
+            "running": True,
+            "loaded": True,
+            "resident": {"checkpointPath": r"d:\VLA-JEPA-Pretrain"},
+        },
+    )
+    assert selected is base
+
+
+def test_grounded_chat_rejects_measured_failed_candidate() -> None:
+    context = _grounded_chat_context(loaded=True)
+    context["models"].append({
+        "id": "candidate-model",
+        "name": "Fine-tuned candidate",
+        "roles": ["vla_policy"],
+        "lifecycle": "AVAILABLE",
+        "health": "healthy",
+        "sourceTrainingRunId": "training-run",
+        "baseModelId": "vla-test",
+    })
+    context["latestTrainingPreflights"] = [{
+        "id": "training-run",
+        "lifecycle": "SUCCEEDED",
+        "baseModelId": "vla-test",
+        "candidateCheckpointSha256": "a" * 64,
+    }]
+    context["latestEvaluations"] = [{
+        "id": "candidate-evaluation",
+        "success": False,
+        "failureCode": "grasp_miss",
+        "policy": "vla-jepa:candidate-model:r2",
+    }]
+    context["latestPolicyDecisions"] = []
+    response = _chat_offline_intent(
+        ChatIn(messages=[ChatMessageIn(role="user", content="Reject the candidate; do not promote it.")]),
+        context,
+        "planner:typed-workspace",
+        "typed-control-planner",
+    )
+    assert response["actions"][0]["tool"] == "training.policy_candidates.decide"
+    arguments = response["actions"][0]["arguments"]
+    assert arguments["decision"] == "REJECT"
+    assert arguments["evaluationIds"] == ["candidate-evaluation"]
+    assert arguments["previousModelId"] == "vla-test"
+
+
+def _grounded_chat_context(*, loaded: bool) -> dict:
+    return {
+        "robots": [
+            {
+                "id": "franka-test",
+                "name": "Franka Panda",
+                "format": "mjcf",
+                "physicsReady": True,
+                "cameras": ["front", "wrist"],
+                "blockers": [],
+            }
+        ],
+        "models": [
+            {
+                "id": "vla-test",
+                "name": "VLA-JEPA",
+                "roles": ["vla_policy"],
+                "lifecycle": "LOADED" if loaded else "AVAILABLE",
+                "health": "healthy" if loaded else "worker_stopped",
+            }
+        ],
+        "physicalAssets": [
+            {"id": "assetver-test", "name": "Known-good cube", "lifecycle": "ORACLE_VALIDATED"}
+        ],
+        "latestEvaluations": [],
+        "latestCurriculumRuns": [],
+        "latestDatasets": [],
+        "latestTrainingPreflights": [],
+        "integrations": {
+            "brightDataConfigured": False,
+            "sigNozOtlpConfigured": False,
+            "sigNozQueryConfigured": False,
+            "trellisQ4ArtifactAvailable": True,
+            "leRobotDatasetWriterImplemented": True,
+            "fineTuningPreflightImplemented": True,
+            "fineTuningWorkerImplemented": True,
+        },
+    }
+
+
+def test_grounded_chat_asks_for_training_goal_before_actions() -> None:
+    response = _chat_offline_intent(
+        ChatIn(messages=[ChatMessageIn(role="user", content="Help me train my current robot.")]),
+        _grounded_chat_context(loaded=True),
+        "disabled:not_configured",
+        "planner",
+    )
+    assert response["actions"] == []
+    assert "what task" in response["reply"].lower()
+    assert "fine-tuning" in response["reply"].lower()
+
+
+def test_grounded_chat_advances_pick_place_to_load_or_bounded_run() -> None:
+    payload = ChatIn(messages=[ChatMessageIn(role="user", content="Pick up the object and place it in the target.")])
+    stopped = _chat_offline_intent(payload, _grounded_chat_context(loaded=False), "disabled:not_configured", "planner")
+    assert [action["tool"] for action in stopped["actions"]] == ["models.load"]
+
+    loaded = _chat_offline_intent(payload, _grounded_chat_context(loaded=True), "disabled:not_configured", "planner")
+    assert [action["tool"] for action in loaded["actions"]] == ["curriculum.runs.start"]
+    arguments = loaded["actions"][0]["arguments"]
+    assert arguments["robotId"] == "franka-test"
+    assert arguments["modelId"] == "vla-test"
+    assert arguments["allowedAssetVersionIds"] == ["assetver-test"]
+    assert arguments["budgets"]["maxEvaluationEpisodes"] == 2
+    assert arguments["instruction"] == "Pick up the object and place it in the target."
+
+
+def test_grounded_chat_keeps_original_instruction_after_tool_result() -> None:
+    response = _chat_offline_intent(
+        ChatIn(messages=[
+            ChatMessageIn(role="user", content="Pick up the object and place it in the target."),
+            ChatMessageIn(role="user", content="Authoritative RobotWorld tool result — models.load succeeded. Continue."),
+        ]),
+        _grounded_chat_context(loaded=True),
+        "planner:typed-workspace",
+        "typed-control-planner",
+    )
+    assert response["actions"][0]["arguments"]["instruction"] == "Pick up the object and place it in the target."
+
+
+def test_grounded_chat_runs_oracle_instead_of_repeating_known_invalid_vla() -> None:
+    context = _grounded_chat_context(loaded=True)
+    context["latestEvaluations"] = [{
+        "id": "eval-vla-invalid",
+        "success": False,
+        "failureCode": "invalid_action",
+        "policy": "VLA-JEPA:test",
+        "robotId": "franka-test",
+        "observationFrameCount": 4,
+    }]
+    response = _chat_offline_intent(
+        ChatIn(messages=[ChatMessageIn(role="user", content="Pick up the object and place it in the target.")]),
+        context,
+        "planner:typed-workspace",
+        "typed-control-planner",
+    )
+    assert [action["tool"] for action in response["actions"]] == ["evaluations.run_oracle_compiled_asset"]
+    assert response["actions"][0]["arguments"]["assetVersionId"] == "assetver-test"
+
+    stopped = _chat_offline_intent(
+        ChatIn(messages=[
+            ChatMessageIn(role="user", content="Pick up the object and place it in the target."),
+            ChatMessageIn(role="user", content="Authoritative RobotWorld tool result — evaluations.run_oracle_compiled_asset succeeded."),
+        ]),
+        context,
+        "planner:typed-workspace",
+        "typed-control-planner",
+    )
+    assert stopped["actions"] == []
+    assert "did not re-run" in stopped["reply"]
+
+
+def test_chat_tool_catalog_exposes_required_input_schema() -> None:
+    catalog = _chat_tool_catalog()
+    assert "vla.attach_franka_zero_shot_bridge" in catalog
+    assert '"acknowledgeZeroShotRisk"' in catalog
+    assert '"cameraMapping"' in catalog
+    assert '"maxEvaluationEpisodes"' in catalog
+    assert "training.datasets.create_from_evaluation" in catalog
+    assert '"evaluationId"' in catalog
+    assert "training.vla_jepa.execute_fine_tune" in catalog
+    assert '"acknowledgeCandidateOnly"' in catalog
+
+
+def test_agentic_chat_converts_model_mutation_to_approval_card(monkeypatch) -> None:
+    async def tool_chat(messages, *, tools, execute_tool, **kwargs):
+        result = await execute_tool("curriculum.runs.cancel", {"runId": "autorun_pending"})
+        assert result["status"] == "approval_required"
+        return '{"reply":"Cancellation is ready for approval.","actions":[]}', "llm:test:tool-loop", "gpt-test", [
+            {"turn": 1, "tool": "curriculum.runs.cancel", "status": "approval_required"}
+        ]
+
+    monkeypatch.setattr(llm, "tool_chat", tool_chat)
+    with TestClient(app) as client:
+        before = len(client.get("/api/agent/tool-calls").json()["toolCalls"])
+        response = client.post(
+            "/api/chat",
+            json={"messages": [{"role": "user", "content": "Cancel the active run."}]},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["provenance"] == "llm:test:tool-loop"
+        assert body["actions"] == [
+            {
+                "label": "Cancel",
+                "tool": "curriculum.runs.cancel",
+                "arguments": {"runId": "autorun_pending"},
+                "effect": "MUTATION",
+                "approvalRequired": True,
+            }
+        ]
+        after = len(client.get("/api/agent/tool-calls").json()["toolCalls"])
+        assert after == before
+
+
+def test_grounded_chat_advances_fine_tune_from_preflight_to_execution() -> None:
+    context = _grounded_chat_context(loaded=True)
+    context["latestTrainingPreflights"] = [
+        {
+            "id": "trainrun-ready",
+            "lifecycle": "READY",
+            "datasetId": "dataset-test",
+            "baseModelId": "vla-test",
+            "error": None,
+        }
+    ]
+    response = _chat_offline_intent(
+        ChatIn(messages=[ChatMessageIn(role="user", content="Fine-tune the current VLA now.")]),
+        context,
+        "disabled:not_configured",
+        "planner",
+    )
+    assert [action["tool"] for action in response["actions"]] == ["training.vla_jepa.execute_fine_tune"]
+    assert response["actions"][0]["arguments"] == {
+        "runId": "trainrun-ready",
+        "acknowledgeCandidateOnly": True,
+    }
+
+
+def test_grounded_chat_exports_only_recorded_successful_oracle_demonstration() -> None:
+    context = _grounded_chat_context(loaded=True)
+    context["latestEvaluations"] = [
+        {
+            "id": "eval-recorded-oracle",
+            "success": True,
+            "failureCode": None,
+            "policy": "deterministic_differential_ik_oracle_v1",
+            "robotId": "franka-test",
+            "observationFrameCount": 42,
+        }
+    ]
+    response = _chat_offline_intent(
+        ChatIn(messages=[ChatMessageIn(role="user", content="Export a LeRobot dataset from the demonstration.")]),
+        context,
+        "disabled:not_configured",
+        "planner",
+    )
+    assert [action["tool"] for action in response["actions"]] == ["training.datasets.create_from_evaluation"]
+    assert response["actions"][0]["arguments"]["evaluationId"] == "eval-recorded-oracle"
+
+    context["latestEvaluations"][0]["observationFrameCount"] = 0
+    blocked = _chat_offline_intent(
+        ChatIn(messages=[ChatMessageIn(role="user", content="Export a LeRobot dataset.")]),
+        context,
+        "disabled:not_configured",
+        "planner",
+    )
+    assert blocked["actions"] == []
+    assert "recorded observations" in blocked["reply"]
+
+
+def test_world_operator_rejects_implicit_or_unsupported_execution_contracts() -> None:
+    drop = WorldOperateRequest.model_validate({
+        "robotId": "franka",
+        "instruction": "Pick up the apple and throw it off the table.",
+        "backend": "mujoco",
+        "controller": "oracle",
+        "task": "drop_off_table",
+        "executionScope": "active_world",
+        "worldId": "kitchen",
+    })
+    assert drop.task == "drop_off_table"
+    cases = [
+        {
+            "robotId": "franka",
+            "instruction": "Pick up the object and throw it off the table.",
+            "backend": "mujoco",
+            "controller": "oracle",
+            "task": "pick_place",
+        },
+        {
+            "robotId": "franka",
+            "instruction": "Pick up the object and place it outside the target.",
+            "backend": "mujoco",
+            "controller": "oracle",
+            "task": "pick_place",
+        },
+        {
+            "robotId": "franka",
+            "instruction": "pick the cube",
+            "backend": "mujoco",
+            "controller": "vla_jepa",
+            "task": "pick_place",
+        },
+        {
+            "robotId": "franka",
+            "instruction": "run agent",
+            "backend": "isaac_sim",
+            "controller": "agent",
+            "task": "pick_place",
+            "assetVersionId": "assetver_test",
+            "modelId": "model_test",
+        },
+        {
+            "robotId": "franka",
+            "instruction": "open drawer with policy",
+            "backend": "mujoco",
+            "controller": "vla_jepa",
+            "task": "open_drawer",
+            "assetVersionId": "assetver_test",
+            "modelId": "model_test",
+        },
+    ]
+    with TestClient(app) as client:
+        for payload in cases:
+            response = client.post("/api/worlds/operate", json=payload)
+            assert response.status_code == 422, response.text
+            if "throw" in payload["instruction"] or "outside" in payload["instruction"]:
+                assert "No simulation was started" in response.text
+
+        live = client.post("/api/worlds/live-sessions", json=cases[0])
+        assert live.status_code == 422
+        assert "No simulation was started" in live.text
+
+        active_world_id = client.get("/api/worlds/scene").json()["worldId"]
+        active_agent = client.post(
+            "/api/worlds/operate",
+            json={
+                "robotId": "franka",
+                "modelId": "model_test",
+                "assetVersionId": "assetver_test",
+                "instruction": "Pick up the apple and place it on top of the blender.",
+                "backend": "mujoco",
+                "controller": "agent",
+                "task": "pick_place",
+                "executionScope": "active_world",
+                "worldId": active_world_id,
+            },
+        )
+        assert active_agent.status_code == 422
+        assert "No validation-bench evaluation was substituted" in active_agent.text
+
+        authored = client.post(
+            "/api/worlds/live-sessions",
+            json={
+                "robotId": "franka",
+                "instruction": "Pick up the apple and place it on top of the blender.",
+                "backend": "mujoco",
+                "controller": "oracle",
+                "task": "pick_place",
+                "executionScope": "active_world",
+                "worldId": active_world_id,
+            },
+        )
+        assert authored.status_code == 422
+        assert "No simulation was started" in authored.text
 
 
 def test_primary_read_contract() -> None:
@@ -33,6 +424,9 @@ def test_primary_read_contract() -> None:
         for path in paths:
             response = client.get(path)
             assert response.status_code == 200, (path, response.text)
+        training = client.get("/api/training").json()
+        assert isinstance(training["datasets"], list)
+        assert isinstance(training["canonicalRuns"], list)
         assert client.get("/api/skills/open-refrigerator").status_code == 404
         legacy_agent = client.post("/api/agent/run", json={"skillId": "open-refrigerator"})
         assert legacy_agent.status_code == 410
@@ -53,7 +447,13 @@ def test_write_only_secrets_survive_section_save() -> None:
         response = client.put("/api/settings/models", json=models)
         assert response.status_code == 200
         assert response.json()["models"]["planner"] == "local-model"
-        assert client.get("/api/health").json()["openai"] in {"not_configured", "checking", "degraded"}
+        assert client.get("/api/health").json()["openai"] in {
+            "not_configured",
+            "configured",
+            "checking",
+            "healthy",
+            "degraded",
+        }
 
 
 def test_brightdata_probe_returns_only_sanitized_evidence(monkeypatch) -> None:
@@ -122,7 +522,7 @@ def test_world_mutations_and_checks() -> None:
         assert client.post(f"/api/worlds/variants/{variant.json()['id']}/activate", json={}).status_code == 200
 
 
-def test_frontend_diagnostics_and_deferred_isaac_fail_closed() -> None:
+def test_frontend_diagnostics_and_isaac_reports_explicit_runtime_state() -> None:
     with TestClient(app) as client:
         recorded = client.post("/api/diagnostics/frontend-errors", json={
             "source": "react",
@@ -138,16 +538,23 @@ def test_frontend_diagnostics_and_deferred_isaac_fail_closed() -> None:
         assert any(row["service"] == "frontend.react" for row in diagnostics.json()["events"])
 
         status = client.get("/api/simulation/isaac")
-        assert status.status_code == 404
-        assert "deferred" in status.json()["detail"]
-
+        assert status.status_code == 200
+        isaac = status.json()
+        assert isinstance(isaac["installed"], bool)
+        assert isaac["version"] == "6.0.1"
+        assert isaac["isaacLabRevision"] == "ffff603eafc6b74264a5261cc0183d6a65390d78"
+        assert isinstance(isaac["eulaAcceptedForApiProcess"], bool)
+        assert isaac["franka"]["cameras"] == ["front", "wrist"]
         franka = client.post("/api/robots/franka/isaac", json={})
-        assert franka.status_code == 404
+        assert franka.status_code == 201
+        assert franka.json()["format"] == "isaac-openusd-reference"
 
         scene = client.get("/api/worlds/scene").json()
         if scene["placements"]:
             prepared = client.post("/api/simulation/isaac/prepare", json={})
-            assert prepared.status_code == 404
+            assert prepared.status_code in {200, 409}
+            if prepared.status_code == 200:
+                assert prepared.json()["prepared"] is True
 
 
 def test_robot_import_camera_mapping_and_world_command_gate(monkeypatch) -> None:
@@ -239,29 +646,48 @@ def test_real_asset_compile_and_openusd_download() -> None:
         assert asset is not None
         assert asset["status"] == "ready", asset
         assert asset["lastEvalResult"] == "passed", asset
+        assert asset["partGraph"]["lifecycleState"] == "PHYSICS_VALIDATED"
+        assert {part["id"] for part in asset["partGraph"]["parts"]} == {"body", "door", "handle"}
+        assert {joint["id"] for joint in asset["partGraph"]["joints"]} == {"door_hinge", "handle_mount"}
+        assert len(asset["partGraph"]["graphSha256"]) == 64
+        sweep = asset["physicsValidation"]["jointSweep"]
+        assert sweep["passed"] is True
+        assert sweep["handleAttachedToMovingPart"] is True
+        assert sweep["handlePathSpanM"] > 0.05
+        assert sweep["severePenetrationCount"] == 0
         assert any(item["file"] == "asset.usda" for item in asset["artifacts"])
         usd = client.get(f"/api/assets/{asset_id}/files/asset.usda")
         assert usd.status_code == 200
         assert b"PhysicsRevoluteJoint" in usd.content
 
 
-def test_live_mujoco_websocket_can_end_and_replay() -> None:
+def test_trellis_monolithic_mesh_cannot_claim_articulation() -> None:
+    with TestClient(app) as client:
+        queued = client.post(
+            "/api/assets/build",
+            json={"query": "one door cabinet", "kind": "articulated", "generator": "trellis2", "families": []},
+        )
+        assert queued.status_code == 202
+        asset_id = queued.json()["assetId"]
+        job_id = queued.json()["jobId"]
+        job = None
+        for _ in range(60):
+            job = client.get(f"/api/jobs/{job_id}").json()
+            if job["status"] in {"failed", "blocked"}:
+                break
+            time.sleep(0.05)
+        assert job is not None
+        assert job["status"] == "failed"
+        assert "validated PartGraph" in str(job["detail"].get("error"))
+        asset = client.get(f"/api/assets/{asset_id}").json()
+        assert asset["status"] == "blocked"
+        assert "validated PartGraph" in asset["properties"]["pipelineError"]
+
+
+def test_legacy_preview_session_is_disabled_in_production() -> None:
     with TestClient(app) as client:
         created = client.post("/api/eval/sessions", json={})
-        assert created.status_code == 201
-        session_id = created.json()["sessionId"]
-        with client.websocket_connect(f"/ws/live/{session_id}") as socket:
-            assert socket.receive_json()["type"] == "meta"
-            frame = socket.receive_json()
-            assert frame["type"] == "frame"
-            assert "doorAngleDeg" in frame
-            socket.send_json({"type": "control", "action": "end"})
-            message = frame
-            for _ in range(20):
-                message = socket.receive_json()
-                if message["type"] == "end":
-                    break
-            assert message["type"] == "end"
-        replay = client.get(f"/api/eval/sessions/{session_id}/replay")
-        assert replay.status_code == 200
-        assert replay.json()["messages"]
+        assert created.status_code == 410
+        assert "/api/worlds/live-sessions" in created.text
+        replay = client.get("/api/eval/sessions/legacy/replay")
+        assert replay.status_code == 410

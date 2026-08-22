@@ -159,6 +159,79 @@ class World:
     def handle_pos(self) -> np.ndarray:
         return self.data.site_xpos[self.handle_site].copy()
 
+    def joint_sweep_report(self, samples: int = 9) -> dict[str, Any]:
+        """Kinematically sweep the authored hinge and verify its part graph.
+
+        This does not replace the dynamic robot rollout. It catches invalid
+        limits, detached handles, non-finite transforms, and severe collisions
+        before the oracle is allowed to interpret a policy failure.
+        """
+
+        sample_count = max(3, min(int(samples), 64))
+        saved_qpos = self.data.qpos.copy()
+        saved_qvel = self.data.qvel.copy()
+        saved_ctrl = self.data.ctrl.copy()
+        lower, upper = (float(value) for value in self.model.jnt_range[self.j["door"]])
+        handle_body = int(self.model.site_bodyid[self.handle_site])
+        handle_geom = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "handle")
+        handle_geom_body = int(self.model.geom_bodyid[handle_geom]) if handle_geom >= 0 else -1
+        positions: list[list[float]] = []
+        finite = True
+        severe_penetrations = 0
+        try:
+            for value in np.linspace(lower, upper, sample_count):
+                self.data.qpos[self.adr("door")] = float(value)
+                self.data.qvel[:] = 0.0
+                mujoco.mj_forward(self.model, self.data)
+                point = self.handle_pos()
+                positions.append([float(item) for item in point])
+                finite = finite and bool(
+                    np.isfinite(self.data.qpos).all()
+                    and np.isfinite(self.data.qvel).all()
+                    and np.isfinite(self.data.xpos).all()
+                    and np.isfinite(point).all()
+                )
+                severe_penetrations += sum(
+                    1 for index in range(self.data.ncon) if float(self.data.contact[index].dist) < -0.005
+                )
+        finally:
+            self.data.qpos[:] = saved_qpos
+            self.data.qvel[:] = saved_qvel
+            self.data.ctrl[:] = saved_ctrl
+            mujoco.mj_forward(self.model, self.data)
+        position_values = np.asarray(positions, dtype=float)
+        path_span = float(np.max(np.linalg.norm(position_values - position_values[0], axis=1)))
+        handle_attached_to_door = handle_body == self.door_body and handle_geom_body == self.door_body
+        errors: list[str] = []
+        if upper <= lower:
+            errors.append("hinge limits are empty or reversed")
+        if not finite:
+            errors.append("joint sweep produced a non-finite state")
+        if not handle_attached_to_door:
+            errors.append("handle site/geometry is not parented to the moving door")
+        if path_span < 0.05:
+            errors.append(f"handle path span is too small ({path_span:.6f} m)")
+        if severe_penetrations:
+            errors.append(f"joint sweep found {severe_penetrations} contacts deeper than 5 mm")
+        return {
+            "passed": not errors,
+            "joint": "j_door",
+            "jointType": "revolute",
+            "axisRuntime": [0.0, -1.0, 0.0],
+            "axisCanonical": [0.0, 0.0, 1.0],
+            "limitsRad": [lower, upper],
+            "sampleCount": sample_count,
+            "handleAttachedToMovingPart": handle_attached_to_door,
+            "handlePathSpanM": path_span,
+            "severePenetrationCount": severe_penetrations,
+            "finite": finite,
+            "samples": [
+                {"jointPositionRad": float(value), "handlePositionRuntimeM": point}
+                for value, point in zip(np.linspace(lower, upper, sample_count), positions)
+            ],
+            "errors": errors,
+        }
+
     # -- control -----------------------------------------------------------
     def set_arm(self, q: np.ndarray) -> None:
         for i, k in enumerate(("yaw", "shoulder", "elbow", "wrist")):

@@ -2,7 +2,9 @@
 
 This directory uses SigNoz's supported Foundry deployment path. The SigNoz
 image is pinned to `v0.137.1`; Foundry generates and owns the Compose files.
-Do not edit generated files under `pours/`.
+Do not edit generated files under `pours/`. `compose.override.yaml` pins the
+collector digest and keeps the checked-in OTLP pipelines active without relying
+on an OpAMP policy created later through the SigNoz onboarding UI.
 
 Windows requires a normal WSL2 Linux distribution with Docker Engine installed
 inside that distribution. Do not use the `docker-desktop` WSL distribution for
@@ -17,6 +19,14 @@ From an Ubuntu WSL shell:
 5. Create the first local admin at `http://127.0.0.1:8080`.
 6. In SigNoz, create a service account and API key if RobotWorld's agent should
    query `/api/v5/query_range`. OTLP ingestion itself does not need a key.
+
+After Foundry casts the deployment, start it with both files:
+
+```bash
+docker compose \
+  -f pours/deployment/compose.yaml \
+  -f compose.override.yaml up -d
+```
 
 RobotWorld defaults:
 

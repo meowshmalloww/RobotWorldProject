@@ -740,6 +740,7 @@ def _compile_core(
     version: int,
     actor: str,
     provenance: dict[str, Any],
+    appearance_sources: list[dict[str, Any]],
 ) -> dict[str, Any]:
     for name in ("evidence", "source", "generated", "visual", "collision", "openusd", "runtime/mujoco", "validation", "previews"):
         (root / name).mkdir(parents=True, exist_ok=True)
@@ -747,6 +748,22 @@ def _compile_core(
     shutil.copyfile(source, source_copy)
     if _sha256_file(source_copy) != source_sha256:
         raise AssetCompileError("SOURCE_VALIDATION: immutable source copy hash mismatch.")
+    copied_appearances: list[dict[str, Any]] = []
+    for appearance in appearance_sources:
+        appearance_copy = root / "source" / "appearances" / f"{appearance['id']}.glb"
+        appearance_copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(Path(str(appearance["sourcePath"])), appearance_copy)
+        if _sha256_file(appearance_copy) != appearance["sha256"]:
+            raise AssetCompileError(
+                f"SOURCE_VALIDATION: appearance '{appearance['id']}' immutable copy hash mismatch."
+            )
+        copied_appearances.append(
+            appearance
+            | {
+                "sourcePath": str(appearance_copy),
+                "artifact": _artifact(appearance_copy, "appearance_source_glb", "model/gltf-binary"),
+            }
+        )
 
     with span("asset.compile", asset_id=asset_id, version_id=version_id, category=payload.category):
         mesh, static_report, uniform_scale, translation, actual_xyz = _prepare_mesh(source_copy, payload)
@@ -762,6 +779,7 @@ def _compile_core(
             visual_usd,
             uniform_scale=uniform_scale,
             translation_m=translation,
+            appearance_variants=copied_appearances,
         )
         rigid_usd = root / "openusd" / "asset.usdc"
         usd_report = _write_rigid_usd(
@@ -805,9 +823,10 @@ def _compile_core(
     visual_artifacts = [_artifact(visual_obj, "runtime_visual_mesh", "model/obj")]
     collision_artifacts = [_artifact(collision_obj, "convex_collision_mesh", "model/obj")]
     openusd_paths = [visual_usd, rigid_usd]
-    texture = visual_usd.with_name("basecolor.png")
-    if texture.is_file():
-        openusd_paths.append(texture)
+    for texture_value in visual_usd_counts.get("textures", []):
+        texture = visual_usd.with_name(str(texture_value["file"]))
+        if texture.is_file():
+            openusd_paths.append(texture)
     openusd_artifacts = [
         _artifact(path, "openusd_texture" if path.suffix.lower() == ".png" else "openusd_layer", "image/png" if path.suffix.lower() == ".png" else "model/vnd.usd")
         for path in openusd_paths
@@ -817,6 +836,27 @@ def _compile_core(
     if preview_path.is_file():
         validation_artifacts.append(_artifact(preview_path, "drop_settle_preview", "image/png"))
     source_artifact = _artifact(source_copy, "immutable_source_glb", "model/gltf-binary")
+    appearance_by_id = {item["id"]: item for item in copied_appearances}
+    manifest_appearances: list[dict[str, Any]] = []
+    for appearance in visual_usd_counts.get("appearanceVariants", []):
+        appearance_id = str(appearance["id"])
+        source_reference = (
+            source_artifact
+            if appearance_id == "generated"
+            else appearance_by_id[appearance_id]["artifact"]
+        )
+        manifest_appearances.append(
+            {
+                "id": appearance_id,
+                "displayName": appearance["displayName"],
+                "sourceVisual": source_reference.model_dump(mode="json", by_alias=True),
+                "openUsdVariantSet": visual_usd_counts["appearanceVariantSet"],
+                "openUsdVariantSelection": appearance_id,
+                "materialPath": appearance["materialPath"],
+                "textures": appearance["textures"],
+                "geometryInvariant": True,
+            }
+        )
 
     errors = list(physics_report["errors"])
     lifecycle = "PHYSICS_VALIDATED" if not errors else "REJECTED"
@@ -873,7 +913,16 @@ def _compile_core(
             "restitutionRange": list(payload.restitution_range),
             "source": "evidence_or_explicit_prior",
             "mujocoRestitutionMapping": "contact impedance; requested range retained for domain variants",
+            "visualPbr": {
+                "source": "immutable_source_glb",
+                "materialCount": visual_usd_counts.get("materialCount", 0),
+                "textures": visual_usd_counts.get("textures", []),
+                "openUsdPreviewSurface": True,
+                "physicsIndependent": True,
+            },
         },
+        "appearanceVariants": manifest_appearances,
+        "defaultAppearanceVariantId": visual_usd_counts["defaultAppearanceVariantId"],
         "semantics": payload.semantics,
         "affordances": payload.affordances,
         "evidenceBundleId": payload.evidence_bundle_id,
@@ -961,6 +1010,25 @@ async def compile_rigid(
             raise ValueError(
                 f"Source SHA-256 mismatch: expected {payload.expected_source_sha256}, resolved {source_sha256}."
             )
+        appearance_sources: list[dict[str, Any]] = []
+        for appearance in payload.appearance_variants:
+            appearance_path, appearance_sha256, appearance_size = await asyncio.to_thread(
+                resolve_source_glb, appearance.source_glb_path
+            )
+            if appearance.expected_source_sha256 and appearance.expected_source_sha256 != appearance_sha256:
+                raise ValueError(
+                    f"Appearance '{appearance.id}' SHA-256 mismatch: expected "
+                    f"{appearance.expected_source_sha256}, resolved {appearance_sha256}."
+                )
+            appearance_sources.append(
+                {
+                    "id": appearance.id,
+                    "displayName": appearance.display_name,
+                    "sourcePath": str(appearance_path),
+                    "sha256": appearance_sha256,
+                    "sizeBytes": appearance_size,
+                }
+            )
         provenance = await _evidence_provenance(payload)
     except Exception as exc:
         await command_store.finish_command(command.id, error=str(exc))
@@ -1029,6 +1097,7 @@ async def compile_rigid(
             version=version,
             actor=actor,
             provenance=provenance,
+            appearance_sources=appearance_sources,
         )
     except Exception as exc:
         unexpected_error = str(exc)

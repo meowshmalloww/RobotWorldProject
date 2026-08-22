@@ -27,7 +27,6 @@ const NAV: NavGroup[] = [
     items: [
       { to: "/models", label: "Models", icon: "hardDrive" },
       { to: "/robots", label: "Robots & Embodiments", icon: "robot" },
-      { to: "/simulation", label: "Simulation & Evaluation", icon: "play" },
       { to: "/failure-analysis", label: "Failure Analysis", icon: "warning" },
       { to: "/agent-control", label: "Agent Control", icon: "agent" },
       { to: "/training", label: "Policy & Evaluation", icon: "training" },

@@ -24,6 +24,7 @@ def test_tool_registry_publishes_strict_versioned_schemas_and_persists_queries()
             "models.register",
             "robots.register_default_franka",
             "evaluations.run_oracle_pick_place",
+            "evaluations.run_oracle_franka_drawer",
             "evaluations.run_vla_compiled_asset",
             "evaluations.analyze_failure",
             "failures.list",
@@ -41,8 +42,16 @@ def test_tool_registry_publishes_strict_versioned_schemas_and_persists_queries()
             "scrapers.repairs.decide",
             "scrapers.repairs.rollback",
             "vla.bridge_status",
+            "vla.attach_franka_zero_shot_bridge",
+            "training.datasets.create_from_evaluation",
+            "training.vla_jepa.validate_fine_tune",
+            "training.vla_jepa.execute_fine_tune",
+            "training.policy_candidates.decide",
+            "training.policy_candidates.rollback",
+            "telemetry.signoz.search_traces",
+            "telemetry.signoz.metric_timeseries",
         } <= set(tools)
-        assert len(tools) == 47
+        assert len(tools) == 56
         assert tools["models.list"]["schemaVersion"] == "robotworld.agent-tool-definition.v1"
         assert tools["models.list"]["effect"] == "QUERY"
         assert tools["models.register"]["effect"] == "MUTATION"
@@ -66,6 +75,24 @@ def test_tool_registry_publishes_strict_versioned_schemas_and_persists_queries()
         assert tools["scrapers.self_heal.request"]["approvalRequired"] is True
         assert tools["scrapers.repairs.decide"]["autonomousAllowed"] is False
         assert tools["scrapers.repairs.rollback"]["inputSchema"]["additionalProperties"] is False
+        assert tools["vla.attach_franka_zero_shot_bridge"]["approvalRequired"] is True
+        assert tools["vla.attach_franka_zero_shot_bridge"]["autonomousAllowed"] is False
+        dataset_tool = tools["training.datasets.create_from_evaluation"]
+        assert dataset_tool["effect"] == "MUTATION"
+        assert dataset_tool["approvalRequired"] is True
+        assert dataset_tool["autonomousAllowed"] is False
+        assert dataset_tool["inputSchema"]["additionalProperties"] is False
+        assert "evaluationId" in dataset_tool["inputSchema"]["required"]
+        preflight_tool = tools["training.vla_jepa.validate_fine_tune"]
+        assert preflight_tool["effect"] == "MUTATION"
+        assert preflight_tool["approvalRequired"] is True
+        assert preflight_tool["autonomousAllowed"] is False
+        assert {"datasetId", "baseModelId"} <= set(preflight_tool["inputSchema"]["required"])
+        execute_tool = tools["training.vla_jepa.execute_fine_tune"]
+        assert execute_tool["effect"] == "MUTATION"
+        assert execute_tool["approvalRequired"] is True
+        assert execute_tool["autonomousAllowed"] is False
+        assert {"runId", "acknowledgeCandidateOnly"} <= set(execute_tool["inputSchema"]["required"])
 
         invoked = client.post(
             "/api/agent/tools/invoke",

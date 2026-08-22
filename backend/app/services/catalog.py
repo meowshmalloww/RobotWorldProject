@@ -239,6 +239,8 @@ async def asset_out(session: AsyncSession, a: Asset) -> dict:
         "sourceImage": spec_payload.get("sourceImage"),
         "sourcePhotos": spec_payload.get("photos", []),
         "collectionTrace": spec_payload.get("collectionTrace"),
+        "partGraph": spec_payload.get("partGraph"),
+        "physicsValidation": spec_payload.get("physicsValidation"),
         "parts": a.parts,
         "artifacts": [
             {"type": ar.type, "file": ar.file, "size": fmt_size(ar.size_bytes), "generated": rel_time(ar.created_at)}
@@ -288,6 +290,8 @@ def _asset_spec_payload(asset_id: str) -> dict[str, Any]:
         "photos": photo_rows,
         "sourceImage": source_image,
         "collectionTrace": trace,
+        "partGraph": payload.get("partGraph") if isinstance(payload.get("partGraph"), dict) else None,
+        "physicsValidation": payload.get("physicsValidation") if isinstance(payload.get("physicsValidation"), dict) else None,
     }
 
 

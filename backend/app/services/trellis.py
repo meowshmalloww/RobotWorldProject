@@ -31,10 +31,16 @@ _local_gateway_process: asyncio.subprocess.Process | None = None
 
 async def _settings() -> dict[str, Any]:
     flat = await settings_store.get_flat()
-    # The workspace intentionally pins the production native Microsoft
-    # pipeline. The previously inspected GGUF bundle is not an active runtime.
-    runtime_name = "native"
-    endpoint = str(flat.get("models.trellisEndpoint") or "").strip().rstrip("/")
+    runtime_name = str(flat.get("models.trellisRuntime") or "gguf").strip().lower()
+    if runtime_name not in {"gguf", "native"}:
+        raise TrellisError("TRELLIS.2 runtime must be 'gguf' or 'native'.")
+    default_endpoint = "http://127.0.0.1:8189" if runtime_name == "gguf" else "http://127.0.0.1:8188"
+    endpoint = str(flat.get("models.trellisEndpoint") or default_endpoint).strip().rstrip("/")
+    # Older settings stored the native port while the runtime was hard-coded.
+    # Remap loopback only; never rewrite an operator-provided remote endpoint.
+    parsed_endpoint = urllib.parse.urlsplit(endpoint)
+    if runtime_name == "gguf" and parsed_endpoint.hostname in {"127.0.0.1", "localhost"} and parsed_endpoint.port == 8188:
+        endpoint = "http://127.0.0.1:8189"
     if not endpoint:
         raise TrellisError("TRELLIS.2 gateway is not configured in Settings -> Models.")
     if not endpoint.startswith(("http://", "https://")):

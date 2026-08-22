@@ -2,7 +2,9 @@
 
 Every span/log/metric is written to the local SQLite store (powering the
 Observability console and the agent's failure-analysis queries) AND exported
-to SigNoz when an ingestion key is configured. Adding a key at runtime is
+to self-hosted SigNoz when its OTLP endpoint is enabled. Community OTLP
+ingestion does not require a cloud key; query credentials remain separate.
+Runtime attachment is
 supported — OTLP processors are attached to the live providers.
 """
 from __future__ import annotations
@@ -41,6 +43,24 @@ _tracer_provider: TracerProvider | None = None
 _meter_provider: MeterProvider | None = None
 _logger_provider: LoggerProvider | None = None
 _otlp_attached = False
+
+
+class _OtelInternalFilter(logging.Filter):
+    """Keep exporter failures out of the exporter itself.
+
+    Without this filter an OTLP transport error is handled by the root
+    LoggingHandler, submitted to the same unavailable OTLP endpoint, and can
+    create an unbounded feedback loop. Application logs remain unaffected.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.name.startswith("opentelemetry.")
+
+
+def _otlp_handler(provider: LoggerProvider) -> LoggingHandler:
+    handler = LoggingHandler(level=logging.INFO, logger_provider=provider)
+    handler.addFilter(_OtelInternalFilter())
+    return handler
 
 
 class LocalSpanProcessor(SpanProcessor):
@@ -113,7 +133,7 @@ def init_otel(signoz_endpoint: str | None = None) -> None:
         _logger_provider.add_log_record_processor(
             BatchLogRecordProcessor(OTLPLogExporter(endpoint=f"{base}/v1/logs"))
         )
-        logging.getLogger().addHandler(LoggingHandler(level=logging.INFO, logger_provider=_logger_provider))
+        logging.getLogger().addHandler(_otlp_handler(_logger_provider))
         _otlp_attached = True
     else:
         _meter_provider = MeterProvider(resource=_resource())
@@ -141,7 +161,7 @@ async def configure_signoz(endpoint: str | None) -> bool:
         _logger_provider.add_log_record_processor(
             BatchLogRecordProcessor(OTLPLogExporter(endpoint=f"{base}/v1/logs"))
         )
-        logging.getLogger().addHandler(LoggingHandler(level=logging.INFO, logger_provider=_logger_provider))
+        logging.getLogger().addHandler(_otlp_handler(_logger_provider))
         _otlp_attached = True
     except Exception:
         logging.getLogger(__name__).exception("Failed to attach SigNoz OTLP exporters")

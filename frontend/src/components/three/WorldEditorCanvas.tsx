@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { TransformControls, type TransformControlsMode } from "three/examples/jsm/controls/TransformControls.js";
 import { reportFrontendDiagnostic } from "../../lib/runtimeDiagnostics";
@@ -31,6 +32,9 @@ interface Runtime {
   roots: Map<string, THREE.Group>;
   baseScales: Map<string, THREE.Vector3>;
   loading: Set<string>;
+  robotObjects: Map<string, THREE.Object3D>;
+  robotLoading: Set<string>;
+  robotRoot: THREE.Group;
   raycaster: THREE.Raycaster;
   pointer: THREE.Vector2;
   resize: ResizeObserver;
@@ -63,17 +67,23 @@ function disposeObject(root: THREE.Object3D) {
  */
 export function WorldEditorCanvas({
   placements,
+  robotGeometries = [],
+  robotSpawn,
   selectedAssetId,
   tool,
   onSelect,
   onCommit,
+  onRobotCommit,
   onFrame,
 }: {
   placements: EditorPlacement[];
+  robotGeometries?: AuthoringRobotGeometry[];
+  robotSpawn?: { positionM: number[]; quaternionWxyz: number[] };
   selectedAssetId: string;
   tool: EditorTool;
   onSelect: (assetId: string, name: string) => void;
   onCommit: (assetId: string, patch: PlacementPatch) => void;
+  onRobotCommit?: (patch: { positionM: number[]; quaternionWxyz: number[] }) => void;
   onFrame?: (metric: { fps: number; latencyMs: null }) => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
@@ -83,6 +93,7 @@ export function WorldEditorCanvas({
   const toolRef = useRef(tool);
   const onSelectRef = useRef(onSelect);
   const onCommitRef = useRef(onCommit);
+  const onRobotCommitRef = useRef(onRobotCommit);
   const onFrameRef = useRef(onFrame);
   const keysRef = useRef(new Set<string>());
   const draggedRef = useRef(false);
@@ -92,6 +103,7 @@ export function WorldEditorCanvas({
   toolRef.current = tool;
   onSelectRef.current = onSelect;
   onCommitRef.current = onCommit;
+  onRobotCommitRef.current = onRobotCommit;
   onFrameRef.current = onFrame;
 
   useEffect(() => {
@@ -141,6 +153,10 @@ export function WorldEditorCanvas({
     transform.setSize(0.82);
     transform.setSpace("world");
     scene.add(transform.getHelper());
+    const robotRoot = new THREE.Group();
+    robotRoot.name = "Franka Panda fixed-base spawn";
+    robotRoot.userData.robotSpawn = true;
+    scene.add(robotRoot);
     transform.addEventListener("dragging-changed", (event) => {
       orbit.enabled = !event.value;
       if (event.value) draggedRef.current = true;
@@ -148,7 +164,17 @@ export function WorldEditorCanvas({
     transform.addEventListener("mouseUp", () => {
       const root = transform.object as THREE.Group | undefined;
       const assetId = root?.userData.assetId as string | undefined;
-      if (!root || !assetId) return;
+      if (!root) return;
+      if (root.userData.robotSpawn) {
+        const quaternion = root.quaternion;
+        onRobotCommitRef.current?.({
+          positionM: [root.position.x, root.position.y, root.position.z],
+          quaternionWxyz: [quaternion.w, quaternion.x, quaternion.y, quaternion.z],
+        });
+        window.setTimeout(() => { draggedRef.current = false; }, 0);
+        return;
+      }
+      if (!assetId) return;
       const activeTool = toolRef.current;
       if (activeTool === "translate") {
         onCommitRef.current(assetId, { translation: [root.position.x, root.position.y, root.position.z] });
@@ -193,6 +219,9 @@ export function WorldEditorCanvas({
       roots: new Map(),
       baseScales: new Map(),
       loading: new Set(),
+      robotObjects: new Map(),
+      robotLoading: new Set(),
+      robotRoot,
       raycaster: new THREE.Raycaster(),
       pointer: new THREE.Vector2(),
       resize: new ResizeObserver(() => undefined),
@@ -221,14 +250,16 @@ export function WorldEditorCanvas({
       const rect = renderer.domElement.getBoundingClientRect();
       runtime.pointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
       runtime.raycaster.setFromCamera(runtime.pointer, camera);
-      const candidates = Array.from(runtime.roots.values());
+      const candidates = [...runtime.roots.values(), runtime.robotRoot];
       const hit = runtime.raycaster.intersectObjects(candidates, true)[0];
       let current: THREE.Object3D | null = hit?.object ?? null;
-      while (current && !current.userData.assetId) current = current.parent;
+      while (current && !current.userData.assetId && !current.userData.robotSpawn) current = current.parent;
       const assetId = current?.userData.assetId as string | undefined;
       if (assetId) {
         const placement = placementsRef.current.find((item) => item.assetId === assetId);
         onSelectRef.current(assetId, placement?.name ?? assetId);
+      } else if (current?.userData.robotSpawn || current?.parent?.userData.robotSpawn) {
+        onSelectRef.current("robot-spawn", "Franka Panda fixed-base spawn");
       }
     };
     const onContextMenu = (event: Event) => event.preventDefault();
@@ -301,6 +332,7 @@ export function WorldEditorCanvas({
       transform.dispose();
       orbit.dispose();
       runtime.roots.forEach(disposeObject);
+      runtime.robotObjects.forEach(disposeObject);
       renderer.dispose();
       renderer.domElement.remove();
       runtimeRef.current = null;
@@ -372,6 +404,60 @@ export function WorldEditorCanvas({
   useEffect(() => {
     const runtime = runtimeRef.current;
     if (!runtime) return;
+    if (robotSpawn) {
+      runtime.robotRoot.position.set(...vector(robotSpawn.positionM, 0));
+      const [w = 1, x = 0, y = 0, z = 0] = robotSpawn.quaternionWxyz;
+      runtime.robotRoot.quaternion.set(x, y, z, w);
+      runtime.robotRoot.updateMatrixWorld(true);
+    }
+    const wanted = new Set(robotGeometries.map((entry) => entry.id));
+    runtime.robotObjects.forEach((object, id) => {
+      if (wanted.has(id)) return;
+      object.parent?.remove(object);
+      disposeObject(object);
+      runtime.robotObjects.delete(id);
+    });
+    const loader = new OBJLoader();
+    robotGeometries.forEach((entry) => {
+      const existing = runtime.robotObjects.get(entry.id);
+      if (existing) {
+        applyRobotLocalPose(existing, entry, runtime.robotRoot);
+        return;
+      }
+      if (!entry.meshName || runtime.robotLoading.has(entry.id)) return;
+      runtime.robotLoading.add(entry.id);
+      loader.load(`${apiOrigin}/api/runtime/franka-compiled-meshes/${encodeURIComponent(entry.meshName)}.obj`, (object) => {
+        runtime.robotLoading.delete(entry.id);
+        if (!runtimeRef.current || !wanted.has(entry.id)) return;
+        const [r = 0.93, g = 0.94, b = 0.96, a = 1] = entry.rgba;
+        const robotMaterial = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(r, g, b),
+          transparent: a < 0.999,
+          opacity: a,
+          roughness: 0.58,
+          metalness: 0.04,
+        });
+        object.traverse((child) => {
+          if (child instanceof THREE.Mesh) child.material = robotMaterial;
+        });
+        object.name = entry.name;
+        object.userData.robotPreview = true;
+        applyRobotLocalPose(object, entry, runtime.robotRoot);
+        runtime.robotObjects.set(entry.id, object);
+        runtime.robotRoot.add(object);
+      }, undefined, (error) => {
+        runtime.robotLoading.delete(entry.id);
+        reportFrontendDiagnostic({
+          source: "api",
+          message: `World editor could not load compiled Franka mesh ${entry.meshName}: ${String(error)}`,
+        });
+      });
+    });
+  }, [robotGeometries, robotSpawn]);
+
+  useEffect(() => {
+    const runtime = runtimeRef.current;
+    if (!runtime) return;
     if (tool === "camera") {
       runtime.transform.detach();
       runtime.orbit.enabled = true;
@@ -379,8 +465,9 @@ export function WorldEditorCanvas({
     }
     runtime.transform.setMode(tool as TransformControlsMode);
     runtime.transform.setSpace(tool === "scale" ? "local" : "world");
-    const root = runtime.roots.get(selectedAssetId);
-    if (root) runtime.transform.attach(root);
+    const root = selectedAssetId === "robot-spawn" ? runtime.robotRoot : runtime.roots.get(selectedAssetId);
+    if (root && !(selectedAssetId === "robot-spawn" && tool !== "translate")) runtime.transform.attach(root);
+    else runtime.transform.detach();
   }, [selectedAssetId, tool, placements]);
 
   return (
@@ -392,4 +479,26 @@ export function WorldEditorCanvas({
       aria-label="3D world editor. In Camera mode use W A S D to move and Q E to move vertically."
     />
   );
+}
+
+export interface AuthoringRobotGeometry {
+  id: string;
+  name: string;
+  meshName?: string | null;
+  rgba: number[];
+  positionM: number[];
+  quaternionWxyz: number[];
+}
+
+function applyRobotLocalPose(object: THREE.Object3D, entry: AuthoringRobotGeometry, root: THREE.Group) {
+  const worldPosition = new THREE.Vector3(
+    finite(entry.positionM[0], 0),
+    finite(entry.positionM[1], 0),
+    finite(entry.positionM[2], 0),
+  );
+  const [w = 1, x = 0, y = 0, z = 0] = entry.quaternionWxyz;
+  const worldQuaternion = new THREE.Quaternion(x, y, z, w);
+  const worldMatrix = new THREE.Matrix4().compose(worldPosition, worldQuaternion, new THREE.Vector3(1, 1, 1));
+  const localMatrix = root.matrixWorld.clone().invert().multiply(worldMatrix);
+  localMatrix.decompose(object.position, object.quaternion, object.scale);
 }

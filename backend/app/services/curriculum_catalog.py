@@ -206,6 +206,34 @@ def _model_id(evaluation: EvaluationRunRecord) -> str | None:
     return None
 
 
+async def terminal_attempt_count(
+    *,
+    robot_id: str,
+    model_id: str | None,
+    lookback_limit: int,
+) -> int:
+    """Count historical terminal attempts for the planner's selected policy.
+
+    ``CurriculumPlanRequest.max_evaluation_episodes`` is an absolute ceiling
+    over its lookback. An autonomous run has an incremental episode budget, so
+    its controller adds this baseline before calling the shared planner.
+    """
+
+    async with SessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(EvaluationRunRecord)
+                .where(
+                    EvaluationRunRecord.robot_id == robot_id,
+                    EvaluationRunRecord.status.in_(TERMINAL_EVALUATION_STATES),
+                )
+                .order_by(EvaluationRunRecord.created_at.desc())
+                .limit(max(1, min(lookback_limit, 500)))
+            )
+        ).scalars().all()
+    return sum(1 for row in rows if _model_id(row) == model_id)
+
+
 def _asset_version_id(evaluation: EvaluationRunRecord) -> str | None:
     value = ((evaluation.result or {}).get("predicate") or {}).get("assetVersionId")
     return str(value) if value else None
@@ -723,8 +751,108 @@ def _wilson_interval(successes: int, samples: int) -> tuple[float, float] | None
 
 
 async def _index_terminal_evaluations(rows: list[EvaluationRunRecord], *, actor: str, command_id: str) -> None:
-    for row in rows:
-        await _persist_analysis(row.id, actor=actor, command_id=command_id)
+    """Backfill only missing projections, batching them into one transaction.
+
+    Planning is a hot path and can inspect hundreds of historical episodes.
+    Re-running the full classifier and opening/committing a session for every
+    already-indexed episode made that read path take minutes and amplified
+    SQLite writer contention.  Coverage and failure rows are immutable and
+    unique by evaluation ID, so an existence preflight is sufficient.
+    """
+
+    if not rows:
+        return
+    evaluation_ids = [row.id for row in rows]
+    async with SessionLocal() as session:
+        coverage_ids = set(
+            (
+                await session.execute(
+                    select(CoverageObservationRecord.evaluation_id).where(
+                        CoverageObservationRecord.evaluation_id.in_(evaluation_ids)
+                    )
+                )
+            ).scalars()
+        )
+        failure_ids = set(
+            (
+                await session.execute(
+                    select(FailureEventRecord.evaluation_id).where(
+                        FailureEventRecord.evaluation_id.in_(evaluation_ids)
+                    )
+                )
+            ).scalars()
+        )
+        pending = [
+            row
+            for row in rows
+            if row.id not in coverage_ids
+            or (
+                not (row.success is True and row.status == "SUCCEEDED")
+                and row.id not in failure_ids
+            )
+        ]
+        if not pending:
+            return
+
+        # Prevent reads needed to derive the batch from flushing partial writes.
+        # The single commit below therefore owns the SQLite writer lock only for
+        # the final bounded INSERT batch.
+        with session.no_autoflush:
+            for evaluation in pending:
+                if evaluation.id not in coverage_ids:
+                    dimensions, fingerprint = await _coverage_dimensions(session, evaluation)
+                    observation = CoverageObservationRecord(
+                        id=new_id("coverage"),
+                        evaluation_id=evaluation.id,
+                        scenario_fingerprint=fingerprint,
+                        taxonomy_revision=TAXONOMY_REVISION,
+                        task_family="pick_place",
+                        robot_id=evaluation.robot_id,
+                        model_id=_model_id(evaluation),
+                        asset_version_id=_asset_version_id(evaluation),
+                        policy=evaluation.policy,
+                        seed=evaluation.seed,
+                        success=bool(evaluation.success),
+                        failure_code=evaluation.failure_code,
+                        dimensions=dimensions,
+                    )
+                    session.add(observation)
+                    session.add(
+                        AuditEvent(
+                            command_id=command_id,
+                            entity_type="coverage_observation",
+                            entity_id=observation.id,
+                            action="coverage.observe",
+                            from_state=None,
+                            to_state="RECORDED",
+                            detail={
+                                "evaluationId": evaluation.id,
+                                "scenarioFingerprint": fingerprint,
+                            },
+                            actor=actor,
+                        )
+                    )
+                is_failure = not (evaluation.success is True and evaluation.status == "SUCCEEDED")
+                if is_failure and evaluation.id not in failure_ids:
+                    _classification, event = await _classify(session, evaluation)
+                    if event is not None:
+                        session.add(
+                            AuditEvent(
+                                command_id=command_id,
+                                entity_type="failure_event",
+                                entity_id=event.id,
+                                action="failure.classify",
+                                from_state=None,
+                                to_state="CLASSIFIED",
+                                detail={
+                                    "evaluationId": evaluation.id,
+                                    "code": event.code,
+                                    "certainty": event.certainty,
+                                },
+                                actor=actor,
+                            )
+                        )
+        await session.commit()
 
 
 async def plan_next(
@@ -1133,6 +1261,17 @@ async def execute_scenario_oracle(
             robot_id=robot_id,
             asset_version_id=asset_version_id,
         ):
+            # Bind the nested evaluation to this outer attempt. A fixed key per
+            # scenario would replay a FAILED nested command forever after a
+            # recoverable native/runtime fault, even when the autonomous
+            # controller correctly advances its retry attempt.
+            evaluation_idempotency_key = "scenario-oracle:" + command_store.payload_hash(
+                {
+                    "parentIdempotencyKey": idempotency_key,
+                    "scenarioFingerprint": scenario_fingerprint,
+                    "executionId": execution_id if idempotency_key is None else None,
+                }
+            )
             evaluation_command = await evaluation_catalog.run_compiled_asset_pick_place_oracle(
                 CompiledAssetOracleRequest(
                     robotId=robot_id,
@@ -1140,7 +1279,7 @@ async def execute_scenario_oracle(
                     seed=seed,
                     placementRequest=placement_request,
                 ),
-                idempotency_key=f"scenario-oracle:{scenario_fingerprint}",
+                idempotency_key=evaluation_idempotency_key,
                 actor=actor,
             )
         nested = dict(evaluation_command.get("result") or {})

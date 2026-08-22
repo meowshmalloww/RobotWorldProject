@@ -6,10 +6,8 @@ Endpoint: POST {tenant}/api/v5/query_range with header SIGNOZ-API-KEY.
 """
 from __future__ import annotations
 
-import asyncio
 import time
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 
@@ -44,16 +42,20 @@ async def probe() -> dict[str, Any]:
     if response.status_code >= 400:
         raise SigNozError(f"SigNoz health check failed ({response.status_code}).")
 
-    parsed = urlparse(otlp)
-    if not parsed.hostname:
-        raise NotConfigured("SigNoz OTLP endpoint has no hostname.")
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        _reader, writer = await asyncio.wait_for(asyncio.open_connection(parsed.hostname, port), timeout=3.0)
-        writer.close()
-        await writer.wait_closed()
-    except (OSError, asyncio.TimeoutError) as exc:
-        raise SigNozError(f"SigNoz OTLP listener is unreachable at {parsed.hostname}:{port}.") from exc
+        async with httpx.AsyncClient(timeout=4.0, trust_env=False) as client:
+            # Empty ExportTraceServiceRequest encoded as protobuf. A 2xx here
+            # proves that the HTTP OTLP route accepts an ingestion request;
+            # opening the TCP port alone does not.
+            otlp_response = await client.post(
+                f"{otlp}/v1/traces",
+                content=b"\x0a\x00",
+                headers={"Content-Type": "application/x-protobuf"},
+            )
+    except httpx.HTTPError as exc:
+        raise SigNozError(f"SigNoz OTLP ingestion is unreachable at {otlp}: {exc}") from exc
+    if not otlp_response.is_success:
+        raise SigNozError(f"SigNoz OTLP ingestion rejected the probe ({otlp_response.status_code}).")
 
     version: Any = None
     try:
@@ -70,6 +72,7 @@ async def probe() -> dict[str, Any]:
         "deployment": "community-self-hosted",
         "uiEndpoint": ui,
         "otlpEndpoint": otlp,
+        "otlpHttpStatus": otlp_response.status_code,
         "version": version,
         "queryKeyConfigured": bool(flat.get("integrations.signoz.apiKey")),
     }

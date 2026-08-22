@@ -19,6 +19,7 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 
 PROTOCOL_VERSION = "robotworld.vla-worker.v1"
@@ -35,6 +36,16 @@ _policy = None
 _preprocessor = None
 _postprocessor = None
 _loaded: dict[str, Any] | None = None
+
+
+def _clip_normalized_action(raw_values: list[float]) -> tuple[list[float], bool, float]:
+    """Apply the checkpoint-declared normalized action clamp with evidence."""
+
+    if len(raw_values) != 7 or any(not math.isfinite(value) for value in raw_values):
+        raise RuntimeError(f"Policy returned invalid normalized action shape/value: {raw_values}")
+    bounded = [max(-1.0, min(1.0, value)) for value in raw_values]
+    maximum_delta = max(abs(raw - value) for raw, value in zip(raw_values, bounded, strict=True))
+    return bounded, bounded != raw_values, maximum_delta
 
 
 def _emit(value: dict[str, Any]) -> None:
@@ -117,11 +128,18 @@ def _local_transformers_dependency(identifier: Any) -> dict[str, Any]:
         except (FileNotFoundError, OSError, RuntimeError):
             resolved = None
         if resolved is not None and resolved.is_dir() and (resolved / "config.json").is_file():
+            weight_names = (
+                "model.safetensors",
+                "model.safetensors.index.json",
+                "pytorch_model.bin",
+                "pytorch_model.bin.index.json",
+            )
+            has_weights = any((resolved / name).is_file() for name in weight_names)
             return {
                 "identifier": value,
-                "availableLocally": True,
+                "availableLocally": has_weights,
                 "resolvedPath": str(resolved),
-                "reason": "configured_local_directory",
+                "reason": "configured_local_directory" if has_weights else "configured_metadata_only_directory",
             }
         return {"identifier": value, "availableLocally": False, "resolvedPath": None, "reason": "local_path_missing_config"}
     if "/" not in value or value.startswith((".", "..")):
@@ -140,6 +158,37 @@ def _local_transformers_dependency(identifier: Any) -> dict[str, Any]:
                     "reason": "huggingface_cache_snapshot",
                 }
     return {"identifier": value, "availableLocally": False, "resolvedPath": None, "reason": "not_in_local_huggingface_cache"}
+
+
+def _qwen_metadata_dependency(value: Any) -> dict[str, Any]:
+    raw = str(value or "").strip()
+    if not raw:
+        return {"availableLocally": False, "resolvedPath": None, "reason": "not_configured"}
+    try:
+        root = Path(raw).expanduser().resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        return {"availableLocally": False, "resolvedPath": None, "reason": "path_missing"}
+    required = {
+        "config.json",
+        "chat_template.json",
+        "preprocessor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    }
+    missing = sorted(name for name in required if not (root / name).is_file()) if root.is_dir() else sorted(required)
+    if missing:
+        return {
+            "availableLocally": False,
+            "resolvedPath": str(root),
+            "reason": "metadata_incomplete",
+            "missing": missing,
+        }
+    return {
+        "availableLocally": True,
+        "resolvedPath": str(root),
+        "reason": "metadata_only_checkpoint_bootstrap",
+        "weightsSource": "vla_checkpoint_model.safetensors",
+    }
 
 
 def _probe(request: dict[str, Any]) -> dict[str, Any]:
@@ -193,6 +242,12 @@ def _probe(request: dict[str, Any]) -> dict[str, Any]:
 
     downloads_allowed = os.environ.get("ROBOTWORLD_WORKER_ALLOW_MODEL_DOWNLOADS") == "1"
     qwen_dependency = _local_transformers_dependency(config.get("qwen_model_name"))
+    qwen_metadata = _qwen_metadata_dependency(request.get("qwenMetadataPath"))
+    if not qwen_dependency["availableLocally"] and qwen_metadata["availableLocally"]:
+        qwen_dependency = {
+            "identifier": config.get("qwen_model_name"),
+            **qwen_metadata,
+        }
     load_world_model = bool(request.get("loadWorldModelForInference", False))
     jepa_dependency = _local_transformers_dependency(config.get("jepa_encoder_name"))
     if not qwen_dependency["availableLocally"] and not downloads_allowed:
@@ -243,6 +298,38 @@ def _probe(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _metadata_qwen_loader(metadata_path: str):
+    """Return a context that builds Qwen structure without duplicate base weights.
+
+    The VLA checkpoint contains all trained Qwen tensors. Transformers still
+    needs the small official config/tokenizer/processor files to construct the
+    architecture and prompts. This scoped patch replaces only the initial
+    Qwen ``from_pretrained`` call and is removed before checkpoint loading.
+    """
+
+    from transformers import AutoConfig, Qwen3VLForConditionalGeneration
+    from transformers.initialization import no_init_weights
+
+    root = Path(metadata_path).resolve(strict=True)
+    original = Qwen3VLForConditionalGeneration.from_pretrained
+
+    def load_structure(identifier, *args, **kwargs):
+        try:
+            candidate = Path(str(identifier)).resolve(strict=True)
+        except (FileNotFoundError, OSError, RuntimeError):
+            candidate = None
+        if candidate != root:
+            return original(identifier, *args, **kwargs)
+        model_config = AutoConfig.from_pretrained(root, local_files_only=True)
+        dtype = kwargs.get("dtype", kwargs.get("torch_dtype"))
+        if dtype is not None:
+            model_config.dtype = dtype
+        with no_init_weights():
+            return Qwen3VLForConditionalGeneration._from_config(model_config, dtype=dtype)
+
+    return patch.object(Qwen3VLForConditionalGeneration, "from_pretrained", side_effect=load_structure)
+
+
 def _load(request: dict[str, Any]) -> dict[str, Any]:
     global _policy, _preprocessor, _postprocessor, _loaded
     probe = _probe(request)
@@ -260,8 +347,16 @@ def _load(request: dict[str, Any]) -> dict[str, Any]:
     # Avoid loading the training-only V-JEPA2 encoder/predictor unless an
     # explicit future evaluation mode requests it.
     config.enable_world_model = bool(request.get("loadWorldModelForInference", False))
+    qwen_dependency = probe["inferenceDependencies"]["qwen"]
+    qwen_metadata_only = qwen_dependency.get("reason") == "metadata_only_checkpoint_bootstrap"
+    if qwen_metadata_only:
+        config.qwen_model_name = str(qwen_dependency["resolvedPath"])
     started = time.perf_counter()
-    policy = VLAJEPAPolicy.from_pretrained(checkpoint, config=config)
+    if qwen_metadata_only:
+        with _metadata_qwen_loader(config.qwen_model_name):
+            policy = VLAJEPAPolicy.from_pretrained(checkpoint, config=config)
+    else:
+        policy = VLAJEPAPolicy.from_pretrained(checkpoint, config=config)
     preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=checkpoint)
     policy.eval()
     parameter_count = sum(parameter.numel() for parameter in policy.parameters())
@@ -281,6 +376,7 @@ def _load(request: dict[str, Any]) -> dict[str, Any]:
         "worldModelConfigured": probe["checkpoint"]["worldModelConfigured"],
         "worldModelLoaded": bool(config.enable_world_model),
         "worldModelInferenceRequired": False,
+        "qwenBootstrap": qwen_dependency,
         "cameraKeys": list(probe["checkpoint"]["cameraKeys"]),
         "stateFeaturePresent": bool(probe["checkpoint"]["stateFeaturePresent"]),
         "actionDimension": probe["checkpoint"]["actionDimension"],
@@ -340,18 +436,34 @@ def _infer(request: dict[str, Any]) -> dict[str, Any]:
     started = time.perf_counter()
     processed = _preprocessor(batch)
     with torch.inference_mode():
-        action = _policy.select_action(processed)
-    action = action.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
-    values = [float(value) for value in action.tolist()]
-    if len(values) != 7 or any(not math.isfinite(value) for value in values):
-        raise RuntimeError(f"Policy returned invalid action shape/value: {values}")
-    if any(value < -1.00001 or value > 1.00001 for value in values):
-        raise RuntimeError(f"Policy returned an action outside the normalized [-1, 1] contract: {values}")
-    values = [max(-1.0, min(1.0, value)) for value in values]
+        normalized = _policy.select_action(processed)
+        checkpoint_action = _postprocessor(normalized)
+    normalized = normalized.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+    checkpoint_action = checkpoint_action.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+    raw_values = [float(value) for value in normalized.tolist()]
+    physical_values = [float(value) for value in checkpoint_action.tolist()]
+    if len(physical_values) != 7 or any(not math.isfinite(value) for value in physical_values):
+        raise RuntimeError(f"Checkpoint postprocessor returned an invalid action: {physical_values}")
+    # The pinned VLA-JEPA config declares clip_normalized_actions=true and its
+    # official LeRobot postprocessor applies Tensor.clamp(-1, 1) before
+    # unnormalization. Mirror that contract for the Cartesian adapter while
+    # surfacing the clamp as evidence instead of rejecting normal diffusion
+    # overshoot (for example a gripper value of 1.0016).
+    values, normalized_action_clipped, maximum_clip_delta = _clip_normalized_action(raw_values)
+    if physical_values[-1] not in {-1.0, 1.0}:
+        raise RuntimeError(
+            "Checkpoint gripper postprocessor did not produce its declared LIBERO-style "
+            f"binary -1/+1 value: {physical_values[-1]}"
+        )
     return {
         "normalizedAction": values,
+        "normalizedActionClipped": normalized_action_clipped,
+        "normalizedActionMaximumClipDelta": maximum_clip_delta,
+        "checkpointAction": physical_values,
         "actionDimension": len(values),
-        "outputStage": "policy_normalized_before_checkpoint_postprocessor",
+        "outputStage": "checkpoint_postprocessed_droid_relative_action",
+        "actionConvention": "[dx,dy,dz,droll,dpitch,dyaw,gripper_-1_closed_+1_open]",
+        "checkpointPostprocessorApplied": True,
         "inferenceDurationSeconds": time.perf_counter() - started,
         "adapterRevision": request["adapterRevision"],
         "normalizationRevision": request["normalizationRevision"],
@@ -413,7 +525,7 @@ def main() -> int:
                     "ok": False,
                     "error": str(exc),
                     "errorType": type(exc).__name__,
-                    "traceback": traceback.format_exc(limit=8),
+                    "traceback": traceback.format_exc(limit=40),
                 }
             )
     return 0

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -13,6 +14,7 @@ import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -28,7 +30,7 @@ from sqlalchemy import delete, func, select
 from . import __version__
 from .bootstrap import seed_definitions
 from .config import ASSETS_DIR, BASE_DIR, DATA_DIR, ROBOTS_DIR, WORLDS_DIR, env
-from .contracts import AgentToolCall, ApprovalDecision, AutonomousCurriculumRunRequest, BrightDataCollectionRequest, CompiledAssetOracleRequest, CompiledAssetVlaEvaluationRequest, CurriculumPlanRequest, FrankaRegistrationRequest, ModelRegistrationCreate, ModelValidationRequest, ObjectRequest, OracleEvaluationRequest, RecordedEvidenceImport, RigidAssetCompileRequest, ScraperCollectorVersionCreate, ScraperRepairCreate, ScraperRepairDecision, ScraperRepairDemoRequest, ScraperRepairDraftSubmission, ScraperRepairRollback, VlaNormalizedAction
+from .contracts import AgentToolCall, ApprovalDecision, AutonomousCurriculumRunRequest, BrightDataCollectionRequest, CompiledAssetOracleRequest, CompiledAssetVlaEvaluationRequest, CurriculumPlanRequest, FrankaRegistrationRequest, LeRobotDatasetExportRequest, ModelRegistrationCreate, ModelValidationRequest, ObjectRequest, OracleEvaluationRequest, PolicyCandidateDecisionRequest, PolicyCandidateRollbackRequest, RecordedEvidenceImport, RigidAssetCompileRequest, ScraperCollectorVersionCreate, ScraperRepairCreate, ScraperRepairDecision, ScraperRepairDemoRequest, ScraperRepairDraftSubmission, ScraperRepairRollback, VlaFrankaZeroShotBridgeRequest, VlaJepaFineTuneExecuteRequest, VlaJepaFineTuneValidationRequest, VlaNormalizedAction, WorldOperateRequest
 from .db import SessionLocal, init_db
 from .models import (
     AgentDecision,
@@ -48,19 +50,20 @@ from .models import (
     Variant,
     World,
 )
-from .telemetry import drain_loop, init_otel, signoz_exporting, span
+from .telemetry import configure_signoz, drain_loop, init_otel, signoz_exporting, span
 from .util import fmt_duration, new_id, rel_time
-from .services import agent, agent_tools, asset_evidence, autonomous_curriculum, brightdata, catalog, command_store, control_catalog, curriculum_catalog, demo_scenarios, evaluation_catalog, evaluator, events, evidence_catalog, evidence_collection, isaac_sim, live, llm, local_vla, model_registry, performance, pipeline, port, rigid_asset_compiler, robot_catalog, robot_registry, scraper_repair, scraper_repair_demo, settings_store, signoz, simcore, trellis, usda, vla_bridge, vla_policy_worker, vulkan_renderer, world_geometry
+from .services import agent, agent_tools, asset_evidence, autonomous_curriculum, brightdata, catalog, command_store, control_catalog, curriculum_catalog, demo_scenarios, evaluation_catalog, evaluator, events, evidence_catalog, evidence_collection, franka_live, franka_pick_place, isaac_sim, lerobot_dataset, lerobot_training, live, llm, local_vla, model_registry, performance, pipeline, policy_lifecycle, port, rigid_asset_compiler, robot_catalog, robot_registry, scraper_repair, scraper_repair_demo, settings_store, signoz, simcore, trellis, usda, vla_bridge, vla_policy_worker, vulkan_renderer, world_geometry
 from .services.remote_policy import PolicyClient, PolicyConfig, PolicyError
 
 log = logging.getLogger(__name__)
 STARTED_AT = time.monotonic()
+STARTED_AT_WALL_MS = time.time() * 1000
 _tasks: set[asyncio.Task] = set()
 HIDDEN_LEGACY_SKILLS = {"open-refrigerator"}
-DEFERRED_ISAAC_ENABLED = os.environ.get("ROBOTWORLD_ENABLE_DEFERRED_ISAAC", "").lower() in {"1", "true", "yes"}
 DEFERRED_PORT_ENABLED = os.environ.get("ROBOTWORLD_ENABLE_DEFERRED_PORT", "").lower() in {"1", "true", "yes"}
 LEGACY_SKILL_AGENT_ENABLED = os.environ.get("ROBOTWORLD_ENABLE_LEGACY_SKILL_AGENT", "").lower() in {"1", "true", "yes"}
 LEGACY_SOURCE_REPAIR_ENABLED = os.environ.get("ROBOTWORLD_ENABLE_LEGACY_SOURCE_REPAIR", "").lower() in {"1", "true", "yes"}
+LEGACY_SIMCORE_ENABLED = os.environ.get("ROBOTWORLD_ENABLE_LEGACY_SIMCORE", "").lower() in {"1", "true", "yes"}
 
 
 class AgentRunIn(BaseModel):
@@ -149,6 +152,58 @@ class PlacementIn(BaseModel):
         return value
 
 
+class RobotSpawnIn(BaseModel):
+    positionM: tuple[float, float, float]
+    quaternionWxyz: tuple[float, float, float, float]
+
+    @field_validator("positionM")
+    @classmethod
+    def finite_position(cls, value):
+        if any(not math.isfinite(item) for item in value) or any(abs(item) > 1000 for item in value):
+            raise ValueError("positionM must contain finite world coordinates within 1000 metres")
+        return value
+
+    @field_validator("quaternionWxyz")
+    @classmethod
+    def normalized_quaternion(cls, value):
+        if any(not math.isfinite(item) for item in value):
+            raise ValueError("quaternionWxyz must contain finite values")
+        norm = math.sqrt(sum(float(item) ** 2 for item in value))
+        if abs(norm - 1.0) > 1e-4:
+            raise ValueError("quaternionWxyz must be normalized")
+        expected = math.sqrt(0.5)
+        # The currently validated controller is calibrated with local +X
+        # facing world +Y. Base translation is authorable; arbitrary yaw must
+        # wait for a fresh reachability/camera calibration gate.
+        if (
+            abs(float(value[0]) - expected) > 1e-4
+            or abs(float(value[1])) > 1e-4
+            or abs(float(value[2])) > 1e-4
+            or abs(float(value[3]) - expected) > 1e-4
+        ):
+            raise ValueError("The validated Franka mount orientation is fixed at +90 degrees yaw")
+        return value
+
+
+class ManualJogIn(BaseModel):
+    deltaM: tuple[float, float, float]
+
+    @field_validator("deltaM")
+    @classmethod
+    def bounded_delta(cls, value):
+        if any(not math.isfinite(item) for item in value):
+            raise ValueError("deltaM must contain finite values")
+        if any(abs(float(item)) > 0.03 for item in value) or math.sqrt(sum(float(item) ** 2 for item in value)) > 0.04:
+            raise ValueError("Each manual jog is limited to 3 cm per axis and 4 cm total")
+        if math.sqrt(sum(float(item) ** 2 for item in value)) < 1e-6:
+            raise ValueError("Manual jog delta must be non-zero")
+        return value
+
+
+class ManualGripperIn(BaseModel):
+    command: Literal["open", "close"]
+
+
 class RobotPatchIn(BaseModel):
     cameraMappings: dict[str, str] | None = None
     policyAdapter: str | None = Field(default=None, max_length=500)
@@ -181,6 +236,17 @@ class DemoRunIn(BaseModel):
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
 
 
+class ChatMessageIn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=8000)
+
+
+class ChatIn(BaseModel):
+    messages: list[ChatMessageIn] = Field(min_length=1, max_length=40)
+    model: str | None = Field(default=None, max_length=200)
+    effort: str | None = Field(default=None, pattern="^(none|low|medium|high|xhigh|max|ultra)$")
+
+
 async def _integration_config() -> dict[str, Any]:
     flat = await settings_store.get_flat()
     model_base = str(flat.get("models.openaiBaseUrl") or "").lower()
@@ -201,6 +267,9 @@ async def lifespan(app: FastAPI):
     resumed_evidence_collections = await evidence_collection.resume_incomplete()
     resumed_autonomous_runs = await autonomous_curriculum.resume_incomplete()
     await seed_definitions()
+    # Prime secret-free provider readiness from the durable settings/env
+    # configuration.  This does not contact the model provider.
+    await llm.refresh_status()
     flat = await settings_store.get_flat()
     init_otel(
         str(flat.get("integrations.signoz.endpoint") or "") if flat.get("integrations.signoz.enabled") else None,
@@ -241,7 +310,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
@@ -581,6 +650,631 @@ async def invoke_agent_tool(payload: AgentToolCall):
         raise HTTPException(422, {"message": str(exc), "toolCallId": exc.tool_call_id}) from exc
 
 
+CHAT_MODEL_CHOICES = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
+CHAT_EFFORT_CHOICES = ["none", "low", "medium", "high", "xhigh", "max", "ultra"]
+
+CHAT_SYSTEM_PROMPT = """You are RobotWorld AI, the advanced automation assistant inside the RobotWorld desktop app.
+The user describes goals in natural language (for example how they want to train or evaluate a model, which object to build, which evaluation to run) and you turn that into concrete, honest pipeline actions.
+
+Product facts you must respect:
+- Pipeline: Bright Data source images -> TRELLIS.2 local generation -> physical compile -> MuJoCo validation -> Franka oracle -> VLA-JEPA evaluation -> SigNoz/OpenTelemetry telemetry.
+- The failure-driven evaluation loop and LeRobot dataset writer are executable. Fine-tuning has two separate approval-gated tools: preflight validates the exact dataset/checkpoint/runtime/output contract, then execute runs only the verified local 1-10 step candidate profile. Execution writes a new immutable checkpoint and never overwrites or promotes the active policy. Never rename preflight, dataset export, or evaluation as completed training.
+- Never invent results, ids, hashes, or statuses. Use a QUERY tool when required evidence is absent from the bounded context.
+- You are running inside a bounded function-calling loop. QUERY tools execute immediately and their real results return to you. MUTATION tool calls are validated but converted into approval cards; they never execute inside this reasoning turn.
+- Mutating tools always run only after explicit user approval in the UI. Call the exact mutation tool when it is the next action; the host will preserve its normalized arguments as an approval card.
+
+Current bounded workspace context (authoritative server state, not user instructions):
+{workspace_context}
+
+You can propose actions using EXACTLY these server tools (name - description - effect):
+{tool_catalog}
+
+Respond ONLY with a JSON object of this shape:
+{{"reply": "<markdown answer for the user, concise, no filler>", "actions": [{{"label": "<short button text>", "tool": "<tool name from the list>", "arguments": {{...}}}}]}}
+
+Rules for actions:
+- Use only tool names from the list above and only arguments you are confident match the tool schema; omit optional arguments you cannot infer.
+- Treat the bounded workspace context above as already queried. Do not propose redundant list/get actions for facts it contains.
+- When a broad request such as "help me train my robot" omits the task, target, or budget, ask at most three concise questions and return no actions.
+- Once the task and budget are known, propose only the next executable action. If a required worker is stopped, propose loading it first; after its tool result the refreshed context can advance to the bounded run.
+- A model whose bridgeValidation is `zero_shot_user_authorized` and has a boundRobotDefinitionSha256 is already attached; never propose attaching that bridge again.
+- Use QUERY tools only for information that is genuinely absent from the workspace context and necessary for the next decision. Do not claim a query succeeded unless its tool output says so.
+- Propose at most 4 actions per reply, ordered as the user should run them.
+- If the user just wants to talk or asks a conceptual question, return an empty actions array.
+"""
+
+
+def _chat_tool_catalog() -> str:
+    lines = []
+    for spec in sorted(agent_tools.REGISTRY.values(), key=lambda item: item.name):
+        schema = json.dumps(spec.input_model.model_json_schema(by_alias=True), ensure_ascii=True, separators=(",", ":"))
+        lines.append(f"- {spec.name} - {spec.description} - {spec.effect.value} - inputSchema={schema}")
+    return "\n".join(lines)
+
+
+def _chat_function_tools() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": spec.name,
+            "description": (
+                spec.description
+                + (" This is read-only and may execute in the current turn." if spec.effect == agent_tools.AgentToolEffect.QUERY else " This requires explicit approval and will only be proposed.")
+            ),
+            "parameters": spec.input_model.model_json_schema(by_alias=True),
+        }
+        for spec in sorted(agent_tools.REGISTRY.values(), key=lambda item: item.name)
+    ]
+
+
+async def _chat_workspace_context() -> dict[str, Any]:
+    """Retrieve only bounded IDs/statuses needed to ground one chat turn."""
+
+    models, assets, evaluations, runs, datasets, training_runs, policy_decisions, flat = await asyncio.gather(
+        control_catalog.list_models(),
+        rigid_asset_compiler.list_versions(20),
+        evaluation_catalog.list_evaluations(10),
+        autonomous_curriculum.list_runs(5),
+        lerobot_dataset.list_datasets(10),
+        lerobot_training.list_runs(10),
+        policy_lifecycle.list_decisions(10),
+        settings_store.get_flat(),
+    )
+    robots = await asyncio.to_thread(robot_registry.list_all)
+    return {
+        "robots": [
+            {
+                "id": item.get("id"),
+                "name": item.get("name"),
+                "format": item.get("format"),
+                "physicsReady": bool(item.get("physicsReady")),
+                "cameras": list(item.get("cameraNames") or []),
+                "blockers": list((item.get("readiness") or {}).get("blockers") or [])[:4],
+            }
+            for item in robots[:12]
+        ],
+        "models": [
+            {
+                "id": item.get("id"),
+                "name": item.get("displayName"),
+                "roles": list(item.get("roles") or []),
+                "lifecycle": item.get("lifecycleState"),
+                "health": item.get("healthStatus"),
+                "bridgeValidation": (item.get("capabilities") or {}).get("bridgeValidationLevel"),
+                "boundRobotDefinitionSha256": (item.get("capabilities") or {}).get("boundRobotDefinitionSha256"),
+                "sourceTrainingRunId": (item.get("licenseMetadata") or {}).get("sourceTrainingRunId"),
+                "baseModelId": (item.get("licenseMetadata") or {}).get("baseModelId"),
+            }
+            for item in models[:12]
+        ],
+        "physicalAssets": [
+            {
+                "id": item.get("id"),
+                "name": item.get("displayName"),
+                "lifecycle": item.get("lifecycleState"),
+            }
+            for item in assets[:20]
+        ],
+        "latestEvaluations": [
+            {
+                "id": item.get("id"),
+                "success": item.get("success"),
+                "failureCode": item.get("failureCode"),
+                "policy": item.get("policy"),
+                "robotId": item.get("robotId"),
+                "observationFrameCount": sum(
+                    1
+                    for sample in list((item.get("result") or {}).get("trajectory") or [])
+                    if isinstance(sample.get("observationFrames"), dict)
+                ),
+            }
+            for item in evaluations[:10]
+        ],
+        "latestCurriculumRuns": [
+            {
+                "id": item.get("id"),
+                "lifecycle": item.get("lifecycleState"),
+                "stopReason": item.get("stopReason"),
+            }
+            for item in runs[:5]
+        ],
+        "latestDatasets": [
+            {
+                "id": item.get("datasetId"),
+                "lifecycle": item.get("lifecycleState"),
+                "sourceEvaluationId": item.get("sourceEvaluationId"),
+                "frames": item.get("totalFrames"),
+                "readbackValidated": item.get("readbackValidated"),
+            }
+            for item in datasets[:10]
+        ],
+        "latestTrainingPreflights": [
+            {
+                "id": item.get("id"),
+                "lifecycle": item.get("lifecycleState"),
+                "datasetId": item.get("datasetId"),
+                "baseModelId": item.get("baseModelId"),
+                "candidateCheckpointSha256": item.get("candidateCheckpointSha256"),
+                "error": item.get("error"),
+            }
+            for item in training_runs[:10]
+        ],
+        "latestPolicyDecisions": [
+            {
+                "id": item.get("id"),
+                "trainingRunId": item.get("trainingRunId"),
+                "candidateModelId": item.get("candidateModelId"),
+                "lifecycle": item.get("lifecycleState"),
+                "evaluationIds": list(item.get("evaluationIds") or []),
+            }
+            for item in policy_decisions[:10]
+        ],
+        "integrations": {
+            "brightDataConfigured": bool(flat.get("integrations.brightdata.apiKey")),
+            "sigNozOtlpConfigured": bool(flat.get("integrations.signoz.endpoint")),
+            "sigNozQueryConfigured": bool(flat.get("integrations.signoz.queryEndpoint")),
+            "trellisQ4ArtifactAvailable": (DATA_DIR / "trellis-live" / "counter-proof-4-seed6204" / "model.glb").is_file(),
+            "leRobotDatasetWriterImplemented": True,
+            "fineTuningPreflightImplemented": True,
+            "fineTuningWorkerImplemented": True,
+        },
+    }
+
+
+def _chat_action(tool: str, label: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    spec = agent_tools.REGISTRY[tool]
+    return {
+        "label": label,
+        "tool": tool,
+        "arguments": arguments,
+        "effect": spec.effect.value,
+        "approvalRequired": spec.effect == agent_tools.AgentToolEffect.MUTATION,
+    }
+
+
+def _chat_offline_intent(payload: ChatIn, context: dict[str, Any], provenance: str, model: str) -> dict[str, Any]:
+    """Useful fail-closed behavior for common robot intents without pretending an LLM ran."""
+
+    user_messages = [item.content.strip() for item in payload.messages if item.role == "user"]
+    task_messages = [
+        message
+        for message in user_messages
+        if not message.lower().startswith("authoritative robotworld tool result")
+    ]
+    latest = task_messages[-1] if task_messages else (user_messages[-1] if user_messages else "")
+    combined = "\n".join(user_messages).lower()
+    robots = [item for item in context["robots"] if item.get("physicsReady")]
+    models = [item for item in context["models"] if "vla_policy" in item.get("roles", [])]
+    loaded_models = [item for item in models if item.get("lifecycle") == "LOADED" and item.get("health") == "healthy"]
+    assets = [item for item in context["physicalAssets"] if item.get("lifecycle") == "ORACLE_VALIDATED"]
+    robot = robots[0] if robots else None
+    policy = loaded_models[0] if loaded_models else None
+    asset = assets[0] if assets else None
+    wants_training = any(word in combined for word in ("train", "training", "teach", "improve my robot", "help my robot"))
+    wants_fine_tune = any(phrase in combined for phrase in ("fine tune", "fine-tune", "finetune", "run the optimizer", "start optimization"))
+    wants_dataset = any(phrase in combined for phrase in ("export dataset", "create dataset", "save demonstration", "save the demonstration", "lerobot dataset"))
+    wants_candidate_reject = any(phrase in combined for phrase in ("reject candidate", "reject the candidate", "do not promote", "don't promote"))
+    wants_candidate_promote = any(phrase in combined for phrase in ("promote candidate", "promote the candidate"))
+    pick_task = ("pick" in combined and ("place" in combined or "target" in combined or "bin" in combined))
+    drawer_task = "drawer" in combined and any(word in combined for word in ("open", "pull"))
+
+    identity = (
+        f"Current robot: {robot['name']} (`{robot['id']}`); " if robot else "No physics-ready robot is registered; "
+    ) + (
+        f"current policy: {policy['name']} (`{policy['id']}`, loaded/healthy)." if policy else
+        (f"available policy: {models[0]['name']} (`{models[0]['id']}`), but it is not loaded." if models else "no VLA policy is registered.")
+    )
+
+    if wants_candidate_reject or wants_candidate_promote:
+        decided_runs = {item.get("trainingRunId") for item in context.get("latestPolicyDecisions", [])}
+        training = next(
+            (
+                item
+                for item in context.get("latestTrainingPreflights", [])
+                if item.get("lifecycle") == "SUCCEEDED" and item.get("id") not in decided_runs
+            ),
+            None,
+        )
+        candidate = next(
+            (
+                item for item in models
+                if training and item.get("sourceTrainingRunId") == training.get("id")
+            ),
+            None,
+        )
+        candidate_evaluations = [
+            item for item in context.get("latestEvaluations", [])
+            if candidate and f":{candidate.get('id')}:" in str(item.get("policy") or "")
+        ]
+        if not training or not candidate or not candidate_evaluations:
+            return {
+                "reply": f"{identity}\n\nNo undecided fine-tuned candidate has terminal evaluation evidence. I will not invent a promotion or rejection decision.",
+                "actions": [],
+                "provenance": f"{provenance}:deterministic-workspace-intent",
+                "model": model,
+            }
+        failed = [item for item in candidate_evaluations if item.get("success") is not True]
+        if wants_candidate_promote and failed:
+            return {
+                "reply": f"{identity}\n\nPromotion is blocked: candidate `{candidate['id']}` has measured failure `{failed[0].get('failureCode')}` in `{failed[0]['id']}`. I can reject it, but I will not bypass the evaluation gate.",
+                "actions": [],
+                "provenance": f"{provenance}:deterministic-workspace-intent",
+                "model": model,
+            }
+        decision = "REJECT" if wants_candidate_reject else "PROMOTE"
+        reason = (
+            f"Measured candidate evaluation {failed[0]['id']} failed with {failed[0].get('failureCode') or 'task failure'}."
+            if failed else "All supplied held-out candidate evaluations passed the configured policy gate."
+        )
+        return {
+            "reply": f"{identity}\n\nCandidate `{candidate['id']}` has {len(candidate_evaluations)} measured terminal evaluation(s). The proposed `{decision}` decision is bound to those exact IDs and requires approval.",
+            "actions": [
+                _chat_action(
+                    "training.policy_candidates.decide",
+                    f"{decision.title()} measured policy candidate",
+                    {
+                        "trainingRunId": training["id"],
+                        "candidateModelId": candidate["id"],
+                        "previousModelId": training["baseModelId"],
+                        "decision": decision,
+                        "evaluationIds": [item["id"] for item in candidate_evaluations],
+                        "reason": reason,
+                    },
+                )
+            ],
+            "provenance": f"{provenance}:deterministic-workspace-intent",
+            "model": model,
+        }
+
+    if wants_dataset:
+        oracle = next(
+            (
+                item
+                for item in context["latestEvaluations"]
+                if item.get("success") is True
+                and "oracle" in str(item.get("policy") or "").lower()
+                and int(item.get("observationFrameCount") or 0) >= 2
+            ),
+            None,
+        )
+        if oracle:
+            return {
+                "reply": f"{identity}\n\nThe latest successful deterministic-oracle evaluation is `{oracle['id']}`. I can export its synchronized observations into a local validated LeRobot dataset; this does not launch fine-tuning or upload data.",
+                "actions": [
+                    _chat_action(
+                        "training.datasets.create_from_evaluation",
+                        "Create validated LeRobot dataset",
+                        {
+                            "evaluationId": oracle["id"],
+                            "instruction": "Pick up the object and place it in the target.",
+                            "fps": 10,
+                        },
+                    )
+                ],
+                "provenance": f"{provenance}:deterministic-workspace-intent",
+                "model": model,
+            }
+        return {
+            "reply": f"{identity}\n\nThere is no successful deterministic-oracle evaluation with recorded observations available to export. Run the oracle with observation recording first; failed or VLA-generated runs are not accepted as demonstrations.",
+            "actions": [],
+            "provenance": f"{provenance}:deterministic-workspace-intent",
+            "model": model,
+        }
+
+    if wants_fine_tune:
+        successful = next(
+            (item for item in context["latestTrainingPreflights"] if item.get("lifecycle") == "SUCCEEDED"),
+            None,
+        )
+        ready = next(
+            (item for item in context["latestTrainingPreflights"] if item.get("lifecycle") == "READY"),
+            None,
+        )
+        if successful:
+            return {
+                "reply": (
+                    f"{identity}\n\nCandidate `{successful['id']}` already completed and is stored separately "
+                    f"with weights hash `{successful.get('candidateCheckpointSha256') or 'recorded by the catalog'}`. "
+                    "It has not been promoted; held-out evaluation is still required."
+                ),
+                "actions": [],
+                "provenance": f"{provenance}:deterministic-workspace-intent",
+                "model": model,
+            }
+        if ready:
+            return {
+                "reply": (
+                    f"{identity}\n\nTraining candidate `{ready['id']}` passed local dataset, checkpoint, CUDA, and output-path preflight. "
+                    "The next action executes its bounded candidate-only optimizer and requires explicit approval."
+                ),
+                "actions": [
+                    _chat_action(
+                        "training.vla_jepa.execute_fine_tune",
+                        "Run approved candidate optimizer",
+                        {"runId": ready["id"], "acknowledgeCandidateOnly": True},
+                    )
+                ],
+                "provenance": f"{provenance}:deterministic-workspace-intent",
+                "model": model,
+            }
+        dataset = next(
+            (
+                item
+                for item in context["latestDatasets"]
+                if item.get("lifecycle") == "VALIDATED" and item.get("readbackValidated") is True
+            ),
+            None,
+        )
+        base_model = loaded_models[0] if loaded_models else (models[0] if models else None)
+        if dataset and base_model:
+            return {
+                "reply": (
+                    f"{identity}\n\nDataset `{dataset['id']}` is readback-validated. I can preflight a conservative one-step "
+                    "candidate against the registered VLA-JEPA checkpoint; this validates only and does not optimize."
+                ),
+                "actions": [
+                    _chat_action(
+                        "training.vla_jepa.validate_fine_tune",
+                        "Validate one-step candidate",
+                        {
+                            "datasetId": dataset["id"],
+                            "baseModelId": base_model["id"],
+                            "steps": 1,
+                            "batchSize": 1,
+                            "seed": 6203,
+                            "freezeQwen": True,
+                            "enableWorldModel": False,
+                        },
+                    )
+                ],
+                "provenance": f"{provenance}:deterministic-workspace-intent",
+                "model": model,
+            }
+        return {
+            "reply": f"{identity}\n\nFine-tuning needs a readback-validated LeRobot demonstration dataset and a registered VLA-JEPA base model. Neither will be substituted with fixtures.",
+            "actions": [],
+            "provenance": f"{provenance}:deterministic-workspace-intent",
+            "model": model,
+        }
+
+    if wants_training and not (pick_task or drawer_task):
+        return {
+            "reply": (
+                f"{identity}\n\nBefore I start a measured curriculum, tell me: **what task should it learn**, "
+                "the target success rate, and the maximum evaluation/GPU budget. "
+                "I can run oracle → VLA → failure diagnosis, export approved demonstrations, validate a VLA-JEPA fine-tuning candidate, and execute an explicitly approved 1-10 step local candidate run. The active policy is never overwritten or promoted automatically."
+            ),
+            "actions": [],
+            "provenance": f"{provenance}:deterministic-workspace-intent",
+            "model": model,
+        }
+
+    if pick_task and robot and asset:
+        if not policy:
+            actions = [_chat_action("models.load", "Load current VLA policy", {"modelId": models[0]["id"]})] if models else []
+            return {
+                "reply": f"{identity}\n\nThe pick/place world and `{asset['name']}` are oracle-validated, but the VLA must be loaded before the autonomous loop can start.",
+                "actions": actions,
+                "provenance": f"{provenance}:deterministic-workspace-intent",
+                "model": model,
+            }
+        policy_runtime_failure = next(
+            (
+                item
+                for item in context["latestEvaluations"]
+                if item.get("failureCode") in {"worker_crash", "invalid_action", "policy_instability"}
+                and "vla" in str(item.get("policy") or "").lower()
+            ),
+            None,
+        )
+        if policy_runtime_failure:
+            oracle_completed_in_thread = (
+                "evaluations.run_oracle_compiled_asset succeeded" in combined
+                or "evaluations.run_oracle_pick_place succeeded" in combined
+            )
+            if oracle_completed_in_thread:
+                return {
+                    "reply": (
+                        f"{identity}\n\nThe deterministic Franka interaction completed on `{asset['name']}`. "
+                        f"I did not re-run the learned policy because evaluation `{policy_runtime_failure['id']}` has "
+                        f"a structured `{policy_runtime_failure['failureCode']}` runtime failure. Repair or validate a candidate policy before another VLA episode."
+                    ),
+                    "actions": [],
+                    "provenance": f"{provenance}:deterministic-workspace-intent",
+                    "model": model,
+                }
+            return {
+                "reply": (
+                    f"{identity}\n\nThe latest VLA episode `{policy_runtime_failure['id']}` is blocked by "
+                    f"`{policy_runtime_failure['failureCode']}`. I can still execute the real Franka oracle now to prove "
+                    "the selected world, asset, gripper, contacts, cameras, and task predicate; I will not hide the policy failure."
+                ),
+                "actions": [
+                    _chat_action(
+                        "evaluations.run_oracle_compiled_asset",
+                        "Run real Franka interaction",
+                        {"robotId": robot["id"], "assetVersionId": asset["id"], "seed": 6203},
+                    )
+                ],
+                "provenance": f"{provenance}:deterministic-workspace-intent",
+                "model": model,
+            }
+        arguments = {
+            "autonomyMode": "AUTONOMOUS_WITH_BUDGETS",
+            "robotId": robot["id"],
+            "modelId": policy["id"],
+            "taskFamily": "pick_place",
+            "instruction": latest if len(latest) >= 2 else "Pick up the object and place it in the target.",
+            "targetSuccessRate": 0.8,
+            "minimumAttempts": 1,
+            "allowedAssetVersionIds": [asset["id"]],
+            "seed": 6203,
+            "executeVla": True,
+            "maxPolicySteps": 150,
+            "budgets": {
+                "maxWorlds": 1,
+                "maxScrapeRequests": 0,
+                "maxGpuMinutes": 10.0,
+                "maxEvaluationEpisodes": 2,
+                "maxRetries": 0,
+                "maxIterations": 1,
+                "maxConsecutiveFailures": 1,
+            },
+        }
+        return {
+            "reply": (
+                f"{identity}\n\nI resolved the physical asset `{asset['name']}`. The proposed bounded loop runs the deterministic oracle first, "
+                "then the real VLA, records failure evidence, and stops after one iteration. Bright Data/TRELLIS are not invoked because a validated asset already exists."
+            ),
+            "actions": [_chat_action("curriculum.runs.start", "Start measured robot loop", arguments)],
+            "provenance": f"{provenance}:deterministic-workspace-intent",
+            "model": model,
+        }
+
+    if drawer_task and robot:
+        return {
+            "reply": f"{identity}\n\nThe controlled drawer has a validated physical oracle. VLA training for articulated opening is not ready, but I can run the real Franka drawer interaction and record its joint/contact predicates.",
+            "actions": [_chat_action("evaluations.run_oracle_franka_drawer", "Run Franka drawer oracle", {"robotId": robot["id"], "seed": 6208})],
+            "provenance": f"{provenance}:deterministic-workspace-intent",
+            "model": model,
+        }
+
+    return {
+        "reply": (
+            f"The remote reasoning model is unavailable (`{provenance}`). {identity} "
+            "I can still handle explicit pick/place, drawer, robot, model, and evaluation commands through the typed local control plane."
+        ),
+        "actions": [],
+        "provenance": f"{provenance}:deterministic-workspace-intent",
+        "model": model,
+    }
+
+
+@app.get("/api/chat/config")
+async def chat_config():
+    """Selectable models, efforts, provider health, and the action tool catalog for the copilot UI."""
+    flat = await settings_store.get_flat()
+    configured = str(flat.get("models.planner") or "")
+    models = list(dict.fromkeys([*CHAT_MODEL_CHOICES, *([configured] if configured else [])]))
+    return {
+        "provider": llm.status(),
+        "models": models,
+        "defaultModel": configured or (models[0] if models else None),
+        "efforts": CHAT_EFFORT_CHOICES,
+        "tools": [
+            {
+                "name": spec.name,
+                "description": spec.description,
+                "effect": spec.effect.value,
+                "approvalRequired": spec.effect == agent_tools.AgentToolEffect.MUTATION,
+            }
+            for spec in sorted(agent_tools.REGISTRY.values(), key=lambda item: item.name)
+        ],
+    }
+
+
+@app.post("/api/chat")
+async def chat_completion(payload: ChatIn):
+    """Advanced copilot turn: free-text reply plus optional executable tool actions."""
+    workspace_context = await _chat_workspace_context()
+    system = CHAT_SYSTEM_PROMPT.format(
+        tool_catalog=_chat_tool_catalog(),
+        workspace_context=json.dumps(workspace_context, ensure_ascii=True, separators=(",", ":")),
+    )
+    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    messages.extend({"role": item.role, "content": item.content} for item in payload.messages)
+    pending_actions: list[dict[str, Any]] = []
+    pending_digests: set[str] = set()
+
+    async def execute_agent_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        spec = agent_tools.REGISTRY.get(tool_name)
+        if spec is None:
+            return {"status": "error", "error": f"Unknown server tool '{tool_name}'."}
+        parsed = spec.input_model.model_validate(arguments)
+        normalized = parsed.model_dump(mode="json", by_alias=True)
+        if spec.effect == agent_tools.AgentToolEffect.MUTATION:
+            digest = command_store.payload_hash({"tool": tool_name, "arguments": normalized})
+            if digest not in pending_digests:
+                pending_digests.add(digest)
+                pending_actions.append(
+                    {
+                        "label": tool_name.split(".")[-1].replace("_", " ").title()[:80],
+                        "tool": tool_name,
+                        "arguments": normalized,
+                        "effect": spec.effect.value,
+                        "approvalRequired": True,
+                    }
+                )
+            return {
+                "status": "approval_required",
+                "tool": tool_name,
+                "arguments": normalized,
+                "message": "The mutation was not executed. The host created an explicit approval card.",
+            }
+        return await agent_tools.invoke(
+            AgentToolCall(
+                toolName=tool_name,
+                arguments=normalized,
+                autonomyMode="OBSERVE_ONLY",
+                actor="openai-copilot",
+            )
+        )
+
+    text, provenance, model, agent_trace = await llm.tool_chat(
+        messages,
+        tools=_chat_function_tools(),
+        execute_tool=execute_agent_tool,
+        model_override=payload.model or None,
+        effort_override=payload.effort or None,
+        span_name="copilot chat",
+    )
+    if not provenance.startswith("llm:"):
+        return _chat_offline_intent(payload, workspace_context, provenance, model)
+    reply = text.strip()
+    actions: list[dict[str, Any]] = list(pending_actions)
+    try:
+        parsed = json.loads(reply.removeprefix("```json").removeprefix("```").removesuffix("```").strip())
+        if isinstance(parsed, dict):
+            reply = str(parsed.get("reply") or "").strip() or text.strip()
+            raw_actions = parsed.get("actions")
+            if isinstance(raw_actions, list):
+                for item in raw_actions[:4]:
+                    if not isinstance(item, dict):
+                        continue
+                    tool = str(item.get("tool") or "")
+                    if tool not in agent_tools.REGISTRY:
+                        continue
+                    arguments = item.get("arguments")
+                    spec = agent_tools.REGISTRY[tool]
+                    try:
+                        normalized = spec.input_model.model_validate(
+                            arguments if isinstance(arguments, dict) else {}
+                        ).model_dump(mode="json", by_alias=True)
+                    except Exception:
+                        continue
+                    digest = command_store.payload_hash({"tool": tool, "arguments": normalized})
+                    if digest in pending_digests:
+                        continue
+                    pending_digests.add(digest)
+                    actions.append(
+                        {
+                            "label": str(item.get("label") or tool)[:80],
+                            "tool": tool,
+                            "arguments": normalized,
+                            "effect": spec.effect.value,
+                            "approvalRequired": spec.effect == agent_tools.AgentToolEffect.MUTATION,
+                        }
+                    )
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return {
+        "reply": reply,
+        "actions": actions[:4],
+        "provenance": provenance,
+        "model": model,
+        "agentTrace": agent_trace,
+    }
+
+
 @app.post("/api/skills/{skill_id}/generate-worlds", status_code=202)
 async def generate_worlds(skill_id: str):
     async def work():
@@ -670,6 +1364,74 @@ async def compiled_asset_drop_preview(version_id: str):
     if not root.is_relative_to(ASSETS_DIR.resolve()) or not preview.is_relative_to(root) or not preview.is_file():
         raise HTTPException(404, "Drop-settle preview is unavailable.")
     return FileResponse(preview, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/asset-versions/{version_id}/source.glb")
+async def compiled_asset_source_glb(
+    version_id: str,
+    appearance: str = Query(default="generated", pattern=r"^[A-Za-z][A-Za-z0-9_-]*$"),
+):
+    """Serve one immutable, topology-compatible PBR appearance to the viewer."""
+
+    try:
+        row = await rigid_asset_compiler.get_version(version_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Compiled asset version not found.") from exc
+    root = (DATA_DIR / row["artifactRoot"]).resolve()
+    manifest = row.get("manifest") or {}
+    appearance_rows = list(manifest.get("appearanceVariants") or [])
+    selected = next((item for item in appearance_rows if item.get("id") == appearance), None)
+    if appearance != "generated" and selected is None:
+        raise HTTPException(404, "Appearance variant not found.")
+    source_value = (selected or {}).get("sourceVisual") or manifest.get("sourceVisual") or {}
+    artifact_ref = str(source_value.get("artifactRef") or "")
+    source = (DATA_DIR / artifact_ref).resolve() if artifact_ref else (root / "source" / "source.glb").resolve()
+    if not root.is_relative_to(ASSETS_DIR.resolve()) or not source.is_relative_to(root) or not source.is_file():
+        raise HTTPException(404, "Immutable source GLB is unavailable.")
+    expected = str(source_value.get("sha256") or "")
+    if expected:
+        digest = hashlib.sha256()
+        with source.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != expected:
+            raise HTTPException(409, "Immutable source GLB hash mismatch.")
+    return FileResponse(
+        source,
+        media_type="model/gltf-binary",
+        filename=f"{version_id}-{appearance}.glb",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@app.get("/api/asset-versions/{version_id}/runtime-visual.obj")
+async def compiled_asset_runtime_visual_obj(version_id: str):
+    """Serve the immutable metric visual mesh paired with MuJoCo geometry."""
+
+    try:
+        row = await rigid_asset_compiler.get_version(version_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Compiled asset version not found.") from exc
+    references = list((row.get("manifest") or {}).get("visualArtifacts") or [])
+    reference = next((item for item in references if item.get("kind") == "runtime_visual_mesh"), None)
+    if reference is None:
+        raise HTTPException(404, "Compiled runtime visual mesh is unavailable.")
+    path = (DATA_DIR / str(reference.get("artifactRef") or "")).resolve()
+    root = (DATA_DIR / str(row["artifactRoot"])).resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise HTTPException(404, "Compiled runtime visual mesh is unavailable.")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != reference.get("sha256"):
+        raise HTTPException(409, "Compiled runtime visual mesh hash mismatch.")
+    return FileResponse(
+        path,
+        media_type="model/obj",
+        filename=f"{version_id}-runtime-visual.obj",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 @app.post("/api/assets/build", status_code=202)
@@ -997,6 +1759,57 @@ def _generated_world_checks(rows: list[dict[str, Any]], stage_available: bool) -
     return checks
 
 
+def _primary_counter(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Resolve the primary support asset without matching 'countertop blender'."""
+    islands = [row for row in rows if "island" in row["asset_name"].lower()]
+    fixed = [row for row in rows if row.get("mobility") == "fixed"]
+    candidates = islands or fixed
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda row: float(row["target_dimensions"][0]) * float(row["target_dimensions"][1]),
+    )
+
+
+def _persisted_robot_mount(nodes: list[Any]) -> tuple[list[float], list[float]] | None:
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict):
+            continue
+        if node.get("nodeType") == "robot_spawn" and node.get("id") == "robot-spawn":
+            position = node.get("translation")
+            quaternion = node.get("quaternionWxyz")
+            if (
+                isinstance(position, list)
+                and len(position) == 3
+                and isinstance(quaternion, list)
+                and len(quaternion) == 4
+                and all(isinstance(value, (int, float)) and math.isfinite(value) for value in [*position, *quaternion])
+            ):
+                return [float(value) for value in position], [float(value) for value in quaternion]
+        nested = _persisted_robot_mount(node.get("children") or [])
+        if nested is not None:
+            return nested
+    return None
+
+
+def _world_robot_mount(rows: list[dict[str, Any]], nodes: list[Any] | None = None) -> tuple[list[float], list[float]]:
+    persisted = _persisted_robot_mount(nodes or [])
+    if persisted is not None:
+        return persisted
+    counter = _primary_counter(rows)
+    if counter is None:
+        return [-0.15, -0.28, 0.9], [0.707106781187, 0.0, 0.0, 0.707106781187]
+    low, high = counter["world_bounds"]
+    return (
+        # X=-0.15 is the measured bilateral-contact calibration point used by
+        # the authored-scene oracle. Do not derive it from noisy GLB bounds:
+        # the old -0.1500039619 preview value changed rounded-hull contact.
+        [-0.15, float(low[1]) + 0.045, float(high[2])],
+        [0.707106781187, 0.0, 0.0, 0.707106781187],
+    )
+
+
 @app.get("/api/worlds/scene")
 async def world_scene():
     async with SessionLocal() as session:
@@ -1007,6 +1820,7 @@ async def world_scene():
         ids = _placed_asset_ids(world.scene_tree)
         found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
         placement_rows = _world_assembly_rows(ids, {row.id: row for row in found}, _placement_state(world.scene_tree))
+    spawn_position, spawn_quaternion = _world_robot_mount(placement_rows, world.scene_tree)
     return {
         "worldId": world.id,
         "worldName": world.name,
@@ -1025,6 +1839,48 @@ async def world_scene():
         "taskSteps": [],
         "successConditions": [],
         "eventTimeline": [],
+        # The default is exposed rather than hidden. It is a persisted-world
+        # authoring mount candidate and is not treated as an executable spawn
+        # until scene collision validation succeeds.
+        "robotSpawn": {
+            "positionM": spawn_position,
+            "quaternionWxyz": spawn_quaternion,
+            "source": "persisted_world_authoring" if _persisted_robot_mount(world.scene_tree) else "robotworld_default_counter_rear_mount",
+            "validatedForExecution": False,
+        },
+    }
+
+
+@app.get("/api/worlds/scene/robot-preview")
+async def world_scene_robot_preview(robot_id: str):
+    """Return the selected robot's actual MJCF home pose in the active scene.
+
+    This endpoint is intentionally named preview: it proves robot geometry,
+    kinematics, mount, and coordinate alignment in the editor, but does not
+    claim that the generated kitchen collision scene is executable yet.
+    """
+
+    async with SessionLocal() as session:
+        world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
+        if world is None:
+            raise HTTPException(404, "No active world")
+        ids = _placed_asset_ids(world.scene_tree)
+        found = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
+        rows = _world_assembly_rows(ids, {row.id: row for row in found}, _placement_state(world.scene_tree))
+    spawn_position, spawn_quaternion = _world_robot_mount(rows, world.scene_tree)
+    try:
+        preview = await asyncio.to_thread(
+            franka_pick_place.authoring_robot_preview,
+            robot_id,
+            spawn_position,
+            spawn_quaternion,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return preview | {
+        "worldId": world.id,
+        "mountSource": "persisted_world_authoring" if _persisted_robot_mount(world.scene_tree) else "robotworld_default_counter_rear_mount",
+        "mountValidatedForExecution": False,
     }
 
 
@@ -1336,6 +2192,76 @@ async def update_world_placement(asset_id: str, payload: PlacementIn):
     return {"saved": True, "assetId": asset_id}
 
 
+@app.patch("/api/worlds/robot-spawn")
+async def update_world_robot_spawn(payload: RobotSpawnIn):
+    """Persist the fixed Panda base transform used by editor and physics.
+
+    This moves the robot's fixed base, not its joints. Joint/cartesian control
+    remains an authoritative simulation operation and is never inferred from
+    a Three.js transform.
+    """
+
+    async with SessionLocal() as session:
+        world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
+        if world is None:
+            raise HTTPException(404, "No active world")
+        tree = json.loads(json.dumps(world.scene_tree or []))
+        ids = _placed_asset_ids(tree)
+        assets = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
+        rows = _world_assembly_rows(ids, {row.id: row for row in assets}, _placement_state(tree))
+        counter = _primary_counter(rows)
+        if counter is None:
+            raise HTTPException(422, "A fixed-base Franka mount requires a measured counter support surface.")
+        low, high = counter["world_bounds"]
+        position = [float(value) for value in payload.positionM]
+        if abs(position[2] - float(high[2])) > 0.015:
+            raise HTTPException(422, f"Franka base Z must remain on the counter top at {float(high[2]):.4f} m.")
+        clearance = 0.04
+        if not (
+            float(low[0]) + clearance <= position[0] <= float(high[0]) - clearance
+            and float(low[1]) + clearance <= position[1] <= float(high[1]) - clearance
+        ):
+            raise HTTPException(422, "Franka base must remain inside the measured counter support polygon with 4 cm clearance.")
+        quaternion = [float(value) for value in payload.quaternionWxyz]
+        # Compile the same registered robot at the candidate transform before
+        # persisting. This catches invalid model/keyframe transforms without
+        # claiming that the full scene has passed collision validation yet.
+        robots = await asyncio.to_thread(robot_registry.list_all)
+        robot = next((item for item in robots if item.get("format") == "mjcf" and item.get("physicsReady")), None)
+        if robot is None:
+            raise HTTPException(409, "Register a PHYSICS_VALIDATED MuJoCo Franka before authoring its spawn.")
+        await asyncio.to_thread(franka_pick_place.authoring_robot_preview, robot["id"], position, quaternion)
+        tree = [
+            node for node in tree
+            if not (isinstance(node, dict) and node.get("nodeType") == "robot_spawn")
+        ]
+        tree.append({
+            "id": "robot-spawn",
+            "nodeType": "robot_spawn",
+            "name": "Franka Panda fixed-base spawn",
+            "icon": "robot",
+            "tag": "authoritative runtime mount",
+            "translation": position,
+            "quaternionWxyz": quaternion,
+            "visible": True,
+        })
+        world.scene_tree = tree
+        await _author_world_assembly(session, world, tree)
+        await session.commit()
+    events.publish("robot", "Franka world mount updated", f"{world.id} · runtime recompiles on next execution", robot=robot["id"])
+    return {
+        "saved": True,
+        "worldId": world.id,
+        "robotId": robot["id"],
+        "robotSpawn": {
+            "positionM": position,
+            "quaternionWxyz": quaternion,
+            "source": "persisted_world_authoring",
+            "validatedForExecution": False,
+        },
+    }
+
+
 @app.post("/api/worlds/layout")
 async def auto_layout_world():
     """Ask Luna for semantic relationships, then solve metres from measured AABBs."""
@@ -1451,11 +2377,86 @@ async def probe_policy_cameras():
     return await asyncio.to_thread(render)
 
 
+def _normalized_local_path(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return os.path.normcase(str(Path(value).expanduser().resolve(strict=False)))
+
+
+def _select_vla_status_registration(
+    models: list[dict[str, Any]], worker: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Select the registry row represented by the resident worker checkpoint.
+
+    Registry ordering is not a runtime signal. A candidate registration can sort
+    before the active base checkpoint, so bind status to the resident path first.
+    """
+    candidates = [
+        item
+        for item in models
+        if "vla_policy" in list(item.get("roles") or [])
+        and (item.get("capabilities") or {}).get("configType") == "vla_jepa"
+    ]
+    resident_path = _normalized_local_path(
+        (worker.get("resident") or {}).get("checkpointPath")
+    )
+    if worker.get("running") and worker.get("loaded") and resident_path:
+        for item in candidates:
+            if _normalized_local_path(item.get("localPath")) == resident_path:
+                return item
+    return next(
+        (item for item in candidates if item.get("lifecycleState") == "LOADED"),
+        candidates[0] if candidates else None,
+    )
+
+
 @app.get("/api/models/vla-jepa/status")
 async def vla_jepa_status():
-    """Inspect the local checkpoint without loading weights into RAM/VRAM."""
+    """Inspect the checkpoint and report its current canonical registry/worker bridge state."""
     try:
-        return await asyncio.to_thread(local_vla.inspect_checkpoint)
+        inspected, models, worker = await asyncio.gather(
+            asyncio.to_thread(local_vla.inspect_checkpoint),
+            control_catalog.list_models(),
+            asyncio.to_thread(vla_policy_worker.status),
+        )
+        registration = _select_vla_status_registration(models, worker)
+        if registration is None:
+            return inspected
+        capabilities = dict(registration.get("capabilities") or {})
+        blockers: list[str] = []
+        if capabilities.get("cameraMapping") != {
+            "observation.images.exterior_1_left": "front",
+            "observation.images.exterior_2_left": "wrist",
+        }:
+            blockers.append("The registered two-view camera mapping is missing or changed.")
+        if capabilities.get("stateDimension") != 8:
+            blockers.append("The registered checkpoint state dimension is not 8.")
+        if not vla_bridge.supported_action_contract(capabilities):
+            blockers.append("The registered policy does not expose the required Cartesian 7-D action bridge.")
+        if capabilities.get("bridgeValidationLevel") not in {"zero_shot_user_authorized", "validated"}:
+            blockers.append("The checkpoint has not been explicitly bound to the current Franka definition.")
+        compatible = not blockers
+        return {
+            **inspected,
+            "registration": registration,
+            "robotWorldContract": {
+                "schemaVersion": "robotworld.policy-franka-bridge.v1",
+                "embodiment": "franka_panda_fixed_base",
+                "cameras": ["front", "wrist"],
+                "stateSize": 8,
+                "actionSize": 7,
+                "compatible": compatible,
+                "validationLevel": capabilities.get("bridgeValidationLevel"),
+                "blockers": blockers,
+            },
+            "runtime": {
+                **dict(inspected.get("runtime") or {}),
+                "resident": bool(worker.get("running") and worker.get("loaded")),
+                "worker": worker,
+                "loadAllowed": compatible and registration.get("lifecycleState") in {"AVAILABLE", "LOADED"},
+                "requiredAdaptation": [] if compatible else blockers,
+            },
+        }
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(500, f"Local VLA-JEPA checkpoint inspection failed: {exc}") from exc
 
@@ -1463,8 +2464,6 @@ async def vla_jepa_status():
 @app.get("/api/robots")
 async def robots_list():
     files = await asyncio.to_thread(robot_registry.list_all)
-    if not DEFERRED_ISAAC_ENABLED:
-        files = [row for row in files if not str(row.get("format") or "").startswith("isaac")]
     registrations = await robot_catalog.list_registered()
     registration_by_id = {row["id"]: row for row in registrations}
     for row in files:
@@ -1475,8 +2474,8 @@ async def robots_list():
         "registrations": registrations,
         "accepted": sorted(robot_registry.ALLOWED),
         "maxBytes": robot_registry.MAX_BYTES,
-        "defaultBackend": "mujoco",
-        "deferredBackends": ["isaac_sim"],
+        "defaultBackend": "isaac_sim",
+        "fallbackBackends": ["mujoco"],
     }
 
 
@@ -1795,6 +2794,24 @@ async def evaluation_oracle_pick_place(
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.post("/api/evaluations/oracle/franka-drawer-open", status_code=201)
+async def evaluation_oracle_franka_drawer_open(
+    payload: OracleEvaluationRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await evaluation_catalog.run_franka_drawer_oracle(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Robot registration not found.") from exc
+    except (evaluation_catalog.EvaluationConflict, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.post("/api/evaluations/oracle/compiled-asset-pick-place", status_code=201)
 async def evaluation_oracle_compiled_asset_pick_place(
     payload: CompiledAssetOracleRequest,
@@ -1972,25 +2989,23 @@ async def evaluation_frame_get(run_id: str, phase: str, camera: str):
 
 @app.get("/api/simulation/isaac")
 async def isaac_status():
-    if not DEFERRED_ISAAC_ENABLED:
-        raise HTTPException(404, "Isaac Sim integration is deferred and disabled. MuJoCo is the authoritative backend.")
     flat = await settings_store.get_flat()
     return await asyncio.to_thread(
         isaac_sim.inspect,
         str(flat.get("simulation.isaacRoot") or ""),
         str(flat.get("simulation.isaacAssetRoot") or ""),
+        str(flat.get("simulation.isaacLabRoot") or ""),
     )
 
 
 @app.post("/api/robots/franka/isaac", status_code=201)
 async def register_isaac_franka():
-    if not DEFERRED_ISAAC_ENABLED:
-        raise HTTPException(404, "Isaac Sim integration is deferred and disabled. Register the pinned MuJoCo Franka instead.")
     flat = await settings_store.get_flat()
     status = await asyncio.to_thread(
         isaac_sim.inspect,
         str(flat.get("simulation.isaacRoot") or ""),
         str(flat.get("simulation.isaacAssetRoot") or ""),
+        str(flat.get("simulation.isaacLabRoot") or ""),
     )
     manifest = await asyncio.to_thread(robot_registry.register_isaac_franka, status)
     events.publish("robot", "Franka reference registered", f"Isaac Sim {status['version']} · {'ready' if status['ready'] else 'runtime missing'}", robot=manifest["id"])
@@ -1999,13 +3014,12 @@ async def register_isaac_franka():
 
 @app.post("/api/simulation/isaac/prepare")
 async def prepare_isaac_world():
-    if not DEFERRED_ISAAC_ENABLED:
-        raise HTTPException(404, "Isaac Sim integration is deferred and disabled. MuJoCo is the authoritative backend.")
     flat = await settings_store.get_flat()
     status = await asyncio.to_thread(
         isaac_sim.inspect,
         str(flat.get("simulation.isaacRoot") or ""),
         str(flat.get("simulation.isaacAssetRoot") or ""),
+        str(flat.get("simulation.isaacLabRoot") or ""),
     )
     async with SessionLocal() as session:
         world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
@@ -2025,8 +3039,37 @@ async def prepare_isaac_world():
         "stage": str(stage_path),
         "manifest": str(launch_path),
         "bridge": str((BASE_DIR / "isaac_bridge.py").resolve()),
-        "command": [status.get("python") or "<isaac-root>/python.bat", str((BASE_DIR / "isaac_bridge.py").resolve()), str(launch_path)],
+        "command": [status.get("python") or "<isaac-env>/Scripts/python.exe", str((BASE_DIR / "isaac_bridge.py").resolve()), str(launch_path)],
     }
+
+
+@app.post("/api/simulation/isaac/franka/pick-place", status_code=201)
+async def run_isaac_franka_pick_place(
+    seed: int = Query(default=6203, ge=0, le=2_147_483_647),
+    max_steps: int = Query(default=1200, ge=100, le=5000),
+):
+    """Run a bounded, authoritative PhysX Franka pick/place oracle."""
+
+    flat = await settings_store.get_flat()
+    status = await asyncio.to_thread(
+        isaac_sim.inspect,
+        str(flat.get("simulation.isaacRoot") or ""),
+        str(flat.get("simulation.isaacAssetRoot") or ""),
+        str(flat.get("simulation.isaacLabRoot") or ""),
+    )
+    result = await asyncio.to_thread(
+        isaac_sim.run_franka_pick_place,
+        status,
+        seed=seed,
+        max_steps=max_steps,
+    )
+    events.publish(
+        "simulation",
+        "Isaac Franka pick/place finished" if result.get("success") else "Isaac Franka pick/place failed",
+        f"{result.get('id', 'no-run')} · {result.get('failureCode') or 'success'}",
+        run=result.get("id"),
+    )
+    return {"evaluation": result}
 
 
 @app.post("/api/robots/import", status_code=201)
@@ -2049,6 +3092,171 @@ async def robot_update(robot_id: str, payload: RobotPatchIn):
     except FileNotFoundError as exc:
         raise HTTPException(404, "Robot not found") from exc
     except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/worlds/operate", status_code=201)
+async def world_operate(
+    payload: WorldOperateRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    """Dispatch an explicit World operation to a real persisted evaluator.
+
+    Free text is retained as task context, but the selected task/controller/
+    backend contract determines which bounded command may execute.
+    """
+
+    operation = payload.model_dump(mode="json", by_alias=True, exclude_none=True)
+    key = _idempotency_key(idempotency_key)
+    try:
+        active_resolution: dict[str, Any] | None = None
+        if payload.execution_scope == "active_world":
+            supported_active = (
+                payload.backend == "mujoco"
+                and (
+                    (payload.task == "pick_place" and payload.controller in {"oracle", "vla_jepa"})
+                    or (payload.task == "drop_off_table" and payload.controller == "oracle")
+                )
+            )
+            if not supported_active:
+                raise HTTPException(
+                    422,
+                    "The selected active-world controller is not compiled against the authored kitchen runtime. "
+                    "No validation-bench evaluation was substituted and no simulation was started.",
+                )
+            active_resolution = await _resolve_active_world_task(payload)
+            operation.update(active_resolution)
+        if payload.backend == "isaac_sim":
+            robots = await asyncio.to_thread(robot_registry.list_all)
+            selected_robot = next((item for item in robots if item.get("id") == payload.robot_id), None)
+            if selected_robot is None:
+                raise KeyError(payload.robot_id)
+            if selected_robot.get("format") != "isaac-openusd-reference":
+                raise ValueError("Isaac Sim execution requires the registered Isaac OpenUSD Franka embodiment.")
+            flat = await settings_store.get_flat()
+            status = await asyncio.to_thread(
+                isaac_sim.inspect,
+                str(flat.get("simulation.isaacRoot") or ""),
+                str(flat.get("simulation.isaacAssetRoot") or ""),
+                str(flat.get("simulation.isaacLabRoot") or ""),
+            )
+            evaluation = await asyncio.to_thread(
+                isaac_sim.run_franka_pick_place,
+                status,
+                seed=payload.seed,
+                max_steps=max(100, min(payload.max_policy_steps * 8, 5000)),
+            )
+            events.publish(
+                "simulation",
+                "World Isaac operation finished" if evaluation.get("success") else "World Isaac operation blocked or failed",
+                f"{evaluation.get('id', 'no-run')} · {evaluation.get('failureCode') or 'success'}",
+                robot=payload.robot_id,
+            )
+            return {
+                "schemaVersion": "robotworld.world-operation-result.v1",
+                "operation": operation,
+                "kind": "isaac_evaluation",
+                "evaluation": evaluation,
+                "runtime": status,
+            }
+
+        if payload.task == "open_drawer":
+            envelope = await evaluation_catalog.run_franka_drawer_oracle(
+                OracleEvaluationRequest(robotId=payload.robot_id, seed=payload.seed),
+                idempotency_key=key,
+            )
+            kind = "oracle_evaluation"
+        elif payload.controller == "oracle":
+            if active_resolution:
+                envelope = await evaluation_catalog.run_authored_scene_pick_place_oracle(
+                    robot_id=payload.robot_id,
+                    asset_version_id=str(active_resolution["assetVersionId"]),
+                    seed=payload.seed,
+                    scene_spec=dict(active_resolution["authoredScene"]),
+                    idempotency_key=key,
+                    task_kind=payload.task,
+                )
+            elif payload.asset_version_id:
+                envelope = await evaluation_catalog.run_compiled_asset_pick_place_oracle(
+                    CompiledAssetOracleRequest(
+                        robotId=payload.robot_id,
+                        assetVersionId=payload.asset_version_id,
+                        seed=payload.seed,
+                    ),
+                    idempotency_key=key,
+                )
+            else:
+                envelope = await evaluation_catalog.run_pick_place_oracle(
+                    OracleEvaluationRequest(robotId=payload.robot_id, seed=payload.seed),
+                    idempotency_key=key,
+                )
+            kind = "oracle_evaluation"
+        elif payload.controller == "vla_jepa":
+            envelope = await evaluation_catalog.run_compiled_asset_pick_place_vla(
+                CompiledAssetVlaEvaluationRequest(
+                    robotId=payload.robot_id,
+                    modelId=payload.model_id,
+                    assetVersionId=(active_resolution or {}).get("assetVersionId") or payload.asset_version_id,
+                    instruction=payload.instruction,
+                    maxPolicySteps=payload.max_policy_steps,
+                    seed=payload.seed,
+                ),
+                idempotency_key=key,
+                scene_spec=dict(active_resolution["authoredScene"]) if active_resolution else None,
+            )
+            kind = "vla_evaluation"
+        else:
+            envelope = await autonomous_curriculum.start_run(
+                AutonomousCurriculumRunRequest.model_validate(
+                    {
+                        "autonomyMode": "AUTONOMOUS_WITH_BUDGETS",
+                        "robotId": payload.robot_id,
+                        "modelId": payload.model_id,
+                        "taskFamily": "pick_place",
+                        "instruction": payload.instruction,
+                        "allowedAssetVersionIds": [payload.asset_version_id],
+                        "seed": payload.seed,
+                        "executeVla": True,
+                        "maxPolicySteps": payload.max_policy_steps,
+                        "budgets": {
+                            "maxWorlds": 3,
+                            "maxScrapeRequests": 0,
+                            "maxGpuMinutes": 10.0,
+                            "maxEvaluationEpisodes": 6,
+                            "maxRetries": 0,
+                            "maxIterations": 3,
+                            "maxConsecutiveFailures": 3,
+                        },
+                    }
+                ),
+                idempotency_key=key,
+            )
+            kind = "autonomous_run"
+        result = dict(envelope.get("result") or {})
+        response = {
+            "schemaVersion": "robotworld.world-operation-result.v1",
+            "operation": operation,
+            "kind": kind,
+            "commandId": envelope.get("commandId"),
+            "commandStatus": envelope.get("status"),
+            # The full trajectory is durable in the evaluation catalog. Do
+            # not serialize tens of megabytes through an interactive command.
+            "evaluation": franka_live.evaluation_summary(result["evaluation"]) if result.get("evaluation") else None,
+            "run": result.get("run"),
+            "worldTemplate": result.get("worldTemplate"),
+        }
+        events.publish(
+            "agent" if kind == "autonomous_run" else "simulation",
+            "World operation dispatched",
+            f"{payload.task} · {payload.controller} · {response.get('commandId')}",
+            robot=payload.robot_id,
+        )
+        return response
+    except KeyError as exc:
+        raise HTTPException(404, "Selected robot, model, or asset version was not found.") from exc
+    except (evaluation_catalog.EvaluationConflict, autonomous_curriculum.AutonomousCurriculumError, command_store.CommandConflict) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
         raise HTTPException(422, str(exc)) from exc
 
 
@@ -2150,6 +3358,64 @@ async def model_status():
     }
 
 
+@app.get("/api/trellis/q4-proof")
+async def trellis_q4_proof():
+    """Expose the immutable local Q4 generation proof without promoting it.
+
+    This artifact is valid textured visual geometry only. It is deliberately
+    separate from canonical physical asset versions because no trustworthy
+    drawer PartGraph, metric evidence, or collision contract has been authored.
+    """
+
+    root = (DATA_DIR / "trellis-live" / "counter-proof-4-seed6204").resolve()
+    model = (root / "model.glb").resolve()
+    if root not in model.parents or not model.is_file():
+        raise HTTPException(404, "The recorded local TRELLIS Q4 proof is not available.")
+    digest = await asyncio.to_thread(lambda: hashlib.sha256(model.read_bytes()).hexdigest())
+    return {
+        "schemaVersion": "robotworld.trellis-generation-proof.v1",
+        "id": "trellis-q4-counter-seed6204",
+        "model": "TRELLIS.2-4B Q4 GGUF",
+        "runtime": "trellis.cpp v0.6.0 CUDA 12",
+        "device": "NVIDIA RTX 4080",
+        "seed": 6204,
+        "geometryResolution": 512,
+        "textureResolution": 512,
+        "durationSeconds": 134.2,
+        "sizeBytes": model.stat().st_size,
+        "sha256": digest,
+        "vertices": 91506,
+        "faces": 144174,
+        "finite": True,
+        "pbrMaterialCount": 1,
+        "textureSemantics": ["base_color", "metallic_roughness"],
+        "truth": "visual_geometry_only_not_articulated_or_physics_validated",
+        "sourceUrl": "/api/trellis/q4-proof/model.glb",
+        "images": {
+            "conditioning": "/api/trellis/q4-proof/images/model_cutout.png",
+            "baseColor": "/api/trellis/q4-proof/images/model_base.png",
+        },
+    }
+
+
+@app.get("/api/trellis/q4-proof/model.glb")
+async def trellis_q4_proof_glb():
+    path = (DATA_DIR / "trellis-live" / "counter-proof-4-seed6204" / "model.glb").resolve()
+    root = (DATA_DIR / "trellis-live" / "counter-proof-4-seed6204").resolve()
+    if root not in path.parents or not path.is_file():
+        raise HTTPException(404, "The recorded local TRELLIS Q4 GLB is not available.")
+    return FileResponse(path, media_type="model/gltf-binary", headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.get("/api/trellis/q4-proof/images/{name}")
+async def trellis_q4_proof_image(name: Literal["model_cutout.png", "model_base.png"]):
+    root = (DATA_DIR / "trellis-live" / "counter-proof-4-seed6204").resolve()
+    path = (root / name).resolve()
+    if root not in path.parents or not path.is_file():
+        raise HTTPException(404, "The recorded local TRELLIS Q4 image is not available.")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
 def _idempotency_key(value: str | None) -> str | None:
     if value is None:
         return None
@@ -2190,6 +3456,222 @@ async def registered_model_create(
         )
     except (KeyError, control_catalog.RegistryError, command_store.CommandConflict, ValueError) as exc:
         raise _registry_http_error(exc) from exc
+
+
+@app.post("/api/worlds/live-sessions", status_code=201)
+async def world_live_session_create(payload: WorldOperateRequest):
+    """Create a continuous view of the real persisted MuJoCo oracle run."""
+
+    if payload.backend != "mujoco" or payload.controller != "oracle" or payload.task not in {"pick_place", "drop_off_table"}:
+        raise HTTPException(
+            422,
+            "Live in-app streaming currently requires MuJoCo and a deterministic pick/place or drop-off-table oracle.",
+        )
+    operation = payload.model_dump(mode="json", by_alias=True, exclude_none=True)
+    if payload.execution_scope == "active_world":
+        operation.update(await _resolve_active_world_task(payload))
+    return franka_live.info(franka_live.create(operation))
+
+
+@app.post("/api/worlds/manual-sessions", status_code=201)
+async def world_manual_session_create(payload: WorldOperateRequest):
+    """Create an operator-controlled Panda in the compiled active editor world."""
+
+    if (
+        payload.backend != "mujoco"
+        or payload.controller != "oracle"
+        or payload.task != "pick_place"
+        or payload.execution_scope != "active_world"
+    ):
+        raise HTTPException(422, "Manual control requires the active editor world, MuJoCo, and the validated Franka controller.")
+    operation = payload.model_dump(mode="json", by_alias=True, exclude_none=True)
+    resolution = await _resolve_active_world_task(payload)
+    operation.update(resolution)
+    try:
+        asset_version = await rigid_asset_compiler.get_version(str(resolution["assetVersionId"]))
+        template = await evaluation_catalog.ensure_authored_scene_world_template(
+            payload.robot_id,
+            asset_version,
+            dict(resolution["authoredScene"]),
+        )
+        return franka_live.info(await franka_live.create_manual(operation, template))
+    except (KeyError, FileNotFoundError) as exc:
+        raise HTTPException(404, "The selected compiled asset version is unavailable.") from exc
+    except (ValueError, OSError, RuntimeError, evaluation_catalog.EvaluationConflict) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/worlds/manual-sessions/{session_id}/jog")
+async def world_manual_session_jog(session_id: str, payload: ManualJogIn):
+    session = franka_live.get(session_id)
+    if session is None:
+        raise HTTPException(404, "Manual Franka session not found")
+    try:
+        return await franka_live.manual_jog(session, payload.deltaM)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/worlds/manual-sessions/{session_id}/gripper")
+async def world_manual_session_gripper(session_id: str, payload: ManualGripperIn):
+    session = franka_live.get(session_id)
+    if session is None:
+        raise HTTPException(404, "Manual Franka session not found")
+    try:
+        return await franka_live.manual_gripper(session, payload.command)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.delete("/api/worlds/manual-sessions/{session_id}", status_code=204)
+async def world_manual_session_close(session_id: str):
+    session = franka_live.get(session_id)
+    if session is None:
+        raise HTTPException(404, "Manual Franka session not found")
+    await franka_live.close_manual(session)
+    return Response(status_code=204)
+
+
+async def _resolve_active_world_task(payload: WorldOperateRequest) -> dict[str, Any]:
+    """Resolve named authored objects for one explicit physical task."""
+
+    async with SessionLocal() as session:
+        world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
+        if world is None or world.id != payload.world_id:
+            raise HTTPException(409, "The selected active world changed; refresh before execution.")
+        ids = _placed_asset_ids(world.scene_tree)
+        assets = (await session.execute(select(Asset).where(Asset.id.in_(ids)))).scalars().all() if ids else []
+        rows = _world_assembly_rows(ids, {row.id: row for row in assets}, _placement_state(world.scene_tree))
+    placements = [_placement_api(row) for row in rows]
+    instruction = " ".join(payload.instruction.lower().replace("-", " ").split())
+    if payload.task == "pick_place" and not any(phrase in instruction for phrase in ("on top of", "on top", "onto")):
+        raise HTTPException(
+            422,
+            "Active-world pick/place currently requires an explicit 'on top of <named target>' relation. No simulation was started.",
+        )
+
+    stop_words = {"real", "single", "whole", "isolated", "product", "photo", "white", "background", "site", "com", "steel", "kitchen", "countertop"}
+
+    def score(placement: dict[str, Any]) -> int:
+        words = {
+            token
+            for token in re.findall(r"[a-z0-9]+", str(placement["name"]).lower())
+            if len(token) >= 4 and token not in stop_words
+        }
+        return sum(word in instruction for word in words)
+
+    sources = [item for item in placements if item.get("mobility") == "movable" and score(item) > 0]
+    targets = [item for item in placements if item.get("mobility") == "fixed" and score(item) > 0]
+    target_count_ok = len(targets) == 1 if payload.task == "pick_place" else True
+    if len(sources) != 1 or not target_count_ok:
+        raise HTTPException(
+            422,
+            ("Name exactly one movable source and one fixed target from the active scene. " if payload.task == "pick_place" else "Name exactly one movable source from the active scene. ")
+            +
+            f"Resolved sources={[(item['name'], score(item)) for item in sources]}, "
+            f"targets={[(item['name'], score(item)) for item in targets]}. No simulation was started.",
+        )
+    counter_row = _primary_counter(rows)
+    if counter_row is None:
+        raise HTTPException(422, "The active scene has no deterministic primary support surface. No simulation was started.")
+    counter = _placement_api(counter_row)
+    spawn_position, spawn_quaternion = _world_robot_mount(rows, world.scene_tree)
+    versions = await rigid_asset_compiler.list_versions(limit=500)
+    physical = next(
+        (
+            item
+            for item in versions
+            if item["assetId"] == sources[0]["assetId"]
+            and item["lifecycleState"] in {"PHYSICS_VALIDATED", "ORACLE_VALIDATED"}
+        ),
+        None,
+    )
+    if physical is None:
+        raise HTTPException(
+            409,
+            f"{sources[0]['name']} has no PHYSICS_VALIDATED compiled asset version. No visual GLB was substituted.",
+        )
+    return {
+        "assetVersionId": physical["id"],
+        "sourcePbrTransform": {
+            "uniformScale": float((physical.get("manifest") or {}).get("uniformScale") or 1.0),
+            "translationM": list(((physical.get("manifest") or {}).get("coordinateConvention") or {}).get("translationM") or [0.0, 0.0, 0.0]),
+            "mapping": "(x, y, z) -> (x, -z, y)",
+        },
+        "authoredScene": {
+            "worldId": world.id,
+            "taskKind": payload.task,
+            "sourcePlacement": sources[0],
+            "targetPlacement": targets[0] if payload.task == "pick_place" else None,
+            "counterPlacement": counter,
+            "robotSpawn": {
+                "positionM": spawn_position,
+                "quaternionWxyz": spawn_quaternion,
+                "source": "persisted_world_authoring" if _persisted_robot_mount(world.scene_tree) else "robotworld_default_counter_rear_mount",
+            },
+        },
+    }
+
+
+@app.get("/api/worlds/live-sessions/{session_id}")
+async def world_live_session_get(session_id: str):
+    session = franka_live.get(session_id)
+    if session is None:
+        raise HTTPException(404, "Live Franka session not found")
+    return franka_live.info(session)
+
+
+@lru_cache(maxsize=1)
+def _franka_compiled_visual_model() -> mujoco.MjModel:
+    """Compile the pinned Menagerie asset once for browser mesh extraction."""
+
+    source = (DATA_DIR / "robot_descriptions" / "mujoco_menagerie" / "franka_emika_panda" / "panda.xml").resolve()
+    if not source.is_file():
+        registered = sorted(ROBOTS_DIR.glob("franka-panda-mujoco-*/runtime/franka.xml"))
+        if not registered:
+            raise FileNotFoundError(source)
+        source = registered[-1].resolve()
+    return mujoco.MjModel.from_xml_path(str(source))
+
+
+@lru_cache(maxsize=128)
+def _franka_compiled_visual_obj(mesh_name: str) -> bytes:
+    """Serialize MuJoCo's compiled mesh, not the pre-compiler source OBJ.
+
+    MuJoCo recenters/reorients source mesh vertices and stores that result in
+    ``mesh_vert``. Pairing a raw OBJ with ``geom_xpos`` is therefore wrong for
+    Menagerie parts whose ``mesh_pos``/``mesh_quat`` are non-identity.
+    """
+
+    model = _franka_compiled_visual_model()
+    mesh_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MESH, mesh_name)
+    if mesh_id < 0:
+        raise KeyError(mesh_name)
+    vertex_address = int(model.mesh_vertadr[mesh_id])
+    vertex_count = int(model.mesh_vertnum[mesh_id])
+    face_address = int(model.mesh_faceadr[mesh_id])
+    face_count = int(model.mesh_facenum[mesh_id])
+    vertices = model.mesh_vert[vertex_address : vertex_address + vertex_count]
+    faces = model.mesh_face[face_address : face_address + face_count]
+    lines = ["# RobotWorld MuJoCo-compiled visual mesh", f"o {mesh_name}"]
+    lines.extend(f"v {float(x):.9g} {float(y):.9g} {float(z):.9g}" for x, y, z in vertices)
+    lines.extend(f"f {int(a) + 1} {int(b) + 1} {int(c) + 1}" for a, b, c in faces)
+    return ("\n".join(lines) + "\n").encode("ascii")
+
+
+@app.get("/api/runtime/franka-compiled-meshes/{mesh_name}.obj")
+async def franka_compiled_visual_mesh(mesh_name: str):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", mesh_name):
+        raise HTTPException(404, "Franka visual mesh not found")
+    try:
+        content = await asyncio.to_thread(_franka_compiled_visual_obj, mesh_name)
+    except (KeyError, FileNotFoundError, ValueError) as exc:
+        raise HTTPException(404, "Franka visual mesh not found") from exc
+    return Response(
+        content=content,
+        media_type="text/plain",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 @app.get("/api/models/{model_id}")
@@ -2250,6 +3732,25 @@ async def model_franka_bridge_status(model_id: str, robot_id: str):
         return await vla_bridge.bridge_status(model_id, robot_id)
     except KeyError as exc:
         raise HTTPException(404, "Model or robot registration not found.") from exc
+
+
+@app.post("/api/models/{model_id}/bridges/franka/{robot_id}/zero-shot", status_code=201)
+async def attach_model_franka_zero_shot_bridge(
+    model_id: str,
+    robot_id: str,
+    payload: VlaFrankaZeroShotBridgeRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await vla_bridge.attach_zero_shot_bridge(
+            model_id,
+            robot_id,
+            camera_mapping=payload.camera_mapping,
+            policy_control_hz=payload.policy_control_hz,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except (KeyError, ValueError, command_store.CommandConflict) as exc:
+        raise _registry_http_error(exc) from exc
 
 
 @app.get("/api/models/{model_id}/worker-probe")
@@ -2553,6 +4054,11 @@ async def training_data():
     if runs:
         latest = runs[0]
         comparison = [{"task": latest.name, "icon": "fridge", "baseline": latest.success_before or 0.0, "candidate": latest.success_after or 0.0}]
+    datasets, canonical_runs, policy_decisions = await asyncio.gather(
+        lerobot_dataset.list_datasets(20),
+        lerobot_training.list_runs(20),
+        policy_lifecycle.list_decisions(20),
+    )
     return {
         "stats": stats,
         "runs": [await catalog.training_run_out(row) for row in runs],
@@ -2560,12 +4066,109 @@ async def training_data():
         "successCurve": {"measured": successes},
         "collisionCurve": {"measured": collisions},
         "agentDecision": ({"title": decision.title, "decision": decision.decision, "evidence": decision.evidence, "nextStep": decision.next_step, "confidence": decision.confidence} if decision else None),
+        "datasets": datasets,
+        "canonicalRuns": canonical_runs,
+        "policyDecisions": policy_decisions,
     }
 
 
 @app.post("/api/training/runs", status_code=202)
 async def queue_training():
     raise HTTPException(409, "Training is disabled. Configure a pinned external VLA and run policy evaluation; RobotWorld will not train on this workstation.")
+
+
+@app.post("/api/training/runs/preflight", status_code=201)
+async def validate_vla_jepa_training_run(
+    payload: VlaJepaFineTuneValidationRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await lerobot_training.validate_candidate(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Dataset or base model was not found.") from exc
+    except command_store.CommandConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (lerobot_training.TrainingPreflightError, FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/training/runs/execute", status_code=202)
+async def execute_vla_jepa_training_run(
+    payload: VlaJepaFineTuneExecuteRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await lerobot_training.execute_candidate(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Training run was not found.") from exc
+    except command_store.CommandConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (lerobot_training.TrainingPreflightError, FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/training/policy-decisions")
+async def policy_candidate_decisions(limit: int = Query(default=100, ge=1, le=500)):
+    return {"policyDecisions": await policy_lifecycle.list_decisions(limit)}
+
+
+@app.post("/api/training/policy-decisions", status_code=201)
+async def decide_policy_candidate(
+    payload: PolicyCandidateDecisionRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await policy_lifecycle.decide(payload, idempotency_key=_idempotency_key(idempotency_key))
+    except KeyError as exc:
+        raise HTTPException(404, "Training run, model, or evaluation was not found.") from exc
+    except command_store.CommandConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (policy_lifecycle.PolicyLifecycleError, OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/training/policy-decisions/rollback", status_code=200)
+async def rollback_policy_candidate(
+    payload: PolicyCandidateRollbackRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await policy_lifecycle.rollback(payload, idempotency_key=_idempotency_key(idempotency_key))
+    except KeyError as exc:
+        raise HTTPException(404, "Policy decision or model was not found.") from exc
+    except command_store.CommandConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (policy_lifecycle.PolicyLifecycleError, OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/training/datasets")
+async def lerobot_datasets_list(limit: int = Query(default=100, ge=1, le=500)):
+    return {"datasets": await lerobot_dataset.list_datasets(limit)}
+
+
+@app.post("/api/training/datasets/from-evaluation", status_code=201)
+async def lerobot_dataset_export(
+    payload: LeRobotDatasetExportRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    try:
+        return await lerobot_dataset.export_evaluation(
+            payload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Evaluation not found.") from exc
+    except command_store.CommandConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (lerobot_dataset.DatasetExportError, FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 async def _obs_stats() -> list[dict[str, Any]]:
@@ -2707,17 +4310,21 @@ async def record_frontend_error(payload: FrontendErrorIn):
 
 @app.get("/api/diagnostics/runtime")
 async def runtime_diagnostics():
-    """Real recent failures for the in-editor Diagnostics shelf."""
+    """Failures emitted by this backend process, excluding historical rows."""
     async with SessionLocal() as session:
         rows = (await session.execute(
             select(LogLine)
-            .where(LogLine.level.in_(["ERROR", "WARN"]))
+            .where(
+                LogLine.level.in_(["ERROR", "WARN"]),
+                LogLine.time_ms >= STARTED_AT_WALL_MS,
+            )
             .order_by(LogLine.time_ms.desc())
             .limit(100)
         )).scalars().all()
     return {
         "status": "degraded" if any(row.level == "ERROR" for row in rows[:10]) else "healthy",
         "uptimeSeconds": round(time.monotonic() - STARTED_AT, 1),
+        "sinceTimeMs": STARTED_AT_WALL_MS,
         "events": [{
             "time": datetime.fromtimestamp(row.time_ms / 1000).strftime("%H:%M:%S.%f")[:-3],
             "level": row.level,
@@ -2751,6 +4358,10 @@ async def put_settings(section: str, patch: dict[str, Any]):
         updated = await settings_store.put_section(section, patch)
     except KeyError as exc:
         raise HTTPException(422, str(exc)) from exc
+    if section == "integrations":
+        signoz_settings = dict((updated.get("integrations") or {}).get("signoz") or {})
+        if signoz_settings.get("enabled") and signoz_settings.get("endpoint"):
+            await configure_signoz(str(signoz_settings["endpoint"]))
     return updated
 
 
@@ -2787,6 +4398,8 @@ async def sync_port_catalog():
 
 @app.post("/api/eval/sessions", status_code=201)
 async def create_eval_session(payload: EvalSessionIn = EvalSessionIn()):
+    if not LEGACY_SIMCORE_ENABLED:
+        raise HTTPException(410, "Legacy refrigerator preview is disabled. Use /api/worlds/live-sessions for authoritative Panda physics.")
     policy_config = None
     if payload.evaluationType == "policy_evaluation":
         try:
@@ -2911,6 +4524,8 @@ async def render_vulkan_frame(
 
 @app.get("/api/eval/sessions/{session_id}/replay")
 async def eval_replay(session_id: str):
+    if not LEGACY_SIMCORE_ENABLED:
+        raise HTTPException(410, "Legacy refrigerator preview is disabled. Use the durable Worlds evaluation catalog.")
     session = live.get(session_id)
     if session is None:
         raise HTTPException(404, "Evaluation session not found")
@@ -2932,39 +4547,73 @@ async def event_socket(websocket: WebSocket):
 
 @app.websocket("/ws/live/{session_id}")
 async def live_socket(websocket: WebSocket, session_id: str):
+    if not LEGACY_SIMCORE_ENABLED:
+        await websocket.close(code=4403, reason="legacy preview disabled; use /ws/worlds/live")
+        return
     session = live.get(session_id)
     if session is None:
         await websocket.close(code=4404, reason="session not found")
         return
     await websocket.accept()
     runner = asyncio.create_task(live.run(session), name=f"live-{session_id}")
-
-    async def sender():
-        while True:
-            message = await session.queue.get()
-            await websocket.send_json(message)
-            if message.get("type") == "end":
-                return
-
-    async def receiver():
-        while True:
-            message = await websocket.receive_json()
-            if message.get("type") == "control":
-                live.control(session, str(message.get("action")), message.get("value"))
-
-    send_task = asyncio.create_task(sender())
-    recv_task = asyncio.create_task(receiver())
+    queue_task = asyncio.create_task(session.queue.get())
+    receive_task = asyncio.create_task(websocket.receive_json())
     try:
-        done, pending = await asyncio.wait({send_task, recv_task}, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        await asyncio.gather(*done, return_exceptions=True)
+        while True:
+            done, _ = await asyncio.wait({queue_task, receive_task}, return_when=asyncio.FIRST_COMPLETED)
+            if receive_task in done:
+                message = receive_task.result()
+                if message.get("type") == "control":
+                    action = str(message.get("action"))
+                    live.control(session, action, message.get("value"))
+                    if action in {"stop", "end"}:
+                        while not session.queue.empty():
+                            try:
+                                session.queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                receive_task = asyncio.create_task(websocket.receive_json())
+            if queue_task in done:
+                message = queue_task.result()
+                await websocket.send_json(message)
+                if message.get("type") == "end":
+                    break
+                queue_task = asyncio.create_task(session.queue.get())
     except WebSocketDisconnect:
         session.stop.set()
     finally:
+        for task in (queue_task, receive_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(queue_task, receive_task, return_exceptions=True)
         if not runner.done() and session.stop.is_set():
             await runner
+
+
+@app.websocket("/ws/worlds/live/{session_id}")
+async def franka_live_socket(websocket: WebSocket, session_id: str):
+    """Stream sampled camera/state evidence from the authoritative MuJoCo run."""
+
+    session = franka_live.get(session_id)
+    if session is None:
+        await websocket.close(code=4404, reason="live Franka session not found")
+        return
+    await websocket.accept()
+    await websocket.send_json({"type": "meta", "session": franka_live.info(session)})
+    if session.latest_frame is not None:
+        await websocket.send_json(session.latest_frame)
+    if session.mode == "oracle" and session.task is None:
+        session.task = asyncio.create_task(franka_live.run(session), name=f"franka-live-{session_id}")
+    try:
+        while True:
+            message = await session.queue.get()
+            await websocket.send_json(message)
+            if message.get("type") in {"end", "error"}:
+                return
+    except WebSocketDisconnect:
+        # The persisted evaluation continues when a viewer refreshes. A new
+        # client can reconnect and receive the latest authoritative frame.
+        return
 
 
 # Production web/Electron topology: the API serves the built renderer from the

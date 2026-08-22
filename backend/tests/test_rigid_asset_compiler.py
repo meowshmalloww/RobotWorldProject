@@ -8,14 +8,16 @@ import time
 from pathlib import Path
 
 import pytest
+import numpy as np
 import trimesh
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from app.config import ASSETS_DIR, DATA_DIR
 from app.db import SessionLocal
 from app.main import app
 from app.models import ModelRegistrationRecord
-from app.services import control_catalog, franka_pick_place, franka_vla_evaluation, vla_bridge, vla_policy_worker
+from app.services import control_catalog, franka_pick_place, franka_vla_evaluation, usda, vla_bridge, vla_policy_worker
 
 
 def _source_glb(name: str = "compiled-source", extents: tuple[float, float, float] = (0.20, 0.40, 0.10)) -> Path:
@@ -26,6 +28,32 @@ def _source_glb(name: str = "compiled-source", extents: tuple[float, float, floa
     mesh = trimesh.creation.box(extents=extents)
     path.write_bytes(mesh.export(file_type="glb"))
     assert path.read_bytes()[:4] == b"glTF"
+    return path
+
+
+def _pbr_source_glb(
+    name: str,
+    color: tuple[int, int, int, int],
+    extents: tuple[float, float, float] = (0.20, 0.40, 0.10),
+) -> Path:
+    root = ASSETS_DIR / "compiler-test-inputs"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{name}.glb"
+    mesh = trimesh.creation.box(extents=extents)
+    uv = np.column_stack(
+        (
+            np.linspace(0.0, 1.0, len(mesh.vertices), dtype=np.float32),
+            np.linspace(1.0, 0.0, len(mesh.vertices), dtype=np.float32),
+        )
+    )
+    mesh.visual = trimesh.visual.TextureVisuals(
+        uv=uv,
+        material=trimesh.visual.material.PBRMaterial(
+            baseColorTexture=Image.new("RGBA", (8, 8), color),
+            metallicRoughnessTexture=Image.new("RGB", (8, 8), (255, 128, 64)),
+        ),
+    )
+    path.write_bytes(mesh.export(file_type="glb"))
     return path
 
 
@@ -50,6 +78,113 @@ def _payload(path: Path, *, dimensions: list[float] | None = None, source_asset_
         "licenseMetadata": {"source": "generated in test", "license": "CC0", "redistribution": "allowed"},
         "maxAspectResidual": 0.05,
     }
+
+
+def test_openusd_visual_preserves_trellis_pbr_channels() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        mesh = trimesh.creation.box(extents=(0.2, 0.3, 0.1))
+        uv = np.column_stack(
+            (
+                np.linspace(0.0, 1.0, len(mesh.vertices), dtype=np.float32),
+                np.linspace(1.0, 0.0, len(mesh.vertices), dtype=np.float32),
+            )
+        )
+        base_color = Image.new("RGBA", (8, 8), (210, 80, 30, 255))
+        metallic_roughness = Image.new("RGB", (8, 8), (255, 128, 64))
+        material = trimesh.visual.material.PBRMaterial(
+            baseColorTexture=base_color,
+            metallicRoughnessTexture=metallic_roughness,
+            metallicFactor=0.25,
+            roughnessFactor=0.5,
+        )
+        mesh.visual = trimesh.visual.TextureVisuals(uv=uv, material=material)
+        source = root / "trellis-pbr.glb"
+        source.write_bytes(mesh.export(file_type="glb"))
+
+        usd_path, report = usda.write_visual_usdc(source, root / "visual.usdc")
+        assert usd_path.is_file()
+        assert {item["role"] for item in report["textures"]} == {"base_color", "metallic_roughness"}
+        assert (root / "basecolor.png").is_file()
+        assert (root / "metallic_roughness.png").is_file()
+        assert report["sourcePbrPreserved"] is True
+
+        from pxr import Usd, UsdShade
+
+        stage = Usd.Stage.Open(str(usd_path))
+        shader = UsdShade.Shader.Get(stage, "/Visual/GeneratedMaterial/PreviewSurface")
+        assert shader.GetInput("diffuseColor").HasConnectedSource()
+        assert shader.GetInput("roughness").HasConnectedSource()
+        assert shader.GetInput("metallic").HasConnectedSource()
+
+
+def test_openusd_visual_authors_selectable_appearance_variant_set() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        mesh = trimesh.creation.box(extents=(0.2, 0.3, 0.1))
+        uv = np.column_stack(
+            (
+                np.linspace(0.0, 1.0, len(mesh.vertices), dtype=np.float32),
+                np.linspace(1.0, 0.0, len(mesh.vertices), dtype=np.float32),
+            )
+        )
+
+        def write_appearance(path: Path, color: tuple[int, int, int, int]) -> None:
+            appearance = mesh.copy()
+            appearance.visual = trimesh.visual.TextureVisuals(
+                uv=uv.copy(),
+                material=trimesh.visual.material.PBRMaterial(
+                    baseColorTexture=Image.new("RGBA", (8, 8), color),
+                    metallicRoughnessTexture=Image.new("RGB", (8, 8), (255, 128, 64)),
+                    metallicFactor=0.25,
+                    roughnessFactor=0.5,
+                ),
+            )
+            path.write_bytes(appearance.export(file_type="glb"))
+
+        primary = root / "ripe.glb"
+        alternate = root / "green.glb"
+        write_appearance(primary, (235, 190, 20, 255))
+        write_appearance(alternate, (55, 160, 60, 255))
+
+        usd_path, report = usda.write_visual_usdc(
+            primary,
+            root / "visual.usdc",
+            appearance_variants=[
+                {"id": "green", "displayName": "Unripe green", "sourcePath": str(alternate)}
+            ],
+        )
+
+        from pxr import Usd, UsdShade
+
+        stage = Usd.Stage.Open(str(usd_path))
+        variant_set = stage.GetPrimAtPath("/Visual").GetVariantSet("appearance")
+        assert set(variant_set.GetVariantNames()) == {"generated", "green"}
+        assert variant_set.GetVariantSelection() == "generated"
+        assert report["defaultAppearanceVariantId"] == "generated"
+        assert {item["id"] for item in report["appearanceVariants"]} == {"generated", "green"}
+        assert (root / "green_base_color.png").is_file()
+
+        variant_set.SetVariantSelection("green")
+        bound, _ = UsdShade.MaterialBindingAPI(stage.GetPrimAtPath("/Visual/Mesh")).ComputeBoundMaterial()
+        assert str(bound.GetPath()) == "/Visual/AppearanceMaterials/green"
+
+
+def test_openusd_appearance_rejects_changed_geometry() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        primary = root / "primary.glb"
+        changed = root / "changed.glb"
+        primary.write_bytes(trimesh.creation.box(extents=(0.2, 0.3, 0.1)).export(file_type="glb"))
+        changed.write_bytes(trimesh.creation.box(extents=(0.25, 0.3, 0.1)).export(file_type="glb"))
+        with pytest.raises(RuntimeError, match="compile it as a new asset version"):
+            usda.write_visual_usdc(
+                primary,
+                root / "visual.usdc",
+                appearance_variants=[
+                    {"id": "changed", "displayName": "Changed", "sourcePath": str(changed)}
+                ],
+            )
 
 
 def test_rigid_compiler_authors_separate_physical_artifacts_and_runs_mujoco() -> None:
@@ -123,6 +258,41 @@ def test_rigid_compiler_authors_separate_physical_artifacts_and_runs_mujoco() ->
         assert detail.json()["assetVersion"]["manifestSha256"] == version["manifestSha256"]
         listed = client.get("/api/asset-versions")
         assert any(item["id"] == version["id"] for item in listed.json()["assetVersions"])
+
+
+def test_rigid_compiler_persists_and_serves_texture_only_appearance() -> None:
+    primary = _pbr_source_glb("appearance-primary", (235, 190, 20, 255))
+    alternate = _pbr_source_glb("appearance-green", (55, 160, 60, 255))
+    payload = _payload(primary, source_asset_id="compiler-appearance-box")
+    payload["appearanceVariants"] = [
+        {
+            "id": "green",
+            "displayName": "Unripe green",
+            "sourceGlbPath": str(alternate),
+            "expectedSourceSha256": hashlib.sha256(alternate.read_bytes()).hexdigest(),
+        }
+    ]
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/asset-versions/rigid",
+            headers={"Idempotency-Key": "compile-controlled-appearance-v1"},
+            json=payload,
+        )
+        assert response.status_code == 201, response.text
+        version = response.json()["result"]["assetVersion"]
+        manifest = version["manifest"]
+        assert manifest["defaultAppearanceVariantId"] == "generated"
+        assert {item["id"] for item in manifest["appearanceVariants"]} == {"generated", "green"}
+        green = next(item for item in manifest["appearanceVariants"] if item["id"] == "green")
+        assert green["geometryInvariant"] is True
+        assert green["openUsdVariantSet"] == "appearance"
+        assert {item["role"] for item in green["textures"]} == {"base_color", "metallic_roughness"}
+
+        selected = client.get(f"/api/asset-versions/{version['id']}/source.glb?appearance=green")
+        assert selected.status_code == 200
+        assert hashlib.sha256(selected.content).hexdigest() == hashlib.sha256(alternate.read_bytes()).hexdigest()
+        missing = client.get(f"/api/asset-versions/{version['id']}/source.glb?appearance=missing")
+        assert missing.status_code == 404
 
 
 def test_rigid_compiler_rejects_nonuniform_shape_without_stretching() -> None:
@@ -261,6 +431,7 @@ def test_compiler_asset_runs_real_franka_contact_lift_and_place_oracle(monkeypat
         assert arguments["state"] is None
         return {
             "normalizedAction": [0.0] * 7,
+            "checkpointAction": [0.0] * 6 + [1.0],
             "inferenceDurationSeconds": 0.001,
             "checkpointConfigSha256": "b" * 64,
         }
@@ -282,6 +453,7 @@ def test_compiler_asset_runs_real_franka_contact_lift_and_place_oracle(monkeypat
     bridge = {
         "executable": True,
         "blockers": [],
+        "adapterRevision": vla_bridge.DROID_ADAPTER_REVISION,
         "observationContract": {
             "cameraMapping": {
                 "observation.images.exterior_1_left": "front",
@@ -289,7 +461,10 @@ def test_compiler_asset_runs_real_franka_contact_lift_and_place_oracle(monkeypat
             },
             "stateRequired": False,
         },
-        "actionContract": {"policyControlHz": 50},
+        "actionContract": {
+            "policyControlHz": 50,
+            "checkpointRepresentation": "droid_base_cartesian_velocity",
+        },
     }
     vla_result, vla_world = franka_vla_evaluation.run_compiled_asset_policy(
         robot_id=robot_id,
@@ -309,7 +484,7 @@ def test_compiler_asset_runs_real_franka_contact_lift_and_place_oracle(monkeypat
     assert len(inference_calls) == 2
     assert all(item["finite"] for item in vla_result["trajectory"])
     assert all(item["normalizedAction"] == [0.0] * 7 for item in vla_result["trajectory"])
-    assert all(item["controller"]["translationFrame"] == "end_effector_local" for item in vla_result["trajectory"])
+    assert all(item["controller"]["translationFrame"] == "robot_base" for item in vla_result["trajectory"])
     assert set(vla_result["frameHashes"]) == {"reset", "step_0000", "final"}
     assert set(vla_result["frameHashes"]["reset"]) == {"front", "wrist"}
     assert vla_result["policy"] == "vla-jepa:vla-integration-fixture:r1"
@@ -327,7 +502,7 @@ def test_compiler_asset_runs_real_franka_contact_lift_and_place_oracle(monkeypat
     persisted_vla = json.loads(evaluation_artifact.read_text(encoding="utf8"))
     assert persisted_vla["failureCode"] == "grasp_miss"
     assert persisted_vla["predicate"]["normalizationRevision"] == "c" * 64
-    assert persisted_vla["predicate"]["adapterRevision"] == vla_bridge.ADAPTER_REVISION
+    assert persisted_vla["predicate"]["adapterRevision"] == vla_bridge.DROID_ADAPTER_REVISION
 
     robot_definition_sha256 = hashlib.sha256(
         json.dumps(robot_view["definition"], sort_keys=True, separators=(",", ":")).encode("utf8")
@@ -671,7 +846,11 @@ def test_compiler_asset_runs_real_franka_contact_lift_and_place_oracle(monkeypat
         }
 
         def wait_for_autonomous_terminal(run_id: str) -> dict:
-            deadline = time.monotonic() + 20
+            # This exercises real MuJoCo rendering plus the persisted oracle
+            # and VLA phases on Windows. Keep a bounded but production-realistic
+            # ceiling; 20 seconds is shorter than one valid oracle+VLA cycle on
+            # the supported laptop GPU/GL stack.
+            deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
                 current = client.get(f"/api/autonomous-runs/{run_id}")
                 assert current.status_code == 200, current.text

@@ -12,6 +12,7 @@ from app.main import app
 from app.models import (
     CommandExecution,
     AutonomousCurriculumRunRecord,
+    CoverageObservationRecord,
     EvaluationRunRecord,
     ModelRegistrationRecord,
     RobotRegistrationRecord,
@@ -59,6 +60,60 @@ def test_autonomous_run_requires_explicit_executable_budgets_and_model_binding()
     )
     assert request.budgets.max_scrape_requests == 0
     assert request.budgets.max_gpu_minutes == 0
+
+
+def test_autonomous_planner_translates_incremental_episode_budget_to_absolute_ceiling() -> None:
+    assert autonomous_curriculum._planner_episode_ceiling(7, 2, 0) == 9
+    assert autonomous_curriculum._planner_episode_ceiling(7, 2, 1) == 8
+    assert autonomous_curriculum._planner_episode_ceiling(7, 2, 2) == 7
+
+
+def test_curriculum_index_skips_already_projected_terminal_evaluations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        evaluation = EvaluationRunRecord(
+            id="eval_index_skip_fixture",
+            status="SUCCEEDED",
+            robot_id="robot_index_skip_fixture",
+            world_template_id="world_index_skip_fixture",
+            policy="deterministic_oracle",
+            seed=1,
+            success=True,
+            result={"predicate": {}, "trajectory": []},
+        )
+        async with SessionLocal() as session:
+            session.add(evaluation)
+            session.add(
+                CoverageObservationRecord(
+                    id="coverage_index_skip_fixture",
+                    evaluation_id=evaluation.id,
+                    scenario_fingerprint="d" * 64,
+                    taxonomy_revision=curriculum_catalog.TAXONOMY_REVISION,
+                    task_family="pick_place",
+                    robot_id=evaluation.robot_id,
+                    model_id=None,
+                    asset_version_id=None,
+                    policy=evaluation.policy,
+                    seed=evaluation.seed,
+                    success=True,
+                    dimensions={},
+                )
+            )
+            await session.commit()
+            session.expunge(evaluation)
+
+        async def unexpected(*_args, **_kwargs):
+            raise AssertionError("already-indexed evaluation was recomputed")
+
+        monkeypatch.setattr(curriculum_catalog, "_coverage_dimensions", unexpected)
+        monkeypatch.setattr(curriculum_catalog, "_classify", unexpected)
+        await curriculum_catalog._index_terminal_evaluations(
+            [evaluation], actor="index-test", command_id="cmd_index_skip_fixture"
+        )
+
+    with TestClient(app):
+        asyncio.run(exercise())
 
 
 def test_autonomous_kill_switch_cancels_queued_run_without_work() -> None:
@@ -226,6 +281,27 @@ def test_scenario_validator_rejects_physical_shape_changes_during_asset_reuse() 
     assert curriculum_catalog._scenario_validation_errors(
         {**base, "variationDimensions": ["baseline_policy_evaluation"]}
     ) == []
+
+
+def test_scenario_oracle_nested_retry_keys_change_with_parent_attempt() -> None:
+    scenario_fingerprint = "a" * 64
+    first = "scenario-oracle:" + curriculum_catalog.command_store.payload_hash(
+        {
+            "parentIdempotencyKey": "autonomous:run:oracle:attempt:0",
+            "scenarioFingerprint": scenario_fingerprint,
+            "executionId": None,
+        }
+    )
+    retry = "scenario-oracle:" + curriculum_catalog.command_store.payload_hash(
+        {
+            "parentIdempotencyKey": "autonomous:run:oracle:attempt:1",
+            "scenarioFingerprint": scenario_fingerprint,
+            "executionId": None,
+        }
+    )
+
+    assert first != retry
+    assert len(first) == len("scenario-oracle:") + 64
 
 
 def test_failure_classifier_derives_only_from_structured_terminal_signals() -> None:

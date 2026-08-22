@@ -7,9 +7,10 @@ shared by humans and autonomous tools.
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -162,6 +163,33 @@ class ModelRegistrationCreate(ContractModel):
 
 class ModelValidationRequest(ContractModel):
     compute_content_hash: bool = False
+
+
+class VlaFrankaZeroShotBridgeRequest(ContractModel):
+    camera_mapping: dict[str, str] = Field(
+        json_schema_extra={
+            "examples": [
+                {
+                    "observation.images.exterior_1_left": "front",
+                    "observation.images.exterior_2_left": "wrist",
+                }
+            ]
+        }
+    )
+    policy_control_hz: int = Field(default=10, ge=1, le=100)
+    acknowledge_zero_shot_risk: bool
+
+    @model_validator(mode="after")
+    def validate_bridge(self) -> "VlaFrankaZeroShotBridgeRequest":
+        expected_keys = {
+            "observation.images.exterior_1_left",
+            "observation.images.exterior_2_left",
+        }
+        if set(self.camera_mapping) != expected_keys or set(self.camera_mapping.values()) != {"front", "wrist"}:
+            raise ValueError("cameraMapping must bind the checkpoint's exact two image keys one-to-one to front and wrist")
+        if not self.acknowledge_zero_shot_risk:
+            raise ValueError("acknowledgeZeroShotRisk must be true for an uncalibrated checkpoint/embodiment bridge")
+        return self
 
 
 class ModelRegistrationView(ContractModel):
@@ -325,6 +353,7 @@ class PlacementRequest(ContractModel):
 class CompiledAssetOracleRequest(OracleEvaluationRequest):
     asset_version_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     placement_request: PlacementRequest | None = None
+    record_observations: bool = False
 
 
 class CompiledAssetVlaEvaluationRequest(CompiledAssetOracleRequest):
@@ -333,8 +362,127 @@ class CompiledAssetVlaEvaluationRequest(CompiledAssetOracleRequest):
     max_policy_steps: int = Field(default=150, ge=1, le=1000)
 
 
+class WorldOperateRequest(ContractModel):
+    """One typed command surface for the compact World operator.
+
+    The instruction is human/agent context; task, controller, and backend are
+    explicit so free text can never silently select a destructive runtime.
+    """
+
+    schema_version: str = "robotworld.world-operate-request.v1"
+    robot_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    instruction: str = Field(min_length=2, max_length=1000)
+    backend: Literal["mujoco", "isaac_sim"] = "mujoco"
+    controller: Literal["oracle", "vla_jepa", "agent"] = "oracle"
+    task: Literal["pick_place", "drop_off_table", "open_drawer"] = "pick_place"
+    asset_version_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    model_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    seed: int = Field(default=6203, ge=0, le=2**31 - 1)
+    max_policy_steps: int = Field(default=150, ge=1, le=1000)
+    execution_scope: Literal["validation_bench", "active_world"] = "validation_bench"
+    world_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+
+    @model_validator(mode="after")
+    def supported_execution_contract(self) -> "WorldOperateRequest":
+        if self.backend == "isaac_sim" and (self.task != "pick_place" or self.controller != "oracle"):
+            raise ValueError("Isaac Sim currently supports the bounded Franka pick/place oracle only")
+        if self.task == "open_drawer" and self.controller != "oracle":
+            raise ValueError("The validated drawer task currently supports its deterministic oracle only")
+        if self.task == "drop_off_table":
+            if self.backend != "mujoco" or self.controller != "oracle":
+                raise ValueError("Drop-off-table currently requires the deterministic MuJoCo Franka oracle")
+            if self.execution_scope != "active_world":
+                raise ValueError("Drop-off-table requires an active authored world with a measured support surface")
+        if self.controller in {"vla_jepa", "agent"} and not self.model_id:
+            raise ValueError(f"{self.controller} requires a selected modelId")
+        if self.execution_scope == "validation_bench" and self.controller in {"vla_jepa", "agent"} and not self.asset_version_id:
+            raise ValueError(f"{self.controller} requires an ORACLE_VALIDATED assetVersionId")
+        if self.execution_scope == "active_world" and not self.world_id:
+            raise ValueError("active_world execution requires the selected worldId")
+        normalized = " ".join(self.instruction.lower().replace("-", " ").split())
+        if self.task == "pick_place":
+            unsupported = {
+                "throw": "throw/toss",
+                "toss": "throw/toss",
+                "off the table": "remove from table",
+                "outside the target": "place outside target",
+                "outside of the target": "place outside target",
+                "outside target": "place outside target",
+                "stack": "stack",
+                "push": "push",
+                "sort": "sort",
+            }
+            requested = next((label for token, label in unsupported.items() if token in normalized), None)
+            if requested:
+                raise ValueError(
+                    f"Instruction requests {requested}, but the selected task contract is pick/place into the target. "
+                    "No simulation was started. Select an implemented task contract; free text cannot change the oracle predicate."
+                )
+        elif self.task == "drop_off_table":
+            if not any(token in normalized for token in ("off the table", "off table", "drop", "throw", "toss")):
+                raise ValueError(
+                    "The drop-off-table contract requires an explicit drop/throw/off-table instruction. "
+                    "No simulation was started."
+                )
+        return self
+
+
 class EvaluationAnalysisRequest(ContractModel):
     evaluation_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+
+
+class LeRobotDatasetExportRequest(ContractModel):
+    schema_version: str = "robotworld.lerobot-dataset-export-request.v1"
+    evaluation_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    instruction: str = Field(default="Pick up the object and place it in the target.", min_length=2, max_length=1000)
+    fps: int = Field(default=10, ge=1, le=50)
+
+
+class VlaJepaFineTuneValidationRequest(ContractModel):
+    schema_version: str = "robotworld.vla-jepa-finetune-validation-request.v1"
+    dataset_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    base_model_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    steps: int = Field(default=1000, ge=1, le=100_000)
+    batch_size: int = Field(default=1, ge=1, le=8)
+    seed: int = Field(default=6203, ge=0, le=2**31 - 1)
+    freeze_qwen: bool = True
+    enable_world_model: bool = False
+
+
+class VlaJepaFineTuneExecuteRequest(ContractModel):
+    schema_version: str = "robotworld.vla-jepa-finetune-execute-request.v1"
+    run_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    acknowledge_candidate_only: Literal[True]
+
+
+class PolicyCandidateDecisionValue(StrEnum):
+    PROMOTE = "PROMOTE"
+    REJECT = "REJECT"
+
+
+class PolicyCandidateDecisionRequest(ContractModel):
+    schema_version: str = "robotworld.policy-candidate-decision.v1"
+    training_run_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    candidate_model_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    previous_model_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    decision: PolicyCandidateDecisionValue
+    evaluation_ids: list[str] = Field(min_length=1, max_length=50)
+    reason: str = Field(min_length=3, max_length=2000)
+
+    @field_validator("evaluation_ids")
+    @classmethod
+    def unique_evaluation_ids(cls, value: list[str]) -> list[str]:
+        if any(not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", item) for item in value):
+            raise ValueError("evaluationIds contain an invalid identifier")
+        if len(set(value)) != len(value):
+            raise ValueError("evaluationIds must be unique")
+        return value
+
+
+class PolicyCandidateRollbackRequest(ContractModel):
+    schema_version: str = "robotworld.policy-candidate-rollback.v1"
+    decision_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    reason: str = Field(min_length=3, max_length=2000)
 
 
 class ScenarioTargetToolInput(ContractModel):
@@ -441,6 +589,7 @@ class EvaluationResultContract(ContractModel):
     duration_seconds: float = Field(ge=0)
     physics_hz: int = Field(gt=0)
     control_hz: int = Field(gt=0)
+    action_contract: dict[str, Any] = Field(default_factory=dict)
     phases: list[dict[str, Any]]
     trajectory: list[dict[str, Any]]
     contact_summary: dict[str, Any]
@@ -490,7 +639,25 @@ class AuditListToolInput(ContractModel):
     limit: int = Field(default=50, ge=1, le=200)
 
 
+class SigNozTraceSearchToolInput(ContractModel):
+    minutes: int = Field(default=60, ge=1, le=10080)
+    filter_expression: str = Field(default="", max_length=1000)
+    limit: int = Field(default=50, ge=1, le=100)
+
+
+class SigNozMetricQueryToolInput(ContractModel):
+    metric: str = Field(min_length=1, max_length=240, pattern=r"^[A-Za-z_:][A-Za-z0-9_.:-]*$")
+    minutes: int = Field(default=60, ge=1, le=10080)
+    step_seconds: int = Field(default=60, ge=1, le=86400)
+    aggregation: Literal["avg", "sum", "min", "max", "count", "p50", "p90", "p95", "p99"] = "avg"
+
+
 class VlaBridgeStatusToolInput(ContractModel):
+    model_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    robot_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+
+
+class VlaFrankaZeroShotBridgeToolInput(VlaFrankaZeroShotBridgeRequest):
     model_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     robot_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
 
@@ -809,6 +976,20 @@ class ArtifactReference(ContractModel):
     immutable: bool = True
 
 
+class AssetAppearanceVariantSource(ContractModel):
+    """A texture/material alternative for exactly the same visual topology.
+
+    Different geometry must be compiled as a new immutable asset version.  A
+    compiler-side topology/UV check prevents a second TRELLIS generation from
+    being mislabeled as a harmless appearance change.
+    """
+
+    id: str = Field(min_length=1, max_length=48, pattern=r"^[A-Za-z][A-Za-z0-9_-]*$")
+    display_name: str = Field(min_length=1, max_length=120)
+    source_glb_path: str = Field(min_length=1, max_length=1200)
+    expected_source_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
 class RigidAssetCompileRequest(ContractModel):
     schema_version: str = "robotworld.rigid-asset-compile-request.v1"
     display_name: str = Field(min_length=2, max_length=200)
@@ -830,6 +1011,7 @@ class RigidAssetCompileRequest(ContractModel):
     restitution_range: tuple[float, float] = (0.0, 0.1)
     semantics: list[str] = Field(default_factory=list, max_length=30)
     affordances: list[str] = Field(default_factory=list, max_length=30)
+    appearance_variants: list[AssetAppearanceVariantSource] = Field(default_factory=list, max_length=12)
     license_metadata: dict[str, Any] = Field(default_factory=dict)
     max_aspect_residual: float = Field(default=0.20, gt=0, le=0.50)
     max_visual_triangles: int = Field(default=1_000_000, ge=1000, le=5_000_000)
@@ -863,6 +1045,18 @@ class RigidAssetCompileRequest(ContractModel):
             raise ValueError("semantic and affordance labels must be unique")
         return cleaned
 
+    @field_validator("appearance_variants")
+    @classmethod
+    def unique_appearance_variants(
+        cls, value: list[AssetAppearanceVariantSource]
+    ) -> list[AssetAppearanceVariantSource]:
+        ids = [item.id for item in value]
+        if "generated" in {item.lower() for item in ids}:
+            raise ValueError("appearance variant id 'generated' is reserved for the primary source")
+        if len(ids) != len(set(ids)):
+            raise ValueError("appearance variant ids must be unique")
+        return value
+
 
 class AssetManifest(ContractModel):
     schema_version: str = "robotworld.asset-manifest.v1"
@@ -885,6 +1079,8 @@ class AssetManifest(ContractModel):
     center_of_mass_m: tuple[float, float, float]
     inertia_kg_m2: tuple[float, float, float, float, float, float]
     material: dict[str, Any]
+    appearance_variants: list[dict[str, Any]] = Field(default_factory=list)
+    default_appearance_variant_id: str = "generated"
     semantics: list[str]
     affordances: list[str]
     evidence_bundle_id: str | None = None
@@ -895,6 +1091,130 @@ class AssetManifest(ContractModel):
     manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     created_by: str
     created_at: datetime
+
+
+class GraspFrame(ContractModel):
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z][A-Za-z0-9._-]*$")
+    parent_part_id: str
+    translation_m: tuple[float, float, float]
+    quaternion_wxyz: tuple[float, float, float, float]
+    approach_axis: tuple[float, float, float]
+    jaw_axis: tuple[float, float, float]
+    required_width_m: float = Field(gt=0, le=0.5)
+
+
+class Affordance(ContractModel):
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z][A-Za-z0-9._-]*$")
+    semantic: str = Field(min_length=1, max_length=120)
+    parent_part_id: str
+    action: str = Field(min_length=1, max_length=120)
+    grasp_frames: list[GraspFrame] = Field(default_factory=list)
+    confidence: float = Field(ge=0, le=1)
+    evidence: list[str] = Field(default_factory=list)
+
+
+class PartSpec(ContractModel):
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z][A-Za-z0-9._-]*$")
+    semantic_label: str = Field(min_length=1, max_length=120)
+    parent_part_id: str | None = None
+    visual_artifacts: list[str] = Field(default_factory=list)
+    collision_artifacts: list[str] = Field(default_factory=list)
+    mass_kg: float = Field(gt=0)
+    center_of_mass_m: tuple[float, float, float]
+    inertia_kg_m2: tuple[float, float, float, float, float, float] | None = None
+    confidence: float = Field(ge=0, le=1)
+    evidence: list[str] = Field(default_factory=list)
+
+
+class PartJointSpec(ContractModel):
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z][A-Za-z0-9._-]*$")
+    joint_type: str = Field(pattern=r"^(fixed|revolute|prismatic)$")
+    parent_part_id: str
+    child_part_id: str
+    axis: tuple[float, float, float]
+    origin_xyz_m: tuple[float, float, float]
+    lower: float
+    upper: float
+    damping: float = Field(ge=0)
+    friction: float = Field(ge=0)
+    confidence: float = Field(ge=0, le=1)
+    evidence: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def valid_joint(self) -> "PartJointSpec":
+        if self.parent_part_id == self.child_part_id:
+            raise ValueError("part joint parent and child must differ")
+        norm = math.sqrt(sum(value * value for value in self.axis))
+        if not math.isfinite(norm) or abs(norm - 1.0) > 1e-4:
+            raise ValueError("part joint axis must be a finite unit vector")
+        if self.lower > self.upper:
+            raise ValueError("part joint lower limit must not exceed upper limit")
+        if self.joint_type == "fixed" and (self.lower != 0 or self.upper != 0):
+            raise ValueError("fixed part joints must have zero limits")
+        return self
+
+
+class PartGraph(ContractModel):
+    schema_version: str = "robotworld.part-graph.v1"
+    id: str
+    revision: int = Field(ge=1)
+    asset_id: str
+    root_part_id: str
+    coordinate_convention: dict[str, Any]
+    parts: list[PartSpec] = Field(min_length=1)
+    joints: list[PartJointSpec] = Field(default_factory=list)
+    affordances: list[Affordance] = Field(default_factory=list)
+    lifecycle_state: str
+    validation_errors: list[str] = Field(default_factory=list)
+    review_reason: str | None = None
+    graph_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    created_by: str
+    source: str
+    created_at: datetime
+
+    @model_validator(mode="after")
+    def valid_graph(self) -> "PartGraph":
+        part_ids = [part.id for part in self.parts]
+        if len(part_ids) != len(set(part_ids)):
+            raise ValueError("part ids must be unique")
+        known = set(part_ids)
+        if self.root_part_id not in known:
+            raise ValueError("rootPartId must identify a part")
+        if next(part for part in self.parts if part.id == self.root_part_id).parent_part_id is not None:
+            raise ValueError("root part must not have a parent")
+        for part in self.parts:
+            if part.parent_part_id is not None and part.parent_part_id not in known:
+                raise ValueError(f"part '{part.id}' references an unknown parent")
+        parent_by_id = {part.id: part.parent_part_id for part in self.parts}
+        for part_id in known:
+            visited: set[str] = set()
+            current: str | None = part_id
+            while current is not None:
+                if current in visited:
+                    raise ValueError("part hierarchy must be acyclic")
+                visited.add(current)
+                current = parent_by_id[current]
+            if self.root_part_id not in visited:
+                raise ValueError(f"part '{part_id}' is not connected to the root")
+        joint_ids = [joint.id for joint in self.joints]
+        if len(joint_ids) != len(set(joint_ids)):
+            raise ValueError("part joint ids must be unique")
+        for joint in self.joints:
+            if joint.parent_part_id not in known or joint.child_part_id not in known:
+                raise ValueError(f"joint '{joint.id}' references an unknown part")
+            child = next(part for part in self.parts if part.id == joint.child_part_id)
+            if child.parent_part_id != joint.parent_part_id:
+                raise ValueError(f"joint '{joint.id}' disagrees with the part hierarchy")
+        expected_joint_children = known - {self.root_part_id}
+        joint_children = [joint.child_part_id for joint in self.joints]
+        if len(joint_children) != len(set(joint_children)) or set(joint_children) != expected_joint_children:
+            raise ValueError("every non-root part must have exactly one incoming joint")
+        for affordance in self.affordances:
+            if affordance.parent_part_id not in known:
+                raise ValueError(f"affordance '{affordance.id}' references an unknown part")
+            if any(frame.parent_part_id != affordance.parent_part_id for frame in affordance.grasp_frames):
+                raise ValueError(f"affordance '{affordance.id}' has a grasp frame on another part")
+        return self
 
 
 class AssetVersionTargetToolInput(ContractModel):

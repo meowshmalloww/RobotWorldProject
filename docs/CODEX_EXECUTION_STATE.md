@@ -4,294 +4,544 @@ Last updated: 2026-08-21 (America/Los_Angeles)
 
 ## Resume point
 
-- Branch/HEAD: `master` at pre-Codex commit `7d65e354425936e9bab880fefd3654c21dc3aff6` (`v0.0.6`). All Codex changes are unstaged. Preserve them and all unrelated user work; do not blanket-stage.
-- Current executable slice: API-backed Models, Robots & Embodiments, Simulation & Evaluation, Evidence, Scraper Repair, Failure Analysis, and Agent Control views; internal catalog and audited command/tool surface; pinned real Franka; authoritative MuJoCo worlds and deterministic pick/place; front/wrist observations; fail-closed VLA-JEPA worker/bridge plus an authoritative policy-evaluation path; exact-object evidence normalization; durable Bright Data collection runs; immutable rigid GLB -> OpenUSD/MJCF compilation, stable semantic placement, Franka grasp/lift/place validation; persisted budgeted curriculum control; and governed collector repair with real semantic quality, golden/canary, promotion, rollback, and restart evidence.
-- Phase 5 provider status: the exact-identity and semantic-quality pipeline is implemented and tested with controlled and recorded provider rows. A live Scraper Studio call is `BLOCKED_BY_CREDENTIAL` because no server-side `BRIGHTDATA_API_TOKEN` is configured. The live blocked run is persisted as `evcollect_6e159bf0` and made no provider snapshot/fallback.
-- Proof data is isolated under `backend/data/codex-live`. The proof API used port 8010 with `ROBOT_ASSET_ROOT=D:\RobotWorldProject\backend\data\assets`; it was shut down cleanly after the latest HTTP readback on 2026-08-21.
-- Phase 6 oracle result: real persisted TRELLIS banana `assetver_20e79f28` is `ORACLE_VALIDATED` after authoritative Franka evaluation `eval_c12f4fb7`; exact-evidence and redistribution gates still correctly prevent promotion.
-- Phase 4 implementation status: the production VLA endpoint, typed agent tool, synchronized front/wrist observation capture, bounded action decoding, differential-IK application, durable lifecycle, real predicates, failure classification, and oracle-vs-VLA UI are implemented and physics-tested. Live inference remains blocked by missing local LeRobot source/package and Qwen base artifacts, plus the unmodified DROID checkpoint's lack of a proven Franka adapter binding.
-- Phase 7 status: structured diagnosis/coverage, configured target/budget stops, valid-asset-first planning, duplicate rejection, semantic `PlacementRequest`, immutable seeded v6 pose/orientation worlds, persisted scenario execution, restart recovery, persisted multi-iteration plan/oracle/VLA/analyze orchestration, aggregate budgets, and a cooperative kill switch are implemented/tested/live. Live policy iterations remain blocked by the configured VLA checkpoint; evidence acquisition is not yet dispatched from the controller, and generic placement beyond the Franka tabletop remains `PARTIAL`.
-- Phase 8 status: the canonical governed repair lifecycle, immutable test/candidate artifacts, schema/record diffs, exact identity/completeness gates, manual/controlled-auto policy, last-known-good continuity, rollback, typed tools, and API-backed UI are implemented and tested. Controlled repair `scraperrepair_4af09484` was promoted, survived restart, rolled back, and survived a second restart. Live provider trigger `scraperrepair_d221d663` failed closed as `EXHAUSTED` before a candidate because the server has no Bright Data token. Post-promotion evidence rebuild and asset/robot revalidation are not connected yet, so the overall phase remains `PARTIAL`.
-- Next executable task: add a persisted post-promotion follow-up that rebuilds an evidence bundle from the promoted collector output and, only when an already-linked source geometry/asset exists, queues asset revalidation and the deterministic oracle. Then connect that same guarded build/reuse branch to the autonomous controller while charging scrape/GPU budgets. Live calls remain credential/hardware gated and must not substitute fixtures.
+- Branch: `master`. The worktree is intentionally dirty with prior Codex/user work. Preserve all unrelated changes and never use blanket staging.
+- Frontend: `http://127.0.0.1:5173/` (HTTP 200 for `#/worlds` and `#/assets`).
+- Backend: `http://127.0.0.1:8000/api/health` is healthy.
+- The original full Worlds editor, original Assets page, original graphite tokens, and full sidebar navigation have been restored. The later compact replacement pages are no longer the production UI.
+- The old World Execute failure was caused by calling `/api/worlds/commands` in `execute` mode; that endpoint intentionally returns 501. Execute now calls the typed persisted `/api/worlds/operate` route.
+- The active Kitchen Juice Workspace now resolves the exact instruction `Pick up the apple and place it on top of the blender.` to the persisted apple and blender placements, compiles their task-relevant physical subset with the counter and Panda, and runs it through the same live MuJoCo stream. It does not substitute the cube validation bench.
+- Production run `live_c54c9a8f` / `eval_a5e8369b` succeeded with 1,636 streamed frames across 44 controller phases and 66.242 simulated seconds. Bilateral gripper contact, lift, transport, release, target-support contact, containment, settling, and a 4.787 mm target error were measured.
+- The validation-bench stream remains a continuous authoritative MuJoCo view rather than phase-by-phase recorded-image navigation. Panda links now use MuJoCo-compiled mesh vertices plus current `geom_xpos/geom_xmat`; the previous raw-OBJ pairing and stale async callback were the causes of the exploded arm in the user screenshots.
+- Free text cannot silently change a task contract. `pick_place` still rejects throw/off-table text, while the explicit `drop_off_table` task now compiles and measures a distinct release-and-settle predicate. General prompt-to-new-skill generation is not complete.
+- `#/simulation` now redirects to `#/worlds`; the separate legacy refrigerator runtime is no longer exposed as a second authoritative simulator page.
+- Runtime Diagnostics now scopes ERROR/WARN rows to the current backend process. Historical frontend/exporter errors remain in the durable log store but no longer make a restarted healthy process appear degraded.
+- AI chat is grounded in current robot/model/asset/evaluation state. High-confidence robot/dataset/fine-tuning intents use a typed workspace planner before free-form LLM reasoning, so the exact prompt cannot be derailed by redundant questions or invalid camera-map keys. After an approved tool result, chat automatically requests the next grounded action.
+- Real local VLA-JEPA base checkpoint is `LOADED/healthy` on CUDA in worker PID 46056. Current zero-shot run `eval_020eaf4e` inferred 40 finite two-camera actions but failed `grasp_miss`; candidate `eval_58c7456c` failed the workspace safety gate after 72 actions. Neither is represented as task success.
+- Successful recorded oracle evaluations export into locally validated LeRobot datasets. A real bounded one-step optimizer run also completed into a separate candidate checkpoint. Promotion/held-out evaluation and a resumable long-run worker remain incomplete.
+- SigNoz Community `v0.137.1` is live at `http://127.0.0.1:8080`; RobotWorld exports OTLP to `http://127.0.0.1:4318`. ClickHouse contains live `robotworld-backend` spans.
 
-## Architecture established from code
+## Latest live evidence
 
-- Client: React 19 / TypeScript 6 / Vite 8 / Electron 43. All new pages call real FastAPI endpoints; fixture/recorded evidence is visibly distinguished from live provider state.
-- Control plane: FastAPI 0.141.1 / Pydantic 2.13.4 / SQLAlchemy 2.0.52 / SQLite. `CommandExecution` provides durable IDs, input hashes, idempotency replay, terminal errors, and audit correlation.
-- Shared agent/human surface: `agent_tools.py` exposes 47 versioned JSON-schema tools, including approval-gated compiled-asset oracle/VLA evaluation, structured diagnosis, curriculum planning, persisted scenario materialization/execution, autonomous-run start/list, the policy-allowed kill switch, collector-version inspection, and governed scraper repair request/test/decision/rollback. Mutations are denied in observe/plan modes and require exact-arguments, expiring, one-use approval unless explicitly policy-allowed. No shell tool is exposed.
-- Artifact storage: immutable/versioned local filesystem below `ROBOTWORLD_DATA_DIR`; database rows contain references and hashes, not checkpoints, images, GLBs, or videos.
-- Physics: MuJoCo 3.11.0 is authoritative. `SimulationBackend` defines the engine boundary. The Franka baseline runs fixed 500 Hz physics / 50 Hz control.
-- Robot source: MuJoCo Menagerie Panda at exact git revision `feadf76d42f8a2162426f7d226a3b539556b3bf5`; Apache-2.0 attribution is copied into each immutable registration.
-- VLA runtime: isolated hidden JSONL worker process is prepared to invoke the pinned LeRobot `VLAJEPAPolicy` and official processor factory. It defaults offline, strips unrelated secret environment variables, validates CUDA/packages/source/checkpoint/base-model dependencies before loading multi-GB weights, disables the training-only world model for inference, and never substitutes a mock.
-- Evidence: `ObjectRequestRecord`, `EvidenceRecordRow`, `EvidenceBundleRecord`, and `EvidenceCollectionRunRecord` persist exact identity, provenance, property estimates, semantic failures, provider snapshot/heartbeat/cancellation, and bundle linkage.
-- Repair governance: `ScraperCollectorVersionRecord` and `ScraperRepairRunRecord` persist active/last-known-good/candidate versions, attempts, provider mode, precise prompt, immutable baseline/candidate references and hashes, schema/record diffs, golden/canary reports, policy, errors, and every lifecycle transition.
-- Failure/curriculum state: `FailureEventRecord`, `CoverageObservationRecord`, `ScenarioSpecRecord`, `ScenarioExecutionRecord`, `CurriculumPlanRecord`, and `AutonomousCurriculumRunRecord` persist immutable diagnoses, versioned coverage bins, duplicate-resistant scenario fingerprints, explicit budgets/thresholds, executable oracle state, oracle-before-VLA gates, phase heartbeats, consumption, blockers, cancellation, and terminal reasons.
-- Rigid assets: `CompiledAssetVersionRecord` and `AssetManifest` persist immutable source/visual/collision/OpenUSD/MJCF/validation references and hashes. `rigid_asset_compiler.py` enforces allowlisted paths, GLB magic/size/hash, uniform-only scaling, mesh QA, a separate convex collider, explicit mass/COM/inertia, OpenUSD units/physics schemas, and deterministic MuJoCo drop/settle.
-- Compiled-asset worlds: `franka_pick_place.py` composes versioned immutable Franka/MJCF worlds, derives stable poses from real collision geometry, measures the Panda finger closing axis, checks clearance/reachability/penetration, settles under physics, and tracks the compiler-authored grasp/COM frame through lift, transport, placement, release, and containment predicates.
-- Bright Data: current official APIs verified on 2026-08-20 against the [Scraper Studio quickstart](https://docs.brightdata.com/datasets/scraper-studio/quickstart), [self-healing workflow](https://docs.brightdata.com/datasets/scraper-studio/self-healing-tool), and [AI-flow API overview](https://docs.brightdata.com/api-reference/scraper-studio-api/ai-flow/overview): bearer token, `POST /request`, `POST /dca/trigger`, `GET /dca/dataset`, and self-heal/refactor/resume endpoints. `BRIGHTDATA_API_TOKEN` is primary; the older API-key env name remains a compatibility alias.
-- Observability: critical state remains in SQLite. OpenTelemetry uses keyless OTLP HTTP for self-hosted SigNoz Community; no cloud ingestion key is required.
-- Deferred scope: Port and Isaac routes are disabled legacy placeholders behind `ROBOTWORLD_ENABLE_DEFERRED_PORT` / `ROBOTWORLD_ENABLE_DEFERRED_ISAAC`; they are absent from production navigation and health gates.
+### 2026-08-21 real active-world Panda control and drop task
 
-## Genuine implementation evidence
+Status: **IMPLEMENTED_AND_TESTED** for deterministic apple pick/place, apple drop-off-table, active-world live streaming, persisted Panda base translation, and manual Cartesian/gripper control. Learned VLA task success remains **BROKEN** (`grasp_miss`); banana at its current authored pose remains **BROKEN** (`unreachable_target`).
 
-### Models, workers, and VLA bridge
+- Added a typed `drop_off_table` task with its own compiler family and oracle policy. It carries the compiled movable asset beyond the measured counter support polygon, releases it under gravity, and requires `outsideSupportPolygon`, `belowCounterTop`, `released`, and `settled`; it does not reuse the in-target predicate.
+- Browser-run evidence: `live_fefac91d` streamed 1,048 continuous authoritative frames in the actual Kitchen Juice Workspace and persisted `eval_868de5ec/SUCCEEDED` at seed `1048576`. At 30.80 simulated seconds it was in `transport_off_table_segment_08`; at 42.68 seconds it finished `settle_after_drop`, finite, with the task predicate passed.
+- Earlier direct evidence `live_76170b7b` / `eval_b6fa4611/SUCCEEDED` measured final apple position `[-0.4773451086, 0.6940897199, -0.0005435093]`, floor settling, and approximately 0.065 mm maximum penetration.
+- Added an active-world manual session with a dedicated single worker thread (MuJoCo/OpenGL objects remain thread-affine), bounded ±3 cm Cartesian jog requests, compiled workspace/joint limits, and real gripper actuator commands. Browser session `manual_124a7923` advanced from frame 1/sim 0.30 s to frame 61/sim 2.70 s after X+ and frame 66/sim 2.90 s after Close gripper; all reported finite physics and zero browser console errors. API session `manual_7a2b1677` closed the gripper to 0.0086467 m.
+- The live viewport retains every authored kitchen GLB as textured visual context while MuJoCo streams the physical Panda/source/counter transforms. Source geometry is not duplicated. The corrected default camera frames the full Panda and counter.
+- Panda base translation is selectable/movable in the editor and persisted through `PATCH /api/worlds/robot-spawn`; the next active runtime consumes that mount. Orientation remains locked to the calibrated +90° yaw until a new controller/camera calibration is validated.
+- Restored the exact calibrated base x coordinate `-0.15`. The previously persisted `-0.150003961892...` (3.96 micrometres different) changed rounded-hull contact from bilateral to unilateral and reproduced `grasp_miss`; apple-to-blender rerun `eval_4421031c/SUCCEEDED` after restoration.
+- A real banana-to-blender attempt resolved `assetver_7aa76e7d` (TRELLIS banana, `PHYSICS_VALIDATED`) but persisted `eval_7f72f749/FAILED/unreachable_target`, with 0.017299 m pre-grasp residual. This is not reported as task success.
+- Interactive command responses and WebSocket terminal messages now omit the full trajectory; the complete trajectory remains durable in the catalog. This prevents multi-megabyte responses from stalling the API and telemetry exporter.
+- The unused `/api/eval/sessions` + `/ws/live` refrigerator preview is now disabled by default (HTTP 410 / WebSocket 4403). `/#/simulation` already redirects to Worlds; `/ws/worlds/live` is the only production live simulator surface.
+- The bottom Console switches to current manual/run state and measured predicate values during live operation instead of showing a stale selected-asset “physical evaluation pending” message.
+- Backend restarted from `backend/run_server.py`; health is `healthy`, MuJoCo 3.11.0/500 Hz, SigNoz `exporting`, and current-process diagnostics have zero events.
 
-- `backend/app/contracts.py`, `models.py`, `command_store.py`, `control_catalog.py`, and `model_registry.py` implement strict registrations, path allowlists, Windows path validation, endpoint SSRF policy, bounded manifests, content hashes, lifecycle guards, and audit events.
-- Live registration `mdl_e3701396` references `D:\VLA-JEPA-Pretrain`; it remains `AVAILABLE` with `healthStatus=worker_unavailable`, not falsely `LOADED`.
-- Manifest SHA-256: `c7accb37b5ebe24c7bb772d6d6059acb86c219c8d301bfecf9c91b662de12f39`.
-- Full content SHA-256: `7dfc57c97e6b896fddd27708cc46da746d4f5c1000962b41a96927e87604dca0` over 3 safetensor files / 6,163,215,182 bytes.
-- Exact Hugging Face repository revision recovered from the local cache metadata: `e946c3e5b538d760f4b4ff239d1b1c12090c041d`. Validation now replaces a legacy literal `unrecorded` revision and preserves an existing full-content hash when a later validation intentionally skips re-hashing; both behaviors are regression-tested and were verified over live HTTP.
-- Revalidation found config `stateDimension=8` but no `observation.state` input feature. Official LeRobot inference treats state as optional, so the bridge correctly reports `shapeCompatible=true` and `stateRequired=false`; it does not fabricate a state blocker.
-- Processor SHA-256: `aa51dd93443f01777096d151e70c1a41b0f3564392a519120b412954a7b1d940`.
-- Bounded safetensors metadata inspection records the real action mask/min/max/q01/q99 statistics without loading model weights; the processor hash is the normalization revision.
-- Live worker probe used `D:\TRELLIS.2-runtime\.venv\Scripts\python.exe` and detected CUDA PyTorch 2.7.0+cu128, `NVIDIA GeForce RTX 4080 Laptop GPU`, and 12,878,086,144 bytes VRAM. `transformers`, `safetensors`, and Pillow are present; `lerobot` and `LEROBOT_REPO_PATH` are absent. Offline resolution also proved `Qwen/Qwen3-VL-2B-Instruct` absent from local paths/cache. V-JEPA2 is absent but explicitly not required for inference.
-- Live load returned HTTP 409 with those exact blockers and left the model `AVAILABLE/worker_unavailable`; no network download, random policy, or bundled demo was used.
-- `vla_bridge.py` defines `franka-cartesian-delta-v1`: `[dx,dy,dz,droll,dpitch,dyaw,gripper]`, translation bound +/-0.05 m, rotation bound +/-0.2 rad, finite normalized input in `[-1,1]`, explicit non-binarized gripper mapping, and encode/decode round-trip tests. Execution additionally requires one-to-one checkpoint-camera mapping, exact robot-definition SHA-256, normalization revision, `end_effector_local_delta`, and a policy rate that divides 500 Hz.
+Files changed for this slice:
 
-### Franka, world, and authoritative evaluation
+- `backend/app/contracts.py`
+- `backend/app/main.py`
+- `backend/app/services/evaluation_catalog.py`
+- `backend/app/services/franka_live.py`
+- `backend/app/services/franka_pick_place.py`
+- `backend/scripts/run_live_franka_stream.py`
+- `backend/tests/test_api.py`
+- `backend/tests/test_franka_oracle.py`
+- `frontend/src/components/three/AuthoritativeSimulationCanvas.tsx`
+- `frontend/src/components/three/WorldEditorCanvas.tsx`
+- `frontend/src/pages/Worlds.tsx`
+- `frontend/src/styles/ui2.css`
 
-- Registered compiler-v2 robot: `franka-panda-mujoco-f9a4918f6663`.
-- Contract: seven arm joints, two gripper joints, eight actuators, deterministic home keyframe, named `franka_ee`, front RGB camera, and wrist RGB camera attached to `hand`.
-- Wrist mount is explicit: translation `[0.04,0,0.055]`, quaternion WXYZ `[0,0.70710678,0.70710678,0]`, `calibrated=false`.
-- Measured validation: 0 severe initial penetrations; max home drift 0.006553 rad; closed/open widths 0.000202/0.079799 m; front robot/workspace pixels 5,054/9,460; wrist gripper/workspace pixels 451/65,085.
-- World `franka-tabletop-pick-place-v1` has a semantic support surface, target volume, free 0.04 kg object with explicit inertia/friction, deterministic seed/reset, real contacts, and real predicates.
-- Live evaluation `eval_9a63023a` (seed 4242) persisted across restart and idempotent replay: `SUCCEEDED`, 0.005879 m target error, settled speed `6.7569e-11` m/s, 2,468 sampled contact observations, distinct front/wrist phase frames.
-- Agent-approved live evaluation `eval_c3bf42a9` (seed 5150) also `SUCCEEDED`: approval `approval_2f8366fa`, tool call `toolcall_34c9a447`, command `cmd_bc876062`; the same approval was rejected on second use.
-- Physics tests release an unheld object from 0.62 m and verify fall, support contact, and settling. The frontend never invents object motion.
-
-### VLA-JEPA authoritative evaluation path
-
-- Primary-source review on 2026-08-21 used the official LeRobot VLA-JEPA docs/config/model/processor sources, official `ginwind/VLA-JEPA` repository/config and DROID modality mapping, and the official `lerobot/VLA-JEPA-Pretrain` model metadata. Current remote heads observed (not installed automatically): LeRobot `d451fe4f1f1b00a812f95aa9534389b5e42ab155`, ginwind VLA-JEPA `0dd5281951046b17e1e3653f5661a406306a4a03`.
-- The official implementation confirms that `observation.state` is optional and the V-JEPA world-model branch is training-only for this inference path. The worker therefore disables `enable_world_model` during inference unless explicitly requested and does not invent a V-JEPA2 runtime dependency.
-- `backend/app/services/franka_vla_evaluation.py` loads the same immutable compiled-asset MuJoCo world as the deterministic oracle, captures real front/wrist RGB observations at the checkpoint resolution, and passes server-side artifact paths to the isolated worker.
-- Each normalized seven-dimensional action is schema-validated in `[-1,1]`, decoded through `franka-cartesian-delta-v1`, transformed from end-effector-local translation/intrinsic XYZ rotation into bounded differential-IK joint targets, clipped to workspace/joint/gripper safety limits, and stepped at an exact policy/physics divisor. There is no production scripted/random fallback.
-- The evaluator records checkpoint, normalization, adapter, model, robot, asset, world, seed, instruction, frame hashes, normalized/physical actions, actuator commands, contacts, state, timing, settle signals, and task predicates. Structured failures include `worker_crash`, `invalid_action`, `policy_instability`, `grasp_miss`, `grasp_slip`, and `policy_timeout`.
-- `evaluation_catalog.py` persists `QUEUED -> STARTING -> RUNNING -> SUCCEEDED|FAILED|CRASHED`, idempotent command replay, immutable artifacts, and `robot.vla_evaluate` telemetry. It never changes asset lifecycle or promotion based on a learned-policy result.
-- Integration coverage runs real MuJoCo with synchronized 64x64 front/wrist frames and an explicitly injected test-only bounded stationary policy. Two actions are consumed and durably recorded; the run correctly terminates `FAILED/grasp_miss`, while the enclosing command succeeds and idempotently replays. Audit assertions prove all three transitions through `RUNNING -> FAILED`.
-- Live preflight against `mdl_e3701396`, `assetver_20e79f28`, and `franka-panda-mujoco-f9a4918f6663` returned HTTP 409 because the policy was not loaded. No evaluation row or fabricated action was emitted.
-- `frontend/src/pages/Assets.tsx` selects only registered VLA policies, enables execution only for enabled/healthy/`LOADED` models and `ORACLE_VALIDATED` assets, and sends a real instruction to the new endpoint. `Simulation.tsx` renders persisted oracle and VLA results separately, including recorded frames, policy/model identity, actions, predicates, and actual failure evidence.
-
-### Agent tool registry and autonomous controller
-
-- `backend/app/services/agent_tools.py` persists bounded `AgentToolCallRecord` and `ApprovalDecisionRecord` rows.
-- Current registry: 47 tools covering models, local worker probes/stop, robots, world templates, oracle and VLA evaluations, structured diagnosis/coverage/curriculum planning, persisted scenario oracle execution, autonomous-run start/list/cancel, VLA compatibility, audit history, exact-object requests, recorded evidence, live durable Bright Data collection/list/get/cancel, immutable bundles, governed collector repair/list/test/decision/rollback, asset-version list/get, and approval-gated rigid compilation.
-- `evaluations.run_vla_compiled_asset` is a schema-validated, idempotent mutation requiring one-use approval and is not enabled for autonomous execution before budget-policy work is complete.
-- `backend/app/services/autonomous_curriculum.py` runs the canonical `plan_next -> deterministic oracle -> VLA -> failure analysis -> repeat/stop` path with persisted phase state, phase-specific idempotency keys, separate world/evaluation/GPU/scrape/retry/iteration/consecutive-failure budgets, real activity heartbeats, startup rescheduling, and cooperative cancellation. It does not use progress timers or invent a policy action.
-- The controller validates an active `AVAILABLE` robot and only accepts `ORACLE_VALIDATED` allowed assets. It reuses an already oracle-validated scenario without charging a world or episode, probes the exact VLA bridge before dispatch, and terminates `BLOCKED/vla_bridge_unavailable` without creating an evaluation when the checkpoint contract is unavailable.
-- `frontend/src/pages/AgentControl.tsx` is a real API-backed control surface for robot/model/asset binding, autonomy mode, budgets, instruction, seed, run state, phase history, durable IDs, blockers, and the kill switch. Scrape budget is visibly fixed at zero until evidence dispatch is wired; no fixture data is shown as live.
-- Integration coverage now drives the full controller through real MuJoCo oracle execution, a test-only injected bounded VLA worker action, persisted `grasp_miss` analysis, and the configured consecutive-failure stop. Separate tests prove queued cancellation, restart rescheduling, strict schemas, tool policy, idempotent replay, and lifecycle audit.
-- The old `/api/agent/run` parameterized-skill loop is retained only behind disabled `ROBOTWORLD_ENABLE_LEGACY_SKILL_AGENT`; production UI entry points now route to Agent Control or Failure Analysis instead of launching that pre-canonical path.
-
-### Structured failure analysis and coverage-driven planning
-
-- Primary-source design grounding on 2026-08-21: OpenAI's Automatic Domain Randomization work describes an automatically expanding environment distribution, while the Automatic Curriculum Learning survey frames curricula as tasks adapted to measured agent capacity. RobotWorld applies the conservative subset relevant here: explicit observed bins, repeated failure counts, configured budgets, and no LLM-selected coordinates or opaque reward score.
-- `backend/app/services/curriculum_catalog.py` classifies only terminal authoritative evaluations. It preserves direct simulator codes, derives `worker_crash` or `policy_instability` only from terminal/no-result or non-finite-state signals, records bounded evidence and a deterministic repair route, and creates no failure row for a successful episode.
-- Pick/place coverage taxonomy `pick-place-coverage-v1` explicitly bins size, aspect ratio, mass, and friction and reports count, unknown count, configured-bin fraction, dynamic shape/pose/orientation/camera dimensions, sample count, unique scenario fingerprints, and failures. No unobserved success percentage is filled in.
-- The planner records request thresholds, episode/new-scenario budgets, sample count, exact success ratio, Wilson 95% interval when samples exist, repeated failure histogram, reusable asset IDs, stop/block reason, and the next gate. It stops at the configured target/budget, blocks policy-runtime failures before world generation, and requests exact evidence only when no allowed `ORACLE_VALIDATED` asset exists.
-- Real historical indexing: command `cmd_844e3023` mapped successful oracle `eval_c12f4fb7` to coverage observation `coverage_2cd41872`, fingerprint `e0a0022d92de144454697b7a08fbab0f10b201a8f6ede5ced0769a1e79449fb3`, with measured bins `large/slender/light/medium-friction`, banana shape, stable pose 0, and no failure event.
-- Planning command `cmd_12a52420` created plan `curriculum_2777414d` and scenario `scenario_ce0cf9f3`, reusing `assetver_20e79f28` for its first untried VLA baseline. It targets only the asset's actual `large/slender/light/medium-friction` bins, requires semantic placement/reachability/no penetration/drop-settle, and gates execution on the deterministic oracle.
-- A first live draft (`scenario_b43deb1f`) incorrectly combined immutable asset reuse with size/aspect variation. The validator detected the contradiction, transitioned it audibly to `REJECTED`, and the corrected plan reports `rejectedInvalidScenarioCount=1`. A separate command `cmd_2d229615` reused `scenario_ce0cf9f3` by fingerprint instead of creating a duplicate.
-- Indexing the real Franka history produced 11 immutable failure events: 4 `success_predicate_failure`, 2 `grasp_miss`, and one each of `policy_timeout`, `unreachable_target`, `object_dropped`, `grasp_slip`, and `pre_grasp_collision`. Historical failed evaluations remain unchanged.
-- `PlacementRequest` accepts semantic support/seed/variation constraints but rejects caller-supplied unchecked XYZ poses. World compiler revision 6 samples a conservative reachable subregion, chooses a seeded graspable stable orientation when requested, checks support clearance/reachability/penetration, drops and settles under MuJoCo, and emits a placement-fingerprinted immutable world rather than mutating the baseline runtime.
-- Scenario execution persists `STARTING -> RUNNING -> SUCCEEDED|FAILED|CRASHED` plus `PLANNED -> ORACLE_VALIDATING -> ORACLE_VALIDATED|REJECTED`. On restart, incomplete wrappers become auditable `CRASHED` records and their scenario returns to retryable `PLANNED`; no interrupted episode is relabeled successful.
-- Live baseline scenario command `cmd_38fdf33d` executed `scenario_ce0cf9f3` as `scenarioexec_35d0200b` / `eval_a8860bb8`; it passed and idempotently replayed after an API restart. A second approval-gated agent call `toolcall_910c50a6` ran baseline scenario `scenario_bc5aa8ee` as `eval_63f15e0d`.
-- Live targeted placement plan `curriculum_0e3fa41c` produced `scenario_6c884cf7` (seed 2401, `object_pose`). Approval `approval_fe64bccd` and tool call `toolcall_113766bd` materialized world `franka-compiled-asset-pick-v6:assetver_20e79f28:p373b8451f122`, runtime SHA-256 `517716caf0a02c10d8a94def50299c98ac43fe09708b00a93e9f9cc757d699d9`, and evaluation `eval_81814555`. It passed with sampled XY `[0.5199102074,-0.0926438730]`, zero severe initial penetration, 554 bounded contact samples (`left=147`, `right=55`), release/containment/settle true, and final linear speed `0.00152460` m/s. Disk hash matched the catalog/evaluation after restart.
-- Targeted scenario results do not overwrite or demote the asset's canonical oracle validation. Live readback kept `assetver_20e79f28` `ORACLE_VALIDATED` with canonical evaluation `eval_63f15e0d` after the targeted run.
-- Classifier revision 2 fixes temporal leakage: a VLA failure can only cite a successful oracle created at or before that policy evaluation, and an already-persisted failure event is returned immutably even after newer oracle runs exist.
-- Live autonomous oracle run `autorun_2fe5e643` / start command `cmd_9e9771dd` planned `curriculum_70abe140`, materialized `scenario_ed7236c8` at seed 2501, and completed `SUCCEEDED/oracle_gate_complete` with authoritative evaluation `eval_39651d2f`. The evaluation recorded runtime SHA-256 `15213612fa81c8dcc22d9ee944c2e672302353ab7f21ed01209ec59c981ed491`, zero severe initial penetration, bilateral finger contacts (`left=192`, `right=70`), release/containment/settle true, and target error `0.00537694` m.
-- Live VLA continuation `autorun_b08467ff` / `cmd_512b515c` reused `scenario_ed7236c8` and oracle `eval_39651d2f`; it charged zero worlds, episodes, and GPU minutes, then terminated `BLOCKED/vla_bridge_unavailable` with the exact load/adapter/camera/robot-binding blockers. It created no fake evaluation or action.
-- Live kill-switch run `autorun_5a7f576f` / `cmd_99a434bc` stopped `CANCELLED/kill_switch_requested` after planning and before its oracle, with zero evaluation episodes. All three rows and their `QUEUED -> STARTING -> RUNNING -> terminal` transitions were read back after API restart; replaying the first start idempotency key returned `reused=true` and the original run ID.
-- `frontend/src/pages/FailureAnalysis.tsx` analyzes terminal runs, plans with configured budgets, displays measured bins/Wilson intervals/deferred variations, and executes supported baseline/pose/orientation scenarios through the authoritative oracle. Multi-iteration execution is explicitly owned by the separate persisted Agent Control surface.
-- Inputs/outputs are versioned JSON Schema. Scraped content is data only and cannot widen tool permissions.
-
-### Exact evidence and Bright Data
-
-- `evidence_catalog.py` implements exact manufacturer/model/SKU claims, authoritative-domain priority, mixed-SKU rejection, category-prior labeling, CAPTCHA/login/error-page detection, URL/SSRF policy, unit conversion, image metadata gates, field completeness, identity confidence thresholds, property provenance, content hashes, and immutable raw/bundle artifacts.
-- Live controlled pass: request `objreq_691b5d51`, bundle `evb_7dc4bcd0`, `QUALITY_PASSED`, identity confidence 1.0, completeness 1.0, 2 records, properties `depth/height/mass/material/width`, artifact SHA-256 `93b30060e1327b1ef311e45fd39c63fc39a6bffa7edfcc59e9c77b5d0ecee95d` at `backend/data/codex-live/evidence/objreq_691b5d51/evb_7dc4bcd0/bundle.json`.
-- Live mixed-SKU rejection: request `objreq_28e84281`, bundle `evb_3731ed44`, `QUALITY_FAILED`; explicit conflict `AC-BLD500-BLU/BLD-500` vs `AC-BLD700-RED/BLD-700`.
-- `brightdata.py` now correctly treats HTTP 200 `{"status":"building"}` as in progress; only a JSON array is a ready dataset.
-- `evidence_collection.py` owns persisted `QUEUED -> STARTING -> RUNNING -> SUCCEEDED|FAILED|CANCELLED` runs, provider snapshot IDs, real heartbeats, timeouts, cancellation, normalization attempts, restart resume, and fail-closed uncertain-trigger recovery.
-- Restart tests prove a known `j_*` snapshot resumes without retriggering. A `STARTING` run without a persisted snapshot fails as uncertain and does not issue a duplicate billable request.
-- Live credential-block proof: request `objreq_8b6994c1`, run `evcollect_6e159bf0`, command `cmd_d92fdadd`, provider attempt 1, state `FAILED`, snapshot `null`, exact missing `BRIGHTDATA_API_TOKEN` error. No provider call or mock bundle occurred.
-
-### Governed scraper repair
-
-- `backend/app/services/scraper_repair.py` implements `COLLECTING -> QUALITY_PASSED|QUALITY_FAILED -> REPAIR_REQUESTED -> DRAFT_READY -> GOLDEN_TESTING -> CANARY_TESTING -> AWAITING_POLICY_DECISION -> PROMOTED|REJECTED`, plus attempt `EXHAUSTED` and `PROMOTED -> ROLLED_BACK`. Transitions, commands, inputs, outputs, errors, artifacts, and version activation are durable and idempotent.
-- `backend/app/services/scraper_repair_demo.py` serves controlled product-shaped v1/v2 pages. V1 exposes legacy data attributes; v2 actually removes them while retaining Product JSON-LD. The legacy extractor produced bundle `evb_becc00ab` as `QUALITY_FAILED` with identity confidence 0, completeness 0.167, and explicit missing manufacturer/identifier/dimensions/mass/material errors. No fake status flag creates the failure.
-- Controlled live proof: repair `scraperrepair_4af09484`, collector `c_robotworld_controlled_9b21d439`, last-known-good `scraperver_bc16fd47`, candidate `scraperver_d2623b14`. Two golden cases and one canary all passed canonical exact-identity/completeness checks with a compatible schema. Manual promotion made only the candidate active; restart readback preserved it. Rollback restored only `scraperver_bc16fd47`; second restart readback preserved `ROLLED_BACK`. Candidate artifact SHA-256 is `9ab4edcc04c086332cba52979d1ce440dceeca6e71f14e27cfc7897568c4a368`.
-- Regression tests reject unapproved output-schema fields, duplicate test case names, live automatic promotion, and legacy source endpoints. `ROBOTWORLD_ENABLE_LEGACY_SOURCE_REPAIR` defaults off; both bypass routes return HTTP 410 and the Sources page links to the governed UI.
-- Live provider fail-closed proof: `scraperrepair_d221d663` entered `REPAIR_REQUESTED`, consumed exactly its configured one attempt, received the exact missing-token error before network/provider work, transitioned to `EXHAUSTED`, and created no candidate version. The adapter does not execute provider-generated code; provider output must be captured and submitted as an explicit candidate for local validation.
-- `frontend/src/pages/ScraperRepair.tsx` reads real runs, collector versions, and audit events; exposes the controlled break; shows prompts/diffs/golden/canary evidence; requires explicit promote/reject; supports rollback; and warns before the potentially billable live provider trigger.
-
-### Canonical rigid asset compiler
-
-- `backend/app/services/rigid_asset_compiler.py` implements the production compiler path; `backend/app/services/usda.py` now accepts explicit uniform scale/coordinate translation for real generated topology.
-- The server accepts only a `.glb` below the artifact store, `ROBOT_ASSET_ROOT`, or explicit `ROBOTWORLD_ASSET_IMPORT_ROOTS`; it validates resolved path, `glTF` magic bytes, configured byte limit, and optional expected SHA-256 before parsing.
-- Synthetic E2E tests prove successful compilation, immutable/idempotent replay, real MuJoCo contact/settle, path/hash defenses, approval gating, and fail-closed aspect-ratio rejection without per-axis stretching.
-- Real source: `backend/data/assets/ast_9aae33a6/model.glb`, a prior actual TRELLIS.2 blender output; source SHA-256 `889bc66362f3fa274d82676596e4ced59c4238a954cc97d421692390c84d5c03`, 19,926,824 bytes, 357,860 vertices, 490,429 source triangles.
-- Live command `cmd_1efe9a2e` created `assetver_efd1d8a1` / manifest SHA-256 `bc545b6afe99af9f278203de669dfcfe4d0fb4c528d0c4ab57c26892f4013a5a` in 15.075 s.
-- Uniform scale `0.4163154110` produced W/H/D `[0.2, 0.4169018233, 0.2125492095]` m with maximum aspect residual `0.062746`; no anisotropic stretch was applied.
-- Derived collision is a separate 302-vertex/600-triangle watertight convex hull (38,346-byte OBJ), not the 490k-triangle visual. The runtime contains two MuJoCo mesh/geoms with visual `contype/conaffinity=0/0` and collision `1/1`.
-- Independent reopen verified OpenUSD default prim `/Asset`, Z-up, metres/kilograms = 1, resolved generated visual, `PhysicsRigidBodyAPI`, `PhysicsMassAPI`, and `PhysicsCollisionAPI`; MuJoCo reloaded 4.0 kg explicit mass.
-- Real physics result: initial contacts 0, floor contact observed, maximum penetration `0.00294345` m, settle-position span `2.05475e-7` m, maximum settle speed `0.00583025`, finite state, deterministic repeat max qpos error `0.0`, and a recorded 320x320 preview.
-- Promotion is correctly false with blockers: deterministic oracle pending, category-prior identity, dimension confidence 0.30, mass confidence 0.25, and unknown redistribution. This is not represented as an exact product or ACTIVE asset.
-- `frontend/src/pages/Assets.tsx` now shows canonical physical versions from `/api/asset-versions`, measured geometry/physics, hashes, blockers, and recorded preview separately from legacy asset records; it also submits a real allowlisted compile request.
-
-### Compiled-asset placement and Franka oracle
-
-- `backend/app/services/franka_pick_place.py` implements the backend-specific composition/placement/oracle path. World revision 5 uses MuJoCo's elliptic contact cone, Newton solver, tighter tolerance, high impedance ratio, and NoSlip refinement; the settings are explicit in the immutable runtime rather than being UI animation parameters.
-- Stable placement samples real mesh poses, aligns the graspable cross-section with the measured Panda jaw axis, verifies support clearance and initial penetration, and settles for 6 simulated seconds. Accepted pose, seed, stable-pose probability, dimensions, clearance, penetration count, and settle measurements are durable evaluation evidence.
-- Real source: prior actual TRELLIS banana version `assetver_20e79f28`. Command `cmd_84443b5a` produced evaluation `eval_c12f4fb7` against robot `franka-panda-mujoco-f9a4918f6663` and immutable world `franka-compiled-asset-pick-v5:assetver_20e79f28` (SHA-256 `15213612fa81c8dcc22d9ee944c2e672302353ab7f21ed01209ec59c981ed491`).
-- The real run is `SUCCEEDED` under `deterministic_differential_ik_compiled_asset_oracle_v13`: both fingers contacted the authored collider (`left=192`, `right=70` bounded samples), target-center error `0.00537694` m, containment residual `-0.0341844` m, final linear speed `0.00377510` m/s, settle position span `0.0000827008` m, and authoritative quaternion rotation span `0.00391493` rad over 6 seconds.
-- The run preserves a solver/collider limitation instead of hiding it: MuJoCo body angular cvel p95/final were `0.188788/0.172428` rad/s, so the angular-velocity gate failed; the independently measured transform-rotation gate passed below its configured `0.01` rad limit. Both raw signals and the selected gate are persisted.
-- The asset transitioned durably to `ORACLE_VALIDATED`. Promotion remains false for `source_identity_is_category_prior`, dimension confidence below 0.80, mass confidence below 0.70, and unknown redistribution rights.
-- Earlier failed evaluations remain in the catalog (unreachable width, wrong assumed grasp axis, grasp slip, and predicate/settle revisions). They were not overwritten or relabeled as successes.
-- `frontend/src/pages/Assets.tsx` lists active `AVAILABLE` robots, invokes the real compiled-asset oracle endpoint, shows the evaluation ID/seed/result, and refreshes lifecycle/promotion gates from the backend.
-- Immutable-world handling is regression-tested: an inadvertently touched v1 artifact was reconstructed from compiler revision 1 and restored byte-for-byte to SHA-256 `5190de5c7d2829c8eed6d9930a88b6c6423aea4e8e496981d8578cbdef3135b6`; new behavior is emitted as v5 instead of mutating old IDs.
-
-## Exact commands and latest results
+Commands/results:
 
 ```powershell
+# full backend regression
 cd D:\RobotWorldProject\backend
-.\.venv\Scripts\python.exe -m py_compile app\config.py app\contracts.py app\models.py app\services\brightdata.py app\services\evidence_catalog.py app\services\evidence_collection.py app\services\agent_tools.py app\main.py
-# passed
-
-.\.venv\Scripts\python.exe -m pytest -q tests\test_evidence_collection.py tests\test_evidence_catalog.py tests\test_agent_tools.py tests\test_model_and_data_contracts.py
-# 18 passed in 8.06s
-
-ruff check app tests workers
-# All checks passed (also fixed the previously undefined SigNoz service import)
-
 .\.venv\Scripts\python.exe -m pytest -q
-# 58 passed in 40.20s
+# 92 passed in 217.71s
 
-.\.venv\Scripts\python.exe -m pytest -q tests\test_scraper_repair.py -x
-# 4 passed in 5.24s: semantic break, full transition audit, promotion/replay/rollback,
-# schema-change rejection, disabled legacy bypass, and live-provider attempt exhaustion
+# focused new/changed contracts
+.\.venv\Scripts\python.exe -m pytest tests/test_api.py::test_legacy_preview_session_is_disabled_in_production tests/test_franka_oracle.py::test_worlds_live_stream_is_continuous_and_persists_same_evaluation -q
+# 2 passed in 27.70s
 
-.\.venv\Scripts\python.exe -m pytest -q tests\test_curriculum_catalog.py tests\test_agent_tools.py
-# 12 passed in 7.98s
-
-.\.venv\Scripts\python.exe -m pytest -q tests\test_rigid_asset_compiler.py::test_compiler_asset_runs_real_franka_contact_lift_and_place_oracle -x
-# passed in 29.24s; includes controller plan -> real oracle -> bounded VLA -> analysis -> stop
-
-.\.venv\Scripts\python.exe -m pytest -q tests\test_rigid_asset_compiler.py tests\test_model_registry.py tests\test_vla_bridge.py tests\test_vla_policy_worker.py tests\test_agent_tools.py
-# 20 passed in 18.23s before the durable VLA endpoint test was added; the final full suite includes it
-
+# frontend production checks
 cd D:\RobotWorldProject\frontend
 npm.cmd run typecheck
 npm.cmd run lint
 npm.cmd run build
-# all passed; Vite 8.2.1 built 89 modules including AgentControl and ScraperRepair. Existing Worlds chunk-size warning only.
+# all passed; Vite built 95 modules
 
-# Real compiler proof (API on port 8010):
-POST /api/asset-versions/rigid
-GET  /api/asset-versions/assetver_efd1d8a1
-GET  /api/asset-versions/assetver_efd1d8a1/previews/drop-settled.png
-POST /api/evaluations/oracle/compiled-asset-pick-place
-GET  /api/evaluations/eval_c12f4fb7
-GET  /api/asset-versions/assetver_20e79f28
-GET  /api/agent/tools
-POST /api/models/mdl_e3701396/validate
-GET  /api/models/mdl_e3701396/worker-probe
-GET  /api/models/mdl_e3701396/bridges/franka/franka-panda-mujoco-f9a4918f6663
-POST /api/models/mdl_e3701396/load
-POST /api/evaluations/vla/compiled-asset-pick-place
-POST /api/evaluations/eval_c12f4fb7/analyze
-GET  /api/failure-events
-GET  /api/coverage
-POST /api/curriculum/plan-next
-GET  /api/curriculum/plans
-GET  /api/scenario-specs
-POST /api/scenario-specs/{scenario_id}/oracle
-GET  /api/scenario-executions
-POST /api/agent/approvals
-POST /api/agent/tools/invoke   # scenarios.oracle_validate
-POST /api/autonomous-runs
-GET  /api/autonomous-runs/{run_id}
-POST /api/autonomous-runs/{run_id}/cancel
-GET  /api/audit?entity_type=autonomous_curriculum_run&entity_id={run_id}
-POST /api/scraper-repair/demo
-GET  /api/scraper-repair/demo/page/v1
-GET  /api/scraper-repair/demo/page/v2
-GET  /api/scraper-repair-runs/{run_id}
-POST /api/scraper-repair-runs/{run_id}/decision
-POST /api/scraper-repair-runs/{run_id}/rollback
-POST /api/scraper-repair-runs/{run_id}/provider-request
-GET  /api/scraper-collector-versions?collectorId={collector_id}
-GET  /api/audit?entity_type=scraper_repair_run&entity_id={run_id}
-
-# Live VLA outcomes:
-# validation: revision e946c3e5..., content hash preserved with computeContentHash=false
-# worker probe: CUDA available; load blocked on local LeRobot source/package + local Qwen
-# evaluation: HTTP 409 before run creation because the model was not LOADED
-# scenario execution: eval_a8860bb8 replayed after restart; targeted eval_81814555 hash matched disk/catalog
-# autonomous oracle: autorun_2fe5e643 -> eval_39651d2f SUCCEEDED; replayed after restart
-# autonomous VLA: autorun_b08467ff BLOCKED before evaluation with exact bridge blockers
-# kill switch: autorun_5a7f576f CANCELLED before oracle; cancellation audit persisted
-# controlled repair: scraperrepair_4af09484 promoted candidate scraperver_d2623b14,
-# survived restart, rolled back to scraperver_bc16fd47, and survived a second restart
-# live repair adapter: scraperrepair_d221d663 EXHAUSTED at attempt 1/1 on missing token;
-# no candidate/provider fallback; legacy bypass returned HTTP 410
-
-# Independent artifact reopen:
-.\.venv\Scripts\python.exe - # pxr Usd/UsdPhysics + mujoco.MjModel.from_xml_path
-# passed: source hash, USD units/schemas/reference, MJCF meshes/collision masks, explicit 4 kg mass
-
-cd D:\RobotWorldProject\backend
-$env:ROBOTWORLD_DATA_DIR='D:\RobotWorldProject\backend\data\codex-live'
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8010
-
-# Live HTTP paths exercised:
-POST /api/evidence/requests
-POST /api/evidence/requests/{id}/normalize-recorded
-GET  /api/evidence/requests/{id}
-POST /api/evidence/requests/{id}/collections
-GET  /api/evidence/collections/{run_id}
-GET  /api/agent/tools
+# browser exercised http://127.0.0.1:5173/#/worlds
+# manual_124a7923: X+ and Close gripper, 66 frames, finite, no console errors
+# live_fefac91d / eval_868de5ec: drop-off-table, 1,048 frames, SUCCEEDED
 ```
 
-Use `npm.cmd`, not `npm`, because this host's PowerShell execution policy blocks `npm.ps1`.
+Exact next executable task: make the banana pose reachable (move it inside the measured Panda workspace or run the deterministic placement planner), rerun its compiled-asset oracle, then collect multi-seed apple/banana oracle demonstrations and fine-tune/evaluate a new VLA candidate. Do not represent the current base VLA as working; its measured result is still `grasp_miss`.
+
+### Active kitchen execution completed (2026-08-21)
+
+- `compile_authored_scene_asset_world` composes the selected `PHYSICS_VALIDATED` TRELLIS apple (`assetver_246364a3`), the authored blender target, primary counter collision, and registered Panda into one immutable MuJoCo runtime. Other visual-only kitchen assets are explicitly omitted from physics until validated.
+- The active-world resolver requires one unambiguous movable source, one fixed target, and the implemented `on top of` relation. Unsupported throw/toss/off-table/outside-target instructions return HTTP 422 with `No simulation was started`.
+- The deterministic oracle uses bounded numerical IK, actuator tracking, bilateral contact validation, contact-feedback recentering, five lift segments, and 28 transport segments. It does not teleport joints or the object.
+- Production stream `live_c54c9a8f` delivered 1,636 continuous frames, 26,251,117 bytes of synchronized front/wrist JPEG evidence, 44 phases, and persisted `eval_a5e8369b/SUCCEEDED`.
+- Every streamed frame identifies the actual generated apple version and carries its PBR transform. The 313,605 source GLB vertices transformed through the manifest matched the metric runtime OBJ bounds within `7.81e-10 m`; the browser now loads the 16.5 MB textured GLB at the authoritative MuJoCo body pose while contacts use the separate convex collider.
+- The Panda editor preview returns 58 compiled geometries from the registered immutable MJCF at spawn `[-0.1500039619,-0.2895051834,0.9]`. Live Panda links use MuJoCo-compiled mesh buffers, fixing the exploded raw-OBJ/compiled-transform mismatch.
+- Self-hosted SigNoz Community `v0.137.1` is healthy at `127.0.0.1:8080`, OTLP probe is connected at `127.0.0.1:4318`, and current-process diagnostics contain zero events.
+- Base VLA `mdl_1a88cd40` loaded 2,593,879,303 parameters on `cuda:0` from `D:\VLA-JEPA-Pretrain` with downloads disabled. `eval_020eaf4e` failed `grasp_miss` after 40 finite actions. Candidate `mdl_3394f1ab` produced `eval_58c7456c/invalid_action` after 72 actions and remains unpromoted.
+- Loading a new VLA checkpoint now atomically demotes the previously resident registration. Live swap test `cmd_e1c4560e` then `cmd_66149b83` showed exactly one `LOADED` row each time and restored the base checkpoint; the catalog can no longer show two active brains for one worker.
+- Active-kitchen VLA now resolves through the same authored runtime and blender-support predicate as the oracle; no cube bench is substituted. `cmd_6d2048b8` / `eval_3d3211dc` ran 100 real two-camera actions from the base checkpoint and failed honestly with `grasp_miss` (no finger contact, maximum lift 4.35 micrometres, target error 0.865 m). Active-world Agent curriculum remains disabled until its scenario planner understands authored-world revisions.
+- Browser/computer-control providers were unavailable, so no visual click-through is claimed. The live API/WebSocket, generated artifacts, streamed geometry metadata, frontend build, and persisted evaluation were exercised directly.
+
+Commands/results:
+
+```powershell
+# backend regression
+.\.venv\Scripts\python.exe -m pytest tests/test_api.py tests/test_franka_oracle.py tests/test_rigid_asset_compiler.py -q
+# 32 passed in 111.66s
+
+.\.venv\Scripts\python.exe -m pytest tests/test_api.py tests/test_vla_policy_worker.py tests/test_franka_oracle.py -q
+# 29 passed in 41.10s
+
+# production active-world stream
+.\.venv\Scripts\python.exe scripts\run_live_franka_stream.py --robot-id franka-panda-mujoco-f9a4918f6663 --active-world-id door-validation-lab --instruction "Pick up the apple and place it on top of the blender."
+# live_c54c9a8f; 1,636 frames; pbrVisualFrames=1,636; eval_a5e8369b/SUCCEEDED
+
+# frontend
+npm.cmd run typecheck
+npm.cmd run lint
+npm.cmd run build
+# all passed; Vite built 95 modules
+```
+
+### 2026-08-21 screenshot-driven Worlds correction
+
+- User screenshots proved three production correctness defects: separated Panda links, an `outside the target` instruction passing the fixed in-target predicate, and the kitchen editor switching to an unrelated calibration world during Run live.
+- `GET /api/runtime/franka-compiled-meshes/{mesh}.obj` now serializes `mjModel.mesh_vert/mesh_face`. The `link1` regression test confirms served vertices match MuJoCo's compiled buffer and that the source has a non-zero `mesh_pos` transform.
+- `AuthoritativeSimulationCanvas` reads the latest geometry frame when asynchronous OBJ loads finish. Links can no longer freeze at different oracle phases after the stream ends.
+- `outside the target`, `outside of the target`, throw/toss, and off-table instructions fail validation with HTTP 422 and `No simulation was started` for the in-target pick/place contract.
+- Active-world execution is explicit (`executionScope=active_world`, `worldId=...`) and the supported apple-on-blender contract now runs the actual authored kitchen subset. Unsupported or ambiguous intents still fail closed; no validation bench is substituted.
+- `GET /api/worlds/scene/robot-preview` loads the selected immutable MJCF, applies the exposed counter mount, resets the real `home` keyframe, runs `mj_forward`, and returns 58 compiled mesh poses. Live spawn is `[-0.1500039619,-0.2895051834,0.9]`, yaw quaternion `[0.707106781187,0,0,0.707106781187]`.
+- The editor consumes those 58 poses and the same compiled mesh endpoint. This is truthfully marked `authoritativeForExecution=false` / `mountValidatedForExecution=false`; it is an authoring FK preview, not a completed rollout.
+- The real active-scene collision-subset compiler and persisted live route are now connected and passed the apple-to-blender run. This supersedes the earlier unilateral-grasp/transport probes.
+- Self-hosted SigNoz Community is running in Docker: UI `:8080`, OTLP `:4318`, version `v0.137.1`. The live RobotWorld probe returned `connected=true`; current-process diagnostics returned `healthy`, zero events. Docker is required for this current SigNoz deployment, not for MuJoCo/RobotWorld itself.
+- UI click-through could not be performed because both Windows computer control and the in-app browser reported unavailable. API readback, live services, compiler tests, TypeScript, and lint were run; visual completion remains `IMPLEMENTED_NOT_LIVE_TESTED` pending user refresh/screenshot or restored browser control.
+
+Commands/results for this correction:
+
+```powershell
+# backend
+.\.venv\Scripts\python.exe -m pytest tests/test_api.py::test_world_operator_rejects_implicit_or_unsupported_execution_contracts tests/test_franka_oracle.py::test_worlds_live_stream_is_continuous_and_persists_same_evaluation -q
+# 2 passed in 14.61s
+.\.venv\Scripts\python.exe -m pytest tests/test_rigid_asset_compiler.py -q
+# 9 passed in 61.35s
+.\.venv\Scripts\python.exe -m compileall -q app
+# passed
+
+# frontend
+npm.cmd run typecheck
+npm.cmd run lint
+# passed
+
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/integrations/signoz/probe
+# connected=true; community-self-hosted; v0.137.1
+
+Invoke-RestMethod http://127.0.0.1:8000/api/diagnostics/runtime
+# healthy; 0 current-process events
+```
+
+### Current-process diagnostics and interactive 3D correction
+
+- Backend restarted from `backend/run_server.py`; `/api/health` returned `healthy`, MuJoCo 3.11.0, 500 Hz, SigNoz `exporting`.
+- `/api/diagnostics/runtime` returned `healthy`, `events=0` after 200.6 seconds and after a full real oracle stream. Pre-restart rows are intentionally excluded by `STARTED_AT_WALL_MS`.
+- Self-hosted SigNoz probe performed a real OTLP HTTP/protobuf POST to `http://127.0.0.1:4318/v1/traces`: HTTP 200, Community `v0.137.1`. This replaces the previous TCP-port-only probe.
+- OTLP root log export now filters `opentelemetry.*` internal records so an exporter transport failure cannot recursively submit itself to the failed exporter.
+- Live run `live_b314f67c` delivered 138 frames from simulator time 0.300 s to 6.012 s across 10 continuous phases and persisted `eval_3c30c0f1/SUCCEEDED`.
+- Each live frame now includes visual geom identity, exact `data.geom_xpos` pose, quaternion converted from `data.geom_xmat`, shape/size, and RGBA. Collision-only group 3 is not rendered. The UI loads the pinned MuJoCo Menagerie OBJ visual meshes and applies only these authoritative transforms.
+- The pinned Panda visual endpoint served `link1.obj` with HTTP 200 (3,362,025 bytes); paths are regex-constrained and remain inside the immutable Menagerie asset directory.
+- Unsupported throw request returned HTTP 422 with `No simulation was started`; it did not create a disguised pick/place evaluation.
+- After the backend restart, approved base registration `mdl_1a88cd40` was explicitly reloaded: command `cmd_837c2350/SUCCEEDED`, worker PID 10868, CUDA 0, 2,593,879,303 parameters, 10.304 s load, offline/no downloads. This proves the checkpoint is resident; it does not change the prior measured zero-shot `grasp_miss` result.
+
+### Continuous Worlds simulation stream
+
+- Browser/Vite-proxied stream: `live_bbd70f00`, selected physical version `assetver_2882ab27`.
+- Received 330 live composite JPEG frames from simulator time 0.500 s through 13.922 s (approximately 24.6 sampled FPS) across reset, pre-grasp, approach, axis correction, close, lift, transport, place, release, retract, and settle.
+- The same run persisted `eval_daee839e/SUCCEEDED`; the asset was contained, released, settled, and passed its task predicate.
+- WebSocket messages are bounded: frames contain camera/state/contact samples; the terminal message contains the evaluation summary only. The complete trajectory remains in the internal catalog.
+- A discovered 1 MiB terminal-message overflow was reproduced through the Vite proxy and repaired instead of raising the client limit.
+
+### Direct World instruction
+
+Request:
+
+```text
+Pick up the object and place it in the target.
+```
+
+Selection: MuJoCo, deterministic oracle, `franka-panda-mujoco-f9a4918f6663`, built-in known-good cube, seed 6203.
+
+- Command: `cmd_2cb929b5`, `SUCCEEDED`.
+- Evaluation: `eval_6a859d30`, `SUCCEEDED`, `success=true`.
+- Final target error: `0.0058790349 m`.
+- Final predicates: contained, on support surface, settled, and released all true.
+- Recorded `settle/front` and `settle/wrist` PNG routes both returned HTTP 200.
+- Visual inspection of the recorded frames shows the real simulated Panda, table, object, target, and wrist view.
+
+### Exact AI-chat prompt after repair
+
+- Chat first proposed approval-gated `models.load`; `toolcall_f46259aa` loaded `mdl_1a88cd40` as `LOADED/healthy` in the isolated CUDA worker.
+- The typed planner saw prior learned-policy failure `eval_d47dac1d/invalid_action` and did not waste a second VLA episode or claim success.
+- It proposed `evaluations.run_oracle_compiled_asset` for `assetver_2882ab27`.
+- Approval-gated tool call `toolcall_43f32173`, command `cmd_c690a6d8`, produced `eval_fa78ceae/SUCCEEDED`.
+- Measured result: 1.106 s simulator wall time, 1,198 sampled contacts, contained/settled predicates true, target error `0.0040681797 m`, and 12 recorded front/wrist phases.
+- The automatic follow-up returned no further mutation and stated that the base VLA still needs repair or a validated candidate before another learned-policy episode.
+
+### Grounded AI-chat conversation
+
+Live turn 1, `gpt-5.6-luna`:
+
+```text
+Help me train my current robot.
+```
+
+The reply asked for the task, object/scene, and evaluation budget, returned zero actions, and stated that LeRobot fine-tuning is not implemented.
+
+Live turn 2:
+
+```text
+Pick up the object and place it in the target. Use the known-good cube,
+one world, two evaluation episodes, and ten GPU minutes.
+```
+
+- With the worker stopped, chat proposed exactly one valid action: `models.load` for `mdl_1a88cd40`.
+- Approval `approval_33e2c07f` and tool call `toolcall_6673f40d` loaded the real checkpoint.
+- Model load command `cmd_a23c8133` succeeded in about 10 seconds on the RTX 4080 Laptop GPU.
+- The isolated worker reported 2,593,879,303 parameters, two 224x224 image inputs, 7D actions, CUDA 12.8, and no network downloads.
+- After refresh, chat proposed exactly one valid `curriculum.runs.start` action with the requested IDs and budgets.
+
+### Autonomous oracle -> VLA -> diagnose run
+
+- Approval: `approval_4078f176`.
+- Agent tool call: `toolcall_14b5b2a8`.
+- Start command: `cmd_7196c750`.
+- Run: `autorun_61bf494c`, terminal `STOPPED/evaluation_budget_exhausted`.
+- Planner reused `assetver_2882ab27` and persisted `scenario_2a73b7a1`.
+- Oracle evaluation `eval_ff20c4c4`: `SUCCEEDED`, target error `0.0124938136 m`.
+- Real VLA evaluation `eval_d47dac1d`: `FAILED/invalid_action` after 132 policy steps.
+- Exact failure: the accumulated Cartesian target left the configured Franka safety box at `[0.8598422565, -0.0000342067, 0.3990430161]`.
+- Failure event `failure_32f92187` records finite state, 528 contact samples, the passing oracle counterpart, classifier revision `structured-failure-v2`, and recommendation `REPAIR_POLICY_RUNTIME`.
+- This proves the local model, two-camera observation path, 7D decoder, IK adapter, safety gate, telemetry, persisted failure analysis, and bounded stop policy execute. It does **not** prove VLA task success or training.
+
+### Validated LeRobot demonstration
+
+- Source oracle command/evaluation: `cmd_a14d3e3b` / `eval_6ad08a38`, `SUCCEEDED`, 242 synchronized front/wrist observations.
+- Export command: `cmd_0a0846f1`, `SUCCEEDED`.
+- Dataset: `dataset_bf1181b4`, `VALIDATED`, repo ID `robotworld/dataset_bf1181b4`.
+- Contract: 1 episode, 92 frames at 10 Hz, 184 embedded image observations, two 224x224 cameras, 8-D state, 7-D local Cartesian action.
+- Worker performed LeRobot readback of first/last samples and verified image/state/action shapes. `readbackValidated=true`; `pushedToHub=false`.
+- Source manifest SHA-256: `aa6dc84108c44b52cddf3ae199fe2aa6b1f95977c48e4e9a7ed8b98ccfa0ca53`.
+- Dataset-info SHA-256: `60fb856e97a1003a23ef1b163481cf4ef07fb5e978316ce7381aaa4ec9a568bb`.
+- Older export `dataset_0fc1185d` predates readback validation and is now surfaced as `LEGACY_UNVERIFIED`; it is not accepted as training evidence.
+
+### Corrected DROID action bridge and live World agent
+
+- Official DROID source confirms the pretrained action is normalized base-frame Cartesian velocity, not an end-effector-local physical delta. The bridge now records `droid-franka-cartesian-velocity-v1`, applies the official 0.075 m / 0.15 rad limits, and uses base-frame translation/extrinsic rotation.
+- Corrected live evaluation: `cmd_bef30993` / `eval_b7eb9dac`, 100 finite learned-policy steps, no invalid action, recorded front/wrist observations. It failed `grasp_miss`; minimum hand-to-object distance was 0.146763 m.
+- Failure analysis: `cmd_dd571237` / `failure_2dabce4d`, with passing oracle counterpart `eval_fa78ceae` and a targeted pose/orientation recommendation.
+- Exact Worlds prompt in Agent mode created `cmd_9dcd0683` / `autorun_2ba734af`. It planned `scenario_8d712325`, passed oracle `eval_22b68846`, ran VLA `eval_e6f0ca04`, diagnosed `grasp_miss`, and stopped at its configured one-iteration budget.
+- The expanded live Worlds run `cmd_416a4a83` / `autorun_266cd0c7` exercised all three configured iterations and six evaluation episodes. Oracle evaluations `eval_305e4519`, `eval_49eb2f6c`, and `eval_561dcfcb` all succeeded on distinct persisted scenarios. Learned-policy evaluations `eval_d9a12458`, `eval_de6445f9`, and `eval_f9424abf` all executed finite base-frame actions and failed `grasp_miss`.
+- The run stopped cleanly with `consecutive_failure_stop` after consuming three worlds, six episodes, and 0.2135 GPU minutes. No invalid-action fault or success fabrication occurred.
+
+### Self-hosted SigNoz Community
+
+- Official Foundry `v0.2.17` was downloaded under ignored `.downloads/`; archive SHA-256 `625c7985b8ac6f3e4a99576c1dceaa4fa46fa4a54b2c53f515dff7f63da8dd4a` matched the published release.
+- Live stack: SigNoz `v0.137.1`, ClickHouse/Keeper `25.12.5`, Postgres `16`, collector digest `sha256:6d1a59bc553e041014597eff0970608948c5c7447aaa984c4d109f2bc9f4062c`.
+- Foundry's generated OpAMP address incorrectly selected the Postgres service and then supplied no-op pipelines before onboarding. `ops/signoz/compose.override.yaml` pins the collector and runs the checked-in OTLP pipelines directly.
+- SigNoz health returns 200; 4317/4318 are listening inside the collector; the RobotWorld probe reports `connected=true`, `community-self-hosted`, `v0.137.1`.
+- Direct ClickHouse evidence after restart: `robotworld-backend` had 1,231 spans, latest timestamp `2026-08-21 20:15:13.058118900`. No cloud ingestion key is used.
+- Initial local admin/service-account creation remains a human credential action. Ingestion and display work now; server-side SigNoz API queries need that local service-account key.
+
+### Post-dataset VLA runtime verification
+
+- Installing the official local `D:\LeRobot[dataset]` extra added the dataset stack without downloading a checkpoint.
+- Load command `cmd_53bb7226` succeeded after that environment change.
+- Worker PID `43432` loaded 2,593,879,303 parameters on the RTX 4080 Laptop GPU in 11.12 seconds, offline, with CUDA 12.8.
+- Live status reports `LOADED/healthy`, resident worker, compatible Franka bridge, two cameras, state 8, action 7.
+- Live AI chat was asked to export the recorded oracle demonstration; it found `dataset_bf1181b4` and correctly returned no duplicate mutation.
+
+### Real bounded VLA-JEPA fine-tuning candidate
+
+- Installed the official local `D:\LeRobot[training]` extra into the isolated VLA environment; no checkpoint was downloaded.
+- Preflight command `cmd_ba95ba47` produced `trainrun_26a4f2b4/READY` after reading a real dataset sample and validating action `[7,7]`, two camera tensors `[1,3,224,224]`, state `[1,8]`, CUDA/bfloat16, LeRobot 0.6.2, Accelerate 1.14.0, and offline/no-Hub/no-W&B configuration.
+- The first direct optimizer smoke run wrote its checkpoint but failed the official Windows `last` symlink with WinError 1314. It is preserved as `trainrun_e508ec70/FAILED`; it is not presented as success.
+- The worker now uses a scoped Windows completion-pointer fallback without modifying `D:\LeRobot`.
+- `trainrun_89c6a7f8` completed one real optimizer step and is durably `SUCCEEDED`.
+- Candidate checkpoint: `backend/data/training-runs/trainrun_89c6a7f8/candidate/checkpoints/000001/pretrained_model`.
+- Candidate weights: 5,498,243,572 bytes, SHA-256 `9bfa07b9519b1d26620780c1eec6bcec4a8f7f35c4de14f1aad78f451f5392c5`.
+- Active checkpoint overwritten: false. Hub push: false. Automatic promotion: false.
+- Recovery/execute command `cmd_b6d1f76c` verified the immutable candidate through the new API.
+- Preflight and execution are separate approval-gated agent tools. Execution is intentionally bounded to 1-10 steps, batch 1, frozen Qwen, and world model disabled on the verified 12 GiB profile. Durable cancellation/resume and held-out candidate promotion are not yet implemented.
+
+### Candidate registration and held-out evaluation
+
+- Registration command `cmd_d72fa9a1` created separate model `mdl_3394f1ab` for `trainrun_89c6a7f8`; the base `mdl_1a88cd40` was not changed.
+- Validation command `cmd_ea971d6a` produced `AVAILABLE/healthy`; manifest SHA-256 `daabcb649bf8c6cabbe7293448c10b8b069b8ab3c5cbee08b40e8250b851fcbf`, two cameras, 8-D state, 7-D action, world-model inference disabled.
+- The first candidate inference load exposed a real metadata-only Qwen detection bug. The probe now distinguishes metadata from full weights and uses the scoped structure-loader for base and candidate checkpoints. No Qwen/model download occurred.
+- Load command `cmd_85851e77` loaded 2,593,879,303 parameters on CUDA in 10.85 s from the candidate checkpoint.
+- The exact Franka bridge was attached with command `cmd_cb3bfda6`.
+- Held-out command/evaluation `cmd_9428e49b` / `eval_26568722` ran the same robot, asset, instruction, and seed as the base comparison.
+- Result: `FAILED/grasp_miss`, 150 finite trajectory steps, 600 contact samples, no gripper/object contact, target error `0.3 m`. Unlike the base run, it did not leave the workspace with `invalid_action`, but it still failed the task.
+- Failure event `failure_5c63d864` links the passing oracle counterpart `eval_fa78ceae` and recommends targeted pose/orientation variation.
+- Candidate promotion was rejected by evidence: it remains `AVAILABLE/healthy`, not active. Base model `mdl_1a88cd40` was reloaded as `LOADED/healthy` after the comparison.
+- A live status defect discovered after that reload was repaired: `/api/models/vla-jepa/status` had selected the first VLA registration even when a different checkpoint was resident. It now matches the worker's normalized resident checkpoint path first, then falls back to the `LOADED` catalog row.
+- Live post-restart evidence: registration `mdl_1a88cd40`, lifecycle `LOADED`, health `healthy`, resident path `D:\VLA-JEPA-Pretrain`, bridge compatible, zero contract blockers. Reload command: `cmd_82d93021`.
+
+### Governed policy candidate decision
+
+- Added durable `PolicyCandidateDecisionRecord` state, exact evaluation evidence, immutable audit transitions, promotion gates, active-model swap recovery, and rollback handling.
+- Promotion requires at least 3 successful held-out evaluations with distinct seeds (configurable by `ROBOTWORLD_POLICY_PROMOTION_MIN_EVALUATIONS`) and refuses any supplied failure.
+- AI chat phrase `Reject the candidate; do not promote it.` resolved the current training run, candidate registration, base registration, and exact failed evaluation without invented IDs.
+- Approval `approval_c123f665` authorized tool `training.policy_candidates.decide`; tool call `toolcall_3e4e8fd0` and command `cmd_9b86127d` created `policydecision_df5f0dcb/REJECTED` from `eval_26568722/grasp_miss`.
+- The rejected candidate remains separate. Reload command `cmd_e5e578dd` restored/verified base `mdl_1a88cd40` as `LOADED`, worker-resident at `D:\VLA-JEPA-Pretrain`.
+- Training UI shows the measured decision inline with the candidate instead of adding another dashboard panel.
+
+### Local TRELLIS.2 Q4 proof
+
+- The existing local Q4 CUDA artifact is exposed on Assets as an optional interactive PBR GLB preview, with conditioning and baked base-color images.
+- Recorded run: 134.2 s, seed 6204, 91,506 vertices, 144,174 faces, 512px PBR texture, one PBR material, 9,428,452-byte GLB.
+- This remains visual geometry only until a specific version passes the separate physical compiler and Franka gates.
+
+## UI corrections completed
+
+- `frontend/src/pages/Worlds.tsx`
+  - restored the original hierarchy/editor/inspector/console layout;
+  - preserved real asset placement editing;
+  - removed invented Samsung/physics/provenance inspector values;
+  - added backend/task/robot/controller/physical-asset/policy selection in the Agent inspector;
+  - sends Execute to `/api/worlds/operate`;
+  - supports oracle, VLA, autonomous loop, drawer, MuJoCo, and the fail-closed Isaac adapter;
+  - displays authoritative recorded front/wrist evaluation frames rather than animating success.
+- `frontend/src/pages/Assets.tsx`: restored the tracked original asset library; advanced physical-version evidence is collapsed by default instead of dominating the page; added an optional real local TRELLIS Q4 GLB/PBR proof viewer.
+- `frontend/src/components/shell/Sidebar.tsx`: restored all original pages/navigation.
+- `frontend/src/styles/tokens.css`: restored the original graphite/dark-gray/white palette.
+- `frontend/src/styles/ui2.css`: removes the white active-navigation rail and decorative status dots, and styles recorded World results without rounded white side rails.
+- `frontend/src/components/ai/AiChatPanel.tsx`: automatically continues planning after a tool result; hidden tool context is retained for reasoning but not rendered as an extra user message.
+- `frontend/src/pages/Training.tsx`: shows validated LeRobot demonstrations, READY/FAILED/SUCCEEDED fine-tuning candidates, immutable candidate hash/size, and approval-gated candidate-only language.
+  - now also shows durable PROMOTED/REJECTED decision state and measured evaluation count inline for each candidate.
+- `frontend/src/pages/Settings.tsx`: removed the stale “Isaac deferred/disabled” claim and shows the detected Isaac Sim/Isaac Lab/OpenUSD runtime plus the exact remaining EULA blocker.
+
+## Backend corrections completed
+
+- `backend/app/main.py`
+  - `/api/worlds/operate` is the typed shared human/agent command surface for the World UI;
+  - chat receives bounded real workspace context;
+  - offline intent handling still identifies current robot/model/asset and fails closed;
+  - chat tool catalog now includes exact JSON input schemas, so proposed actions contain required fields;
+  - broad training requests ask questions before proposing mutations;
+  - typed high-confidence intents preserve the original instruction across hidden tool-result turns and route known `invalid_action` policy failures to the real oracle rather than repeating a broken VLA;
+  - Isaac World commands validate that the selected robot is the registered Isaac OpenUSD Franka;
+  - product prompt distinguishes dataset/preflight/optimization/candidate/promotion stages;
+  - `/api/models/vla-jepa/status` now reports the canonical registered Franka bridge instead of the obsolete 5-D legacy contract.
+  - VLA status is bound to the checkpoint actually resident in the isolated worker, so an inactive candidate cannot be misreported as the active base policy.
+- `backend/app/services/lerobot_dataset.py` and `backend/workers/lerobot_dataset_worker.py`
+  - export synchronized successful oracle trajectories through the exact installed LeRobot API;
+  - validate paths/hashes, camera shapes, state/action dimensions, metadata counts, and dataset readback;
+  - keep artifacts local and immutable; no Hub push.
+- `backend/app/services/agent_tools.py`: exposes `training.datasets.create_from_evaluation` as an approval-gated typed mutation.
+- `backend/app/services/lerobot_training.py`, `backend/workers/lerobot_training_worker.py`, and `backend/workers/lerobot_training_execute_worker.py`: durable preflight catalog, bounded offline optimizer execution, immutable candidate hashing, Windows-safe completion pointer, and direct-run reconciliation.
+- Agent tools now include approval-gated `training.vla_jepa.validate_fine_tune` and `training.vla_jepa.execute_fine_tune`.
+- `backend/app/services/policy_lifecycle.py`: measured candidate promotion/rejection gates, rollback model preservation, activation recovery, command envelopes, and audit events.
+- Agent tools now also include approval-gated `training.policy_candidates.decide` and `training.policy_candidates.rollback`.
+- `backend/tests/test_api.py`
+  - covers unsupported World execution contracts;
+  - covers grounded training clarification;
+  - covers stopped-model -> load and loaded-model -> bounded-run progression;
+  - verifies chat exposes required tool-schema fields.
+  - verifies the chat proposes dataset export only for recorded successful oracle evidence.
+  - verifies worker-resident checkpoint selection wins over catalog ordering in the VLA status API.
+
+## Current architecture from code
+
+- FastAPI control plane plus React/Vite UI.
+- Internal SQLite catalog and filesystem artifact store; critical state does not depend on SigNoz.
+- 54 versioned JSON-schema agent tools with approval, audit, durable IDs, and no arbitrary shell tool.
+- MuJoCo is the currently validated authoritative backend through the simulation boundary.
+- Franka uses seven arm joints, a parallel gripper, deterministic reset, differential IK, front RGB, and hand-mounted wrist RGB.
+- Canonical asset manifests compile immutable visual, collision, OpenUSD, and MuJoCo artifacts.
+- VLA-JEPA runs in `D:\RobotWorldRuntimes\vla-env` against the local checkpoint and LeRobot checkout.
+- LeRobot datasets are written under `backend/data/datasets/<dataset_id>` by an isolated worker and listed in Training.
+- Fine-tuning candidates are written under `backend/data/training-runs/<run_id>` and never replace the active checkpoint.
+- NVIDIA Isaac Sim 6.0.1/Isaac Lab are isolated behind the Isaac adapter. Runtime launch remains blocked by the unaccepted NVIDIA EULA; the project does not set acceptance automatically.
+- OpenTelemetry spans persist locally and export to the live self-hosted SigNoz Community deployment.
+- Port remains deferred and disabled.
 
 ## Requirement status
 
-| Capability | Status | Evidence |
-|---|---|---|
-| Phase 0 reproducible repository | IMPLEMENTED_AND_TESTED | Ruff clean, 58 pytest + frontend typecheck/lint/production build (89 modules) |
-| Internal catalog / audited idempotent commands | IMPLEMENTED_AND_TESTED | SQLite models, command hash/replay tests, live restart/readback |
-| Durable provider/evaluation runs | IMPLEMENTED_AND_TESTED | evaluation persistence, resumable evidence snapshots, uncertain-trigger protection, scenario transition audit, and restart-to-retryable reconciliation |
-| Models page and provider/path registry | IMPLEMENTED_AND_TESTED | real APIs/UI; 6.16 GB local checkpoint validation |
-| Robots page and Franka default | IMPLEMENTED_AND_TESTED | pinned licensed MJCF, activation, camera, gripper, physics tests |
-| Generic robot import | PARTIAL | canonical inspection exists; only Franka is fully physics validated |
-| Authoritative MuJoCo pick/place | IMPLEMENTED_AND_TESTED | 3-seed regression plus two live successful seeds |
-| Front/wrist observations | IMPLEMENTED_AND_TESTED | calibration metrics, PNG hashes, frame API; browser visual QA unavailable |
-| VLA-JEPA worker, bridge, and authoritative evaluation | IMPLEMENTED_NOT_LIVE_TESTED | production worker/endpoint/IK/predicates/durable failure path are physics-tested; live checkpoint load is blocked and no live policy output is claimed |
-| Agent typed tool registry | IMPLEMENTED_AND_TESTED | 47 tools; durable approvals/tool calls; scenario/controller/repair execution proved live; one-use approval and policy-allowed kill switch |
-| Exact evidence normalization/catalog/UI | IMPLEMENTED_AND_TESTED | controlled pass + mixed-SKU fail + immutable artifacts |
-| Live Bright Data collection | BLOCKED_BY_CREDENTIAL | durable adapter/UI/tests complete; live run failed before snapshot on missing token |
-| Scraper self-healing governance | PARTIAL | canonical state machine, exact quality failure, versioned golden/canary, schema diff, policy decision, rollback, restart persistence, tools/UI, and disabled legacy bypass are tested/live; live provider is credential-blocked and downstream evidence/asset/robot revalidation is not yet orchestrated |
-| TRELLIS.2 live generation | BLOCKED_BY_HARDWARE | local paths exist; no live inference run; do not claim generation |
-| Rigid OpenUSD + MuJoCo asset compiler | IMPLEMENTED_AND_TESTED | canonical manifest, immutable artifacts, separate convex collision, explicit mass/inertia, USD/MJCF, synthetic + real TRELLIS GLB drop/settle proof |
-| Generated-asset Franka oracle gate | IMPLEMENTED_AND_TESTED | real TRELLIS banana `assetver_20e79f28`, stable placement, bilateral physical grasp, lift/place/release/containment, durable `eval_c12f4fb7` |
-| Semantic placement planner | IMPLEMENTED_AND_TESTED | semantic request rejects unchecked XYZ; seeded baseline/position/orientation worlds pass clearance/reachability/penetration/drop-settle and immutable hash checks for compiled Franka pick/place |
-| Structured failure/coverage/next-scenario planner | IMPLEMENTED_AND_TESTED | real history indexed; configured bins/budgets/Wilson interval; validated asset reuse; duplicate fingerprint and stop gates tested/live |
-| Autonomous next-world execution loop | PARTIAL | persisted plan/oracle/VLA/analyze/repeat state machine, aggregate budgets, restart rescheduling, idempotency, Agent Control UI, and kill switch are tested; oracle/block/cancel paths are live, but live VLA is externally blocked and evidence-build dispatch is not yet connected |
-| Articulated cabinet/drawer | MISSING | no accepted physics-driven PartGraph pipeline yet |
-| Self-hosted SigNoz | IMPLEMENTED_NOT_LIVE_TESTED | keyless OTLP config; no local instance connected |
-| Port | DEFERRED | disabled feature flag; no production UI/gate |
-| Isaac Sim | DEFERRED | disabled feature flag; not installed |
+| Feature | Status | Evidence / remaining limitation |
+| --- | --- | --- |
+| Original Worlds/Assets/navigation restored | IMPLEMENTED_AND_TESTED | Files restored; frontend typecheck/lint/build and HTTP routes pass. Browser attachment was unavailable for click QA. |
+| World natural-language instruction -> real physics | IMPLEMENTED_AND_TESTED | Active Kitchen Juice Workspace `live_c54c9a8f` / `eval_a5e8369b` resolved apple + blender, streamed 1,636 frames, and passed measured contact/containment predicates. |
+| Models page/local VLA registration/load | IMPLEMENTED_AND_TESTED | `mdl_1a88cd40` is `LOADED/healthy`; real CUDA load executed. |
+| Robots page/default Franka | IMPLEMENTED_AND_TESTED | Real Panda MJCF, gripper, cameras, reset, and oracle. |
+| Authoritative Franka pick/place | IMPLEMENTED_AND_TESTED | Direct and autonomous oracle evaluations passed. |
+| Real VLA-JEPA bridge/evaluation | IMPLEMENTED_AND_TESTED | Exact active-kitchen `eval_3d3211dc` ran 100 finite base-checkpoint actions with front/wrist observations against the same apple/blender runtime as the oracle. |
+| VLA-JEPA task success | BROKEN | Active-kitchen zero-shot run `eval_3d3211dc` failed `grasp_miss`; no finger contact and 0.865 m final target error. A one-step candidate also remains rejected. Oracle success is reported separately. |
+| LeRobot dataset writer | IMPLEMENTED_AND_TESTED | `dataset_bf1181b4` passed exact LeRobot write/readback validation; agent tool and Training UI are connected. |
+| VLA-JEPA fine-tuning worker | PARTIAL | Real one-step candidate `trainrun_89c6a7f8` completed and was hashed; execution is limited to a verified 1-10 step profile and lacks durable cancel/resume and promotion gates. |
+| Candidate registration/held-out comparison | IMPLEMENTED_AND_TESTED | `mdl_3394f1ab` loaded offline; `eval_26568722` failed `grasp_miss`, so candidate was not promoted and base was restored. |
+| Policy promotion/rejection/rollback lifecycle | IMPLEMENTED_AND_TESTED | Agent-created `policydecision_df5f0dcb/REJECTED` is bound to failed evaluation evidence; promotion has multi-seed success gates and active-model recovery; base remained active. |
+| Continuous Worlds Franka viewer | IMPLEMENTED_AND_TESTED | `live_c54c9a8f` streamed 1,636 active-kitchen MuJoCo frames with compiled Panda meshes, generated-apple PBR/body-pose metadata, two camera views, and persisted `eval_a5e8369b/SUCCEEDED`. Browser attachment was unavailable for visual click QA. |
+| Arbitrary prompt -> robot behavior | PARTIAL | Pick/place, drawer, VLA, and bounded agent routes are explicit. Unsupported intents such as throw now fail closed before execution; they are not yet compiled into new task predicates/controllers. |
+| Autonomous oracle-before-VLA diagnosis loop | IMPLEMENTED_AND_TESTED | Live run `autorun_266cd0c7` completed three persisted scenarios, three passing oracle episodes, three finite VLA episodes, and stopped on the configured consecutive-failure policy. |
+| OpenUSD + runtime compilation | IMPLEMENTED_AND_TESTED | Physical versions contain canonical OpenUSD plus MuJoCo artifacts. |
+| Real TRELLIS.2 Q4 generation | IMPLEMENTED_AND_TESTED | Existing CUDA proof GLB is 9,428,452 bytes with PBR textures and recorded provenance. |
+| Multiple texture/appearance selection | PARTIAL | Assets can display the real embedded PBR GLB and texture artifact; only one recorded Q4 appearance exists, so no second appearance is claimed or selectable. |
+| Bright Data exact evidence live call | IMPLEMENTED_NOT_LIVE_TESTED | Server reports Bright Data configured; no billable/live exact-object request was issued in this correction pass. |
+| Governed scraper repair | IMPLEMENTED_AND_TESTED | Controlled golden/canary/promotion/rollback path exists. |
+| Articulated product cabinet/drawer | PARTIAL | Controlled real drawer oracle works; evidence-backed multipart product asset remains missing. |
+| Isaac Sim authoritative run | BLOCKED_BY_LICENSE | Isaac Sim 6.0.1 and Isaac Lab are detected/configured; correct OpenUSD Franka dispatch reaches the isolated adapter, but the API process cannot accept NVIDIA's EULA for the operator. |
+| Self-hosted SigNoz export/display | IMPLEMENTED_AND_TESTED | Community `v0.137.1` is healthy on 8080, OTLP is live on 4317/4318, and ClickHouse contains RobotWorld spans. |
+| Server-side SigNoz read queries | BLOCKED_BY_CREDENTIAL | Adapter/probe exists; create a local SigNoz service-account API key after first-admin onboarding. No cloud key is needed. |
+| Port | MISSING | Intentionally deferred. |
 
-## Current blockers
+## Commands run in this correction pass
 
-- `BLOCKED_BY_CREDENTIAL`: no server-side `BRIGHTDATA_API_TOKEN`; exact live collection fails explicitly before a provider snapshot, and canonical repair `scraperrepair_d221d663` persisted `EXHAUSTED` at attempt 1/1 with no candidate or fallback.
-- `BLOCKED_BY_HARDWARE`: official TRELLIS.2 documents a Linux environment and at least 24 GB VRAM; configured code revision `65d1e13b4a92296036044df0633242bb9e95abf6` exists locally with user modifications, but this host exposes an RTX 4080 Laptop GPU with about 12 GB VRAM. No live generation was attempted or claimed; a prior real output was compiled instead.
-- `IMPLEMENTED_NOT_LIVE_TESTED`: VLA-JEPA checkpoint cannot load because no compatible `LEROBOT_REPO_PATH`/`lerobot` package or local `Qwen/Qwen3-VL-2B-Instruct` dependency is configured. CUDA is available in the selected worker environment. The checkpoint's absent state feature is valid/optional, but the unmodified DROID revision still lacks a proven Franka camera mapping, adapter/action representation, robot-definition hash, control rate, and Franka-specific normalization/training provenance.
-- Interactive UI QA: no controllable in-app browser session is connected. Typecheck/lint/production build pass.
-- Self-hosted SigNoz Community is not running locally; no installation was attempted before the core simulation/evidence slices.
+Most recent current-process/3D correction (2026-08-21):
 
-## Next executable task
+```powershell
+# from D:\RobotWorldProject\backend
+.\.venv\Scripts\python.exe -m pytest tests/test_api.py::test_world_operator_rejects_implicit_or_unsupported_execution_contracts tests/test_api.py::test_frontend_diagnostics_and_isaac_reports_explicit_runtime_state tests/test_franka_oracle.py::test_worlds_live_stream_is_continuous_and_persists_same_evaluation -q
+# 3 passed in 14.68s
 
-1. Implement a persisted post-promotion follow-up for `ScraperRepairRunRecord`: normalize the promoted candidate output into a new evidence-bundle revision, link it to the prior failed bundle, and persist its semantic quality outcome. Do not mutate the old evidence bundle.
-2. Only when that evidence request has a genuinely matching source geometry/asset lineage, queue existing asset static/physics revalidation and the deterministic Franka oracle; otherwise stop at an explicit `asset_source_missing` blocker instead of pairing unrelated geometry with the repaired evidence.
-3. Route the autonomous controller's `BUILD_OR_REUSE_SCENARIO` evidence branch through these durable commands and charge `scrapeRequests`/`gpuMinutes` from actual activities. Keep Bright Data/TRELLIS failures terminal and visible; never replace them with controlled fixtures.
-4. Independently, point `LEROBOT_REPO_PATH` at an exact compatible local LeRobot/VLA-JEPA checkout and configure the local Qwen dependency/cache without downloads. A DROID checkpoint must remain unavailable for Franka execution until a genuinely adapted revision supplies `franka-cartesian-delta-v1`, exact front/wrist mapping, robot-definition and normalization hashes, control rate, and training provenance.
+.\.venv\Scripts\python.exe -m pytest -q
+# 86 passed in 113.48s
+
+# from D:\RobotWorldProject
+backend\.venv\Scripts\python.exe backend/scripts/run_live_franka_stream.py --robot-id franka-panda-mujoco-f9a4918f6663
+# live_b314f67c; 138 frames; eval_3c30c0f1; SUCCEEDED
+
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/integrations/signoz/probe
+# connected=true; v0.137.1; otlpHttpStatus=200
+
+Invoke-RestMethod http://127.0.0.1:8000/api/diagnostics/runtime
+# healthy; zero current-process ERROR/WARN events
+
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/models/mdl_1a88cd40/load
+# cmd_837c2350/SUCCEEDED; CUDA worker PID 10868; 2,593,879,303 parameters resident
+
+# from D:\RobotWorldProject\frontend
+npm.cmd run typecheck
+npm.cmd run lint
+npm.cmd run build
+# all passed; Vite built 95 modules
+```
+
+From `D:\RobotWorldProject\backend`:
+
+```powershell
+.\.venv\Scripts\python.exe -m py_compile app\main.py
+.\.venv\Scripts\python.exe -m pytest tests\test_api.py -q
+# 14 passed in 8.00s
+
+.\.venv\Scripts\python.exe -m pytest -q
+# 86 passed in 54.82s after the continuous Worlds stream integration
+
+.\.venv\Scripts\python.exe scripts\run_live_franka_stream.py --api http://127.0.0.1:5173 --robot-id franka-panda-mujoco-f9a4918f6663 --asset-version-id assetver_2882ab27
+# 330 frames, 11 motion phases, eval_daee839e SUCCEEDED
+
+.\.venv\Scripts\python.exe -m pytest tests\test_api.py tests\test_vla_policy_worker.py -q
+# 25 passed in 10.92s
+
+.\.venv\Scripts\python.exe -m pytest tests\test_agent_tools.py tests\test_api.py tests\test_lerobot_dataset.py -q
+# 22 passed in 9.44s
+
+D:\RobotWorldRuntimes\vla-env\Scripts\python.exe -m ensurepip --upgrade
+D:\RobotWorldRuntimes\vla-env\Scripts\python.exe -m pip install -e 'D:\LeRobot[dataset]'
+# installed the official local LeRobot dataset extra; no model/checkpoint download
+
+D:\RobotWorldRuntimes\vla-env\Scripts\python.exe -m pip install -e 'D:\LeRobot[training]'
+# installed official local training dependencies; no checkpoint download
+
+D:\RobotWorldRuntimes\vla-env\Scripts\python.exe -u workers\lerobot_training_execute_worker.py --manifest data\training-runs\trainrun_89c6a7f8\preflight_input.json
+# one real optimizer step completed; immutable candidate saved and later reconciled into the catalog
+```
+
+From `D:\RobotWorldProject\frontend`:
+
+```powershell
+npm.cmd run typecheck
+# passed
+
+npm.cmd run lint
+# passed
+
+npm.cmd run build
+# passed; Vite built 94 modules
+```
+
+Live checks:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/health
+Invoke-WebRequest http://127.0.0.1:5173/#/worlds -UseBasicParsing
+Invoke-WebRequest http://127.0.0.1:5173/#/assets -UseBasicParsing
+# backend healthy; both frontend routes HTTP 200
+
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/models/mdl_1a88cd40/load
+# cmd_82d93021; CUDA worker resident/healthy after backend restart
+
+Invoke-RestMethod http://127.0.0.1:8000/api/models/vla-jepa/status
+# mdl_1a88cd40 / LOADED / healthy / D:\VLA-JEPA-Pretrain / bridge compatible / zero blockers
+
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/chat
+# resolved "Reject the candidate; do not promote it." to the exact failed candidate/evaluation
+
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/agent/tools/invoke
+# toolcall_3e4e8fd0 / cmd_9b86127d / policydecision_df5f0dcb REJECTED
+
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/worlds/operate
+# cmd_2cb929b5 / eval_6a859d30 SUCCEEDED for the exact user instruction
+
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/agent/tools/invoke
+# toolcall_43f32173 / cmd_c690a6d8 / eval_fa78ceae SUCCEEDED through the AI-chat action chain
+
+Invoke-RestMethod http://127.0.0.1:8000/api/simulation/isaac
+# Isaac Sim 6.0.1 installed/configured; launch blocked only by operator EULA acceptance
+
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/integrations/signoz/probe
+# connected=true / community-self-hosted / v0.137.1 / OTLP 4318
+
+docker exec robotworld-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query `
+  "SELECT serviceName, count(), max(timestamp) FROM signoz_traces.signoz_index_v3 WHERE serviceName='robotworld-backend' GROUP BY serviceName"
+# robotworld-backend / 1231 spans / latest 2026-08-21 20:15:13.058118900
+
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/worlds/operate
+# cmd_9dcd0683 / autorun_2ba734af / real oracle -> VLA -> structured diagnosis
+```
+
+One initial verification command was intentionally retained as evidence of an invocation mistake: running `python -m pytest backend/tests/...` from the repository root failed because `app` was not on `PYTHONPATH`, and bare `npm` was blocked by PowerShell script policy. Re-running from `backend` with `.\.venv\Scripts\python.exe` and from `frontend` with `npm.cmd` produced the passing results above.
+
+`git diff --check` passed; only expected LF/CRLF warnings were emitted.
+
+The in-app browser provider returned `No browser is available`, so this pass does not claim visual click-through of the rebuilt UI. Recorded physics images were inspected directly and API/UI routes were exercised live.
+
+## Exact next executable task
+
+Add frame callbacks and bounded WebSocket messages to the now-tested authored-kitchen VLA evaluator so Worlds displays its 10 Hz learned actions continuously instead of returning only the persisted terminal result. Keep `eval_3d3211dc/grasp_miss` visible beside the passing oracle; never substitute or animate a scripted success.
+
+Then run the active kitchen apple-to-blender oracle over at least three distinct persisted placement seeds and add those runs as an automated integration gate. The one current production seed passes, but variation robustness is not yet proven.
+
+Then add a typed manual-control session to the same authoritative Worlds viewport (pause/resume/reset, bounded Cartesian jog, gripper open/close, cancellation) with every command persisted and safety-checked. Add an explicit `throw_off_table` task definition and predicate before allowing that instruction to execute; until then throw instructions must continue to fail before simulation.
+
+After those interaction contracts pass, build a targeted pose/orientation scenario and demonstration dataset from `failure_5c63d864` plus passing oracle `eval_fa78ceae`, then create and evaluate a fresh candidate across at least three distinct held-out seeds. Do not reuse or promote rejected `mdl_3394f1ab`.
+
+After that:
+
+1. Add durable cancellation/resume around optimizer execution before running beyond the 1-10 step verified profile.
+2. Run live Bright Data only for a user-selected exact product; the configured provider call may be billable.
+3. Compile a real evidence-backed multipart drawer/cabinet.
+4. Create the first local SigNoz admin/service account, store its key as a server-only secret reference, and live-test the existing read-only query adapter.
+5. After reading NVIDIA's license, accept it as the operator with `[Environment]::SetEnvironmentVariable("OMNI_KIT_ACCEPT_EULA","YES","User")`, restart RobotWorld, then execute the bounded Isaac Franka worker from Worlds.
+
+Do not claim VLA task success, candidate promotion, a new live Bright Data request, product articulation, Isaac execution, or SigNoz integration until their recorded gates pass.

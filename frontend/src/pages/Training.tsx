@@ -24,6 +24,54 @@ interface TrainingData {
     nextStep: { name: string; meta: string };
     confidence: number;
   } | null;
+  datasets: LeRobotDataset[];
+  canonicalRuns: CanonicalTrainingRun[];
+  policyDecisions: PolicyDecision[];
+}
+
+interface LeRobotDataset {
+  datasetId: string;
+  lifecycleState: string;
+  sourceEvaluationId: string;
+  repoId: string;
+  fps: number;
+  totalEpisodes: number;
+  totalFrames: number;
+  imageCount: number;
+  imageStorage: string;
+  readbackValidated: boolean;
+  pushedToHub: boolean;
+  sourceManifestSha256: string;
+}
+
+interface CanonicalTrainingRun {
+  id: string;
+  lifecycleState: string;
+  datasetId: string;
+  baseModelId: string;
+  inputSha256: string;
+  error?: string | null;
+  candidateCheckpointPath?: string | null;
+  candidateCheckpointSha256?: string | null;
+  metrics?: { stepsCompleted?: number; durationSeconds?: number | null; candidateWeightsBytes?: number; device?: string };
+  configuration: { steps?: number; batchSize?: number; freezeQwen?: boolean; enableWorldModel?: boolean };
+  validation: {
+    validated?: boolean;
+    trainingExecuted?: boolean;
+    runtime?: { cudaDevice?: string; lerobotVersion?: string; accelerateVersion?: string };
+    dataset?: { episodes?: number; frames?: number };
+  };
+}
+
+interface PolicyDecision {
+  id: string;
+  trainingRunId: string;
+  candidateModelId: string;
+  previousModelId: string;
+  lifecycleState: string;
+  evaluationIds: string[];
+  reason: string;
+  error?: string | null;
 }
 
 interface LocalVlaStatus {
@@ -33,7 +81,8 @@ interface LocalVlaStatus {
   modelBytes?: number;
   tensorCount?: number;
   checkpoint?: { dtype: string; backbone: string; cameras: string[]; stateSize: number; actionSize: number; actionHorizon: number };
-  robotWorldContract?: { compatible: boolean; blockers: string[] };
+  registration?: { id: string; lifecycleState: string; healthStatus: string };
+  robotWorldContract?: { compatible: boolean; blockers: string[]; validationLevel?: string };
   runtime?: { resident: boolean; idleUnloadSeconds: number; lerobotInstalledInBackend: boolean; loadAllowed: boolean };
 }
 
@@ -60,17 +109,16 @@ export default function Training() {
         <div>
           <div className="page-eyebrow">Policy · Checkpoints</div>
           <h1 className="page-title">Policy &amp; Evaluation</h1>
-          <p className="page-sub">Review measured evaluations and checkpoint readiness. Training is intentionally disabled on this workstation.</p>
+          <p className="page-sub">Review measured evaluations, validated demonstrations, and immutable fine-tuning candidates. Training runs only after agent approval and never replaces the active policy.</p>
         </div>
         <div className="head-actions">
           <button className="btn btn-secondary" onClick={exportCsv} disabled={runs.length === 0}><Icon name="download" size={13} /> Export runs</button>
-          <button className="btn btn-secondary" disabled title="RobotWorld will not train until a separate training environment is explicitly authorized"><Icon name="lock" size={13} /> Training disabled</button>
         </div>
       </div>
 
       <Card
         title="Local VLA-JEPA checkpoint"
-        right={<StatusBadge status={localVla?.robotWorldContract?.compatible ? "ready" : localVla?.available ? "blocked" : "offline"} />}
+        right={<StatusBadge status={localVla?.runtime?.resident ? "ready" : localVla?.robotWorldContract?.compatible ? "available" : localVla?.available ? "blocked" : "offline"} />}
         style={{ marginBottom: 10 }}
       >
         {localVlaLoading ? <Skeleton rows={3} /> : localVlaError ? <ErrorState message={localVlaError.message} /> : localVla ? (
@@ -80,6 +128,7 @@ export default function Training() {
               <div className="kv-row"><span className="kv-k">Weights</span><span className="kv-v mono">{localVla.modelBytes ? `${(localVla.modelBytes / 1e9).toFixed(2)} GB · ${localVla.tensorCount} tensors` : "missing"}</span></div>
               <div className="kv-row"><span className="kv-k">Runtime residency</span><span className="kv-v mono">{localVla.runtime?.resident ? "loaded" : `offloaded · ${localVla.runtime?.idleUnloadSeconds ?? 300}s policy`}</span></div>
               <div className="kv-row"><span className="kv-k">I/O contract</span><span className="kv-v mono">{localVla.checkpoint ? `${localVla.checkpoint.cameras.length} cameras · state ${localVla.checkpoint.stateSize} · action ${localVla.checkpoint.actionSize}×${localVla.checkpoint.actionHorizon}` : "unknown"}</span></div>
+              <div className="kv-row"><span className="kv-k">Franka bridge</span><span className="kv-v mono">{localVla.robotWorldContract?.validationLevel ?? "not bound"}</span></div>
             </div>
             {localVla.robotWorldContract && !localVla.robotWorldContract.compatible && (
               <div className="callout callout-warn" style={{ margin: 0 }}>
@@ -96,13 +145,70 @@ export default function Training() {
           {[
             ["1", "Import robot", robotData?.robots.length ? `${robotData.robots.length} inspected` : "URDF / MJCF / OpenUSD required"],
             ["2", "Map observations", "two checkpoint camera keys + robot state"],
-            ["3", "Collect demonstrations", "LeRobot dataset; no synthetic success labels"],
+            ["3", "Collect demonstrations", data?.datasets.length ? `${data.datasets.length} validated local dataset${data.datasets.length === 1 ? "" : "s"}` : "LeRobot dataset; no synthetic success labels"],
             ["4", "Fine-tune adapters", "reinitialize camera/state/action projections"],
             ["5", "Evaluate in physics", "measured collisions and task predicates"],
             ["6", "Promote or repair", "only measured runs feed the next cycle"],
           ].map(([n, title, detail]) => <div className="card grow" style={{ minWidth: 155, padding: 9, background: "var(--bg-panel-2)" }} key={n}><span className="micro t3 mono">STEP {n}</span><div className="small" style={{ fontWeight: 650 }}>{title}</div><div className="micro t3">{detail}</div></div>)}
         </div>
-        <div className="callout callout-warn" style={{ margin: "9px 0 0" }}><Icon name="lock" size={13} /><span><b>No training job will start yet.</b> The DROID VLA-JEPA checkpoint has a 7-D action / 8-D state contract and two exterior cameras; an arbitrary uploaded robot requires robot-specific data and fine-tuning.</span></div>
+        <div className="callout" style={{ margin: "9px 0 0" }}><Icon name="lock" size={13} /><span><b>Training is approval-gated and candidate-only.</b> The verified local worker accepts two 224×224 camera views, 8-D state, and 7-D Cartesian actions. It writes a separate checkpoint; nothing is uploaded, promoted, or overwritten.</span></div>
+      </Card>
+
+      <Card title="Validated demonstrations" right={<span className="micro t3">Local LeRobot datasets</span>} flush style={{ marginBottom: 10 }}>
+        {loading && !data ? (
+          <Skeleton rows={3} />
+        ) : data && data.datasets.length > 0 ? (
+          <div className="table-scroll">
+            <table className="table">
+              <thead><tr><th>Dataset</th><th>Source evaluation</th><th style={{ textAlign: "right" }}>Frames</th><th style={{ textAlign: "right" }}>Images</th><th>Contract</th><th>Status</th></tr></thead>
+              <tbody>
+                {data.datasets.map((dataset) => (
+                  <tr key={dataset.datasetId}>
+                    <td><div style={{ fontWeight: 600 }}>{dataset.repoId}</div><div className="micro t3 mono">{dataset.datasetId}</div></td>
+                    <td className="mono t2">{dataset.sourceEvaluationId}</td>
+                    <td className="mono t2" style={{ textAlign: "right" }}>{dataset.totalFrames} @ {dataset.fps} fps</td>
+                    <td className="mono t2" style={{ textAlign: "right" }}>{dataset.imageCount}</td>
+                    <td><div className="small">2 cameras · state 8 · action 7</div><div className="micro t3">{dataset.imageStorage} · local only</div></td>
+                    <td><StatusBadge status={dataset.readbackValidated ? "validated" : "blocked"} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <EmptyState icon="camera">No approved demonstration dataset yet. Run the deterministic oracle with observation recording, then export that successful evaluation through the AI agent.</EmptyState>
+        )}
+      </Card>
+
+      <Card title="Fine-tuning candidates" right={<span className="micro t3">Preflight → approved optimizer → candidate</span>} flush style={{ marginBottom: 10 }}>
+        {loading && !data ? (
+          <Skeleton rows={3} />
+        ) : data && data.canonicalRuns.length > 0 ? (
+          <div className="table-scroll">
+            <table className="table">
+              <thead><tr><th>Candidate</th><th>Dataset / base</th><th>Configuration</th><th>Runtime</th><th>Status</th></tr></thead>
+              <tbody>
+                {data.canonicalRuns.map((run) => {
+                  const decision = data.policyDecisions.find((item) => item.trainingRunId === run.id);
+                  return (
+                  <tr key={run.id}>
+                    <td><div className="mono" style={{ fontWeight: 600 }}>{run.id}</div><div className="micro t3 mono">{run.inputSha256.slice(0, 12)}…</div></td>
+                    <td><div className="mono small">{run.datasetId}</div><div className="micro t3 mono">{run.baseModelId}</div></td>
+                    <td><div className="small">{run.metrics?.stepsCompleted ?? run.configuration.steps ?? "—"} steps · batch {run.configuration.batchSize ?? "—"}</div><div className="micro t3">Qwen {run.configuration.freezeQwen ? "frozen" : "trainable"} · world model {run.configuration.enableWorldModel ? "on" : "off"}</div></td>
+                    <td><div className="small">{run.metrics?.device ?? run.validation.runtime?.cudaDevice ?? "not probed"}</div><div className="micro t3">{run.candidateCheckpointSha256 ? `${(run.metrics?.candidateWeightsBytes ?? 0) / 1e9 > 0 ? `${((run.metrics?.candidateWeightsBytes ?? 0) / 1e9).toFixed(2)} GB · ` : ""}${run.candidateCheckpointSha256.slice(0, 12)}…` : `LeRobot ${run.validation.runtime?.lerobotVersion ?? "—"} · Accelerate ${run.validation.runtime?.accelerateVersion ?? "—"}`}</div></td>
+                    <td>
+                      <StatusBadge status={decision?.lifecycleState === "PROMOTED" ? "ready" : decision?.lifecycleState === "REJECTED" ? "failed" : run.lifecycleState === "SUCCEEDED" ? "validated" : run.lifecycleState === "READY" ? "ready" : ["REJECTED", "FAILED"].includes(run.lifecycleState) ? "failed" : "testing"} />
+                      {decision && <div className="micro t3" style={{ marginTop: 3 }}>{decision.lifecycleState.toLowerCase()} · {decision.evaluationIds.length} measured evaluation{decision.evaluationIds.length === 1 ? "" : "s"}</div>}
+                    </td>
+                  </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <EmptyState icon="training">No fine-tuning candidate yet. Ask the AI agent to validate a dataset and base checkpoint; optimizer execution requires a separate approval.</EmptyState>
+        )}
       </Card>
 
       <div className="tr-stats">

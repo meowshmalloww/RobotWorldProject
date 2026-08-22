@@ -8,7 +8,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import mujoco
 import numpy as np
@@ -23,6 +23,8 @@ TEMPLATE_ID = "franka-tabletop-pick-place-v1"
 TEMPLATE_REVISION = 1
 COMPILED_ASSET_WORLD_REVISION = 6
 COMPILED_ASSET_ORACLE_POLICY = "deterministic_differential_ik_compiled_asset_oracle_v13"
+AUTHORED_SCENE_ORACLE_POLICY = "deterministic_authored_scene_contact_ik_oracle_v1"
+AUTHORED_SCENE_DROP_ORACLE_POLICY = "deterministic_authored_scene_drop_off_table_oracle_v1"
 PHYSICS_HZ = 500
 CONTROL_HZ = 50
 OBJECT_HALF_SIZE_M = 0.025
@@ -694,6 +696,255 @@ def compile_compiled_asset_world_template(
     return template
 
 
+def compile_authored_scene_asset_world(
+    robot_id: str,
+    asset_version: dict[str, Any],
+    *,
+    world_id: str,
+    source_placement: dict[str, Any],
+    target_placement: dict[str, Any] | None,
+    counter_placement: dict[str, Any],
+    robot_spawn: dict[str, Any] | None = None,
+    task_kind: str = "pick_place",
+) -> dict[str, Any]:
+    """Compose one catalogued physical asset into the active authored world.
+
+    The generated kitchen GLBs remain the visual layer. This compiler creates
+    the executable collision subset needed by the selected task: counter,
+    selected movable object, target support, and the registered Panda. It
+    never treats an arbitrary visual GLB as a dynamic collider.
+    """
+
+    if task_kind not in {"pick_place", "drop_off_table"}:
+        raise ValueError(f"Unsupported authored-scene task kind: {task_kind}")
+    identifiers = [world_id, str(source_placement.get("assetId") or "")]
+    if target_placement is not None:
+        identifiers.append(str(target_placement.get("assetId") or ""))
+    for identifier in identifiers:
+        if not identifier or not all(character.isalnum() or character in "._-" for character in identifier):
+            raise ValueError("Authored world or placement identity is invalid.")
+    if asset_version.get("assetId") != source_placement.get("assetId"):
+        raise ValueError("Physical asset version does not belong to the selected authored object.")
+    base = compile_compiled_asset_world_template(robot_id, asset_version)
+    family = "authored-kitchen-pick-place-v1" if task_kind == "pick_place" else "authored-kitchen-drop-off-table-v1"
+    root = (WORLDS_DIR / family / f"world-{world_id}" / f"robot-{robot_id}" / f"asset-{asset_version['id']}").resolve()
+    if not root.is_relative_to(WORLDS_DIR.resolve()):
+        raise ValueError("Invalid authored-world runtime target.")
+    world_path = root / "runtime" / "world.xml"
+    tree = ET.parse(Path(base["runtimePath"]))
+    mujoco_root = tree.getroot()
+    worldbody = mujoco_root.find("worldbody")
+    if worldbody is None:
+        raise ValueError("Compiled world has no worldbody.")
+
+    def bounds(value: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        raw = np.asarray(value.get("worldBounds") or [], dtype=float)
+        if raw.shape != (2, 3) or not np.isfinite(raw).all() or (raw[1] <= raw[0]).any():
+            raise ValueError(f"Placement {value.get('assetId')} has invalid world bounds.")
+        return raw[0], raw[1]
+
+    counter_low, counter_high = bounds(counter_placement)
+    source_low, source_high = bounds(source_placement)
+    counter_top = float(counter_high[2])
+    if task_kind == "pick_place":
+        if target_placement is None:
+            raise ValueError("Pick/place authored scene requires a fixed target placement.")
+        target_low, target_high = bounds(target_placement)
+        target_top = float(target_high[2])
+
+    root_body = next((body for body in worldbody.findall("body") if body.get("name") == "link0"), None)
+    workspace = next((body for body in worldbody.findall("body") if body.get("name") == "workspace_calibration"), None)
+    pick_object = next((body for body in worldbody.findall("body") if body.get("name") == "pick_object"), None)
+    if root_body is None or workspace is None or pick_object is None:
+        raise ValueError("Compiled world is missing Panda, workspace, or selected object bodies.")
+    requested_spawn = list((robot_spawn or {}).get("positionM") or [-0.15, float(counter_low[1]) + 0.045, counter_top])
+    requested_quaternion = list((robot_spawn or {}).get("quaternionWxyz") or [0.707106781187, 0.0, 0.0, 0.707106781187])
+    spawn = np.asarray(requested_spawn, dtype=float)
+    spawn_quaternion = np.asarray(requested_quaternion, dtype=float)
+    if spawn.shape != (3,) or spawn_quaternion.shape != (4,) or not np.isfinite(np.concatenate((spawn, spawn_quaternion))).all():
+        raise ValueError("Authored Franka spawn is invalid.")
+    if abs(float(np.linalg.norm(spawn_quaternion)) - 1.0) > 1e-4:
+        raise ValueError("Authored Franka spawn quaternion is not normalized.")
+    if abs(float(spawn[2]) - counter_top) > 0.015:
+        raise ValueError("Authored Franka spawn is not mounted on the counter top.")
+    root_body.set("pos", " ".join(f"{value:.12g}" for value in spawn))
+    # The Menagerie home pose reaches along local +X. Mount the arm at the
+    # counter front and rotate local +X toward world +Y, keeping both the
+    # authored fruit row and blender in the forward manipulation workspace.
+    root_body.set("quat", " ".join(f"{value:.12g}" for value in spawn_quaternion))
+
+    counter_center = (counter_low + counter_high) / 2
+    counter_half = (counter_high - counter_low) / 2
+    workspace.set("pos", " ".join(f"{value:.12g}" for value in counter_center))
+    workspace_geom = workspace.find("geom")
+    if workspace_geom is None:
+        raise ValueError("Compiled world workspace has no collision geometry.")
+    workspace_geom.set("size", " ".join(f"{value:.12g}" for value in counter_half))
+
+    original_position = np.asarray([float(value) for value in str(pick_object.get("pos") or "").split()], dtype=float)
+    if original_position.shape != (3,):
+        raise ValueError("Compiled object pose is invalid.")
+    stable_height = float(original_position[2] - TABLE_TOP_Z)
+    source_center = (source_low + source_high) / 2
+    authored_object_position = np.asarray([source_center[0], source_center[1], counter_top + stable_height])
+    pick_object.set("pos", " ".join(f"{value:.12g}" for value in authored_object_position))
+    original_quaternion = np.asarray([float(value) for value in str(pick_object.get("quat") or "1 0 0 0").split()], dtype=float)
+    if original_quaternion.shape != (4,):
+        raise ValueError("Compiled object orientation is invalid.")
+    authored_quaternion = np.empty(4, dtype=float)
+    mujoco.mju_mulQuat(
+        authored_quaternion,
+        np.asarray([math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)], dtype=float),
+        original_quaternion,
+    )
+    pick_object.set("quat", " ".join(f"{value:.12g}" for value in authored_quaternion))
+    friction_range = list(((asset_version.get("manifest") or {}).get("material") or {}).get("frictionRange") or [0.5, 0.5])
+    authored_friction = float(max(friction_range))
+    if not math.isfinite(authored_friction) or authored_friction <= 0:
+        raise ValueError("Compiled object friction range is invalid.")
+    for geom in pick_object.findall("geom"):
+        if geom.get("name") == "pick_object_collision":
+            geom.set("friction", f"{authored_friction:.12g} 0.005 0.0001")
+            geom.set("condim", "4")
+
+    for geom in list(worldbody.findall("geom")):
+        if geom.get("name") == "target_marker":
+            worldbody.remove(geom)
+    target_volumes: list[dict[str, Any]] = []
+    if task_kind == "pick_place":
+        assert target_placement is not None
+        target_center = (target_low + target_high) / 2
+        target_half = (target_high - target_low) / 2
+        target_body = ET.SubElement(
+            worldbody,
+            "body",
+            {"name": "target_support", "pos": " ".join(f"{value:.12g}" for value in target_center)},
+        )
+        ET.SubElement(
+            target_body,
+            "geom",
+            {
+                "name": "target_support_collision",
+                "type": "box",
+                "size": " ".join(f"{value:.12g}" for value in target_half),
+                "rgba": "0.18 0.20 0.24 0.35",
+                "friction": "0.8 0.01 0.001",
+            },
+        )
+        target_radius = float(max(0.025, min(target_half[0], target_half[1]) * 0.82))
+        ET.SubElement(
+            worldbody,
+            "geom",
+            {
+                "name": "target_marker",
+                "type": "cylinder",
+                "pos": f"{target_center[0]:.12g} {target_center[1]:.12g} {target_top + 0.002:.12g}",
+                "size": f"{target_radius:.12g} 0.002",
+                "rgba": "0.12 0.72 0.36 0.6",
+                "contype": "0",
+                "conaffinity": "0",
+            },
+        )
+        target_volumes = [{
+            "id": "authored_target_top",
+            "shape": "cylinder",
+            "centerM": [float(target_center[0]), float(target_center[1]), target_top],
+            "radiusM": target_radius,
+            "supportTopM": target_top,
+            "supportBody": "target_support",
+            "assetId": target_placement["assetId"],
+        }]
+    front = next((camera for camera in worldbody.findall("camera") if camera.get("name") == "front"), None)
+    if front is not None:
+        front.set("pos", "1.55 -1.65 2.05")
+        front.set("xyaxes", "0.729537 0.683942 0 -0.318769 0.339941 0.884304")
+
+    ET.indent(tree, space="  ")
+    world_path.parent.mkdir(parents=True, exist_ok=True)
+    tree.write(world_path, encoding="utf-8", xml_declaration=True)
+    model = mujoco.MjModel.from_xml_path(str(world_path))
+    data = mujoco.MjData(model)
+    home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    mujoco.mj_resetDataKeyframe(model, data, home)
+    mujoco.mj_forward(model, data)
+    if not np.isfinite(data.qpos).all():
+        raise ValueError("Authored-world reset produced non-finite physics state.")
+
+    template = dict(base)
+    authored_grasp_contract = dict(base.get("graspContract") or {})
+    authored_grasp_contract.update({
+        "gripperClosingAxisWorld": [0.0, 1.0, 0.0],
+        "gripperClosingAxisIndex": 1,
+        "mountAdjusted": True,
+    })
+    object_bounding_radius = float(authored_grasp_contract["localBoundingRadiusM"])
+    drop_center = [
+        float(source_center[0]),
+        float(counter_high[1] + object_bounding_radius + 0.045),
+        float(counter_top + max(0.18, float(authored_grasp_contract["placedGraspHeightM"]) + 0.12)),
+    ]
+    target_name = str(target_placement["name"]) if target_placement is not None else "outside the counter support polygon"
+    collision_subset = [counter_placement["assetId"], source_placement["assetId"]]
+    if target_placement is not None:
+        collision_subset.append(target_placement["assetId"])
+    template.update({
+        "id": f"{family}:{world_id}:{asset_version['id']}",
+        "revision": 1,
+        "name": f"{world_id} · {source_placement['name']} → {target_name}",
+        "taskKind": task_kind,
+        "runtimePath": str(world_path),
+        "runtimeSha256": _sha256(world_path),
+        "authoredWorldId": world_id,
+        "robotSpawnAnchors": [{"id": "franka_counter_mount", "baseLink": "link0", "pose": [*spawn.tolist(), *spawn_quaternion.tolist()]}],
+        "workspaceSafetyBoundsM": [
+            [float(counter_center[0] - counter_half[0]), float(counter_center[0] + counter_half[0])],
+            [float(counter_center[1] - counter_half[1] - 0.25), float(counter_center[1] + counter_half[1] + 0.25)],
+            [0.04, float(counter_top + 0.9)],
+        ],
+        "supportSurfaces": [{
+            "id": "authored_counter",
+            "semantic": "counter",
+            "centerM": counter_center.tolist(),
+            "halfExtentsM": counter_half.tolist(),
+            "topM": counter_top,
+            "assetId": counter_placement["assetId"],
+        }],
+        "targetVolumes": target_volumes,
+        "dropRegions": [{
+            "id": "outside_authored_counter_front_edge",
+            "releaseCenterM": drop_center,
+            "counterBoundsM": [counter_low.tolist(), counter_high.tolist()],
+            "minimumClearanceM": 0.045,
+            "predicate": "released_and_settled_below_counter_top_outside_counter_support_polygon",
+        }] if task_kind == "drop_off_table" else [],
+        "placements": [{
+            "assetVersionId": asset_version["id"],
+            "assetId": source_placement["assetId"],
+            "authoredObjectPositionM": authored_object_position.tolist(),
+            "visualWorldBoundsM": [source_low.tolist(), source_high.tolist()],
+            "supportSurfaceId": "authored_counter",
+            "accepted": True,
+        }],
+        "graspContract": authored_grasp_contract,
+        "source": {
+            "type": "active_authored_world_collision_subset",
+            "worldId": world_id,
+            "sourceAssetId": source_placement["assetId"],
+            "targetAssetId": target_placement["assetId"] if target_placement is not None else None,
+            "omittedVisualOnlyAssets": True,
+            "frictionSample": {"value": authored_friction, "method": "upper_evidence_range_for_grasp_validation"},
+        },
+        "validation": dict(base.get("validation") or {}) | {
+            "loads": True,
+            "finiteReset": True,
+            "executableCollisionSubset": collision_subset,
+            "robotSpawnConsumed": True,
+        },
+    })
+    (root / "template.json").write_text(json.dumps(template, indent=2), encoding="utf8")
+    return template
+
+
 class MujocoFrankaBackend(SimulationBackend):
     def __init__(self, artifact: Path | None = None):
         self.model: mujoco.MjModel | None = None
@@ -753,6 +1004,8 @@ class MujocoFrankaBackend(SimulationBackend):
 
     def state(self) -> dict[str, Any]:
         model, data = self._require()
+        ee_quaternion = np.empty(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(ee_quaternion, data.site_xmat[self.ee_site])
         state = {
             "timeSeconds": float(data.time),
             "seed": self._seed,
@@ -760,6 +1013,7 @@ class MujocoFrankaBackend(SimulationBackend):
             "jointVelocity": [float(data.qvel[index]) for index in self.arm_dofs],
             "gripperWidthM": float(data.qpos[7] + data.qpos[8]),
             "endEffectorPositionM": [float(value) for value in data.site_xpos[self.ee_site]],
+            "endEffectorQuaternionWxyz": [float(value) for value in ee_quaternion],
             "objectPositionM": [float(value) for value in data.xpos[self.object_body]],
             "objectQuaternionWxyz": [float(value) for value in data.xquat[self.object_body]],
             "objectVelocityMps": [float(value) for value in data.cvel[self.object_body, 3:]],
@@ -769,6 +1023,7 @@ class MujocoFrankaBackend(SimulationBackend):
         }
         if self.asset_grasp_site >= 0:
             state["objectGraspPositionM"] = [float(value) for value in data.site_xpos[self.asset_grasp_site]]
+        state["renderGeometries"] = render_geometries(model, data)
         return state
 
     def contacts(self) -> list[ContactEvent]:
@@ -810,6 +1065,106 @@ class MujocoFrankaBackend(SimulationBackend):
         self.data = None
 
 
+def render_geometries(model: mujoco.MjModel, data: mujoco.MjData) -> list[dict[str, Any]]:
+    """Return browser geometry at MuJoCo-computed poses.
+
+    The mesh vertices are served from MuJoCo's compiled mesh buffers by the
+    API.  These poses therefore compose with the same geometry MuJoCo uses,
+    rather than with the differently centered source OBJ files.
+    """
+
+    render_geometries: list[dict[str, Any]] = []
+    for geom_id in range(model.ngeom):
+        # Group 3 is collision-only in the pinned Menagerie Panda. The
+        # browser mirrors visual geometry and explicit world colliders;
+        # it never advances or invents their transforms.
+        if int(model.geom_group[geom_id]) == 3:
+            continue
+        geom_type = int(model.geom_type[geom_id])
+        kind = {
+            int(mujoco.mjtGeom.mjGEOM_PLANE): "plane",
+            int(mujoco.mjtGeom.mjGEOM_SPHERE): "sphere",
+            int(mujoco.mjtGeom.mjGEOM_CAPSULE): "capsule",
+            int(mujoco.mjtGeom.mjGEOM_ELLIPSOID): "ellipsoid",
+            int(mujoco.mjtGeom.mjGEOM_CYLINDER): "cylinder",
+            int(mujoco.mjtGeom.mjGEOM_BOX): "box",
+            int(mujoco.mjtGeom.mjGEOM_MESH): "mesh",
+        }.get(geom_type, "unknown")
+        data_id = int(model.geom_dataid[geom_id])
+        mesh_name = (
+            str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MESH, data_id) or "")
+            if geom_type == int(mujoco.mjtGeom.mjGEOM_MESH) and data_id >= 0
+            else ""
+        )
+        quat = np.empty(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(quat, data.geom_xmat[geom_id])
+        body_id = int(model.geom_bodyid[geom_id])
+        render_geometries.append({
+            "id": f"geom-{geom_id}",
+            "name": str(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or mesh_name or f"geom-{geom_id}"),
+            "kind": kind,
+            "meshName": mesh_name or None,
+            "size": [float(value) for value in model.geom_size[geom_id]],
+            "rgba": [float(value) for value in model.geom_rgba[geom_id]],
+            "positionM": [float(value) for value in data.geom_xpos[geom_id]],
+            "quaternionWxyz": [float(value) for value in quat],
+            "bodyPositionM": [float(value) for value in data.xpos[body_id]],
+            "bodyQuaternionWxyz": [float(value) for value in data.xquat[body_id]],
+        })
+    return render_geometries
+
+
+def authoring_robot_preview(
+    robot_id: str,
+    spawn_xyz: list[float],
+    spawn_quaternion_wxyz: list[float] | None = None,
+) -> dict[str, Any]:
+    """Evaluate a Franka home pose at the active world's authored mount.
+
+    This is intentionally a reset-pose authoring preview, not a simulated
+    rollout.  The exact same registered MJCF and compiled geometry are used by
+    the live backend, so the editor does not draw a decorative robot proxy.
+    """
+
+    if len(spawn_xyz) != 3 or not np.isfinite(np.asarray(spawn_xyz, dtype=float)).all():
+        raise ValueError("Robot spawn must contain three finite metre coordinates.")
+    runtime, robot = _safe_robot_manifest(robot_id)
+    tree = ET.parse(runtime)
+    worldbody = tree.getroot().find("worldbody")
+    if worldbody is None:
+        raise ValueError("Robot runtime has no worldbody.")
+    root_body = next((body for body in worldbody.findall("body") if body.get("name") == "link0"), None)
+    if root_body is None:
+        raise ValueError("Robot runtime has no fixed link0 root.")
+    root_body.set("pos", " ".join(f"{float(value):.12g}" for value in spawn_xyz))
+    quaternion = spawn_quaternion_wxyz or [1.0, 0.0, 0.0, 0.0]
+    if len(quaternion) != 4 or not np.isfinite(np.asarray(quaternion, dtype=float)).all():
+        raise ValueError("Robot spawn quaternion must contain four finite WXYZ values.")
+    root_body.set("quat", " ".join(f"{float(value):.12g}" for value in quaternion))
+    for body in list(worldbody.findall("body")):
+        if body.get("name") in {"workspace_calibration", "calibration_target"}:
+            worldbody.remove(body)
+    model = mujoco.MjModel.from_xml_string(ET.tostring(tree.getroot(), encoding="unicode"))
+    data = mujoco.MjData(model)
+    home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    if home < 0:
+        raise ValueError("Registered Franka runtime has no deterministic home keyframe.")
+    mujoco.mj_resetDataKeyframe(model, data, home)
+    mujoco.mj_forward(model, data)
+    values = render_geometries(model, data)
+    robot_values = [item for item in values if item["kind"] == "mesh"]
+    return {
+        "schemaVersion": "robotworld.authoring-robot-preview.v1",
+        "robotId": robot_id,
+        "robotRuntimeSha256": robot["runtimeSha256"],
+        "spawnPositionM": [float(value) for value in spawn_xyz],
+        "spawnQuaternionWxyz": [float(value) for value in quaternion],
+        "poseSource": "mujoco_home_keyframe_forward_kinematics",
+        "authoritativeForExecution": False,
+        "geometries": robot_values,
+    }
+
+
 @dataclass
 class OracleResult:
     success: bool
@@ -824,7 +1179,15 @@ class OracleResult:
 
 
 class PickPlaceOracle:
-    def __init__(self, backend: MujocoFrankaBackend, artifact_dir: Path):
+    def __init__(
+        self,
+        backend: MujocoFrankaBackend,
+        artifact_dir: Path,
+        *,
+        record_observations: bool = False,
+        live_frame_callback: Callable[[dict[str, Any], np.ndarray, np.ndarray], None] | None = None,
+        realtime: bool = False,
+    ):
         self.backend = backend
         self.model, self.data = backend._require()
         self.artifact_dir = artifact_dir
@@ -833,10 +1196,33 @@ class PickPlaceOracle:
         self.phases: list[dict[str, Any]] = []
         self.contact_pairs: dict[str, int] = {}
         self.frames: dict[str, dict[str, str]] = {}
+        self.record_observations = bool(record_observations)
+        self.observation_dir = self.artifact_dir / "demonstration_frames"
+        self.live_frame_callback = live_frame_callback
+        self.realtime = bool(realtime)
+        self._live_last_sim_time: float | None = None
+        self._live_sim_origin: float | None = None
+        self._live_wall_origin: float | None = None
 
     def _record(self, phase: str) -> None:
         state = self.backend.state()
         state["phase"] = phase
+        if self.record_observations:
+            self.observation_dir.mkdir(parents=True, exist_ok=True)
+            frame_index = len(self.trajectory)
+            observations: dict[str, dict[str, str]] = {}
+            for camera in ("front", "wrist"):
+                path = self.observation_dir / f"frame-{frame_index:06d}-{camera}.png"
+                Image.fromarray(self.backend.render_rgb(camera, width=224, height=224), mode="RGB").save(
+                    path,
+                    format="PNG",
+                    optimize=False,
+                )
+                observations[camera] = {
+                    "path": path.relative_to(self.artifact_dir).as_posix(),
+                    "sha256": _sha256(path),
+                }
+            state["observationFrames"] = observations
         contacts = self.backend.contacts()
         state["objectContacts"] = [
             {
@@ -852,6 +1238,24 @@ class PickPlaceOracle:
         for contact in contacts:
             pair = "|".join(sorted((contact.body_a, contact.body_b)))
             self.contact_pairs[pair] = self.contact_pairs.get(pair, 0) + 1
+        if self.live_frame_callback is not None:
+            sim_time = float(state["timeSeconds"])
+            # Control samples arrive at 20-50 Hz depending on the current
+            # phase. Cap rendering at 25 Hz while preserving simulator time.
+            should_render = self._live_last_sim_time is None or sim_time - self._live_last_sim_time >= 0.039
+            if should_render:
+                if self._live_sim_origin is None:
+                    self._live_sim_origin = sim_time
+                    self._live_wall_origin = time.perf_counter()
+                if self.realtime and self._live_wall_origin is not None:
+                    target_wall = self._live_wall_origin + (sim_time - self._live_sim_origin)
+                    delay = target_wall - time.perf_counter()
+                    if delay > 0:
+                        time.sleep(delay)
+                front = self.backend.render_rgb("front", width=640, height=360)
+                wrist = self.backend.render_rgb("wrist", width=256, height=144)
+                self.live_frame_callback(dict(state), front, wrist)
+                self._live_last_sim_time = sim_time
 
     def _capture(self, phase: str) -> None:
         phase_dir = self.artifact_dir / "frames"
@@ -875,9 +1279,11 @@ class PickPlaceOracle:
         *,
         tracked_site: int | None = None,
         stop_on_support_contact: bool = False,
+        support_body_name: str = "workspace_calibration",
         max_joint_step: float = 0.10,
         position_tolerance_m: float = 0.007,
         rotation_tolerance_rad: float = 0.08,
+        rotation_gain: float = 0.45,
         axis_tolerance: tuple[int, float] | None = None,
     ) -> bool:
         jacp = np.zeros((3, self.model.nv))
@@ -893,7 +1299,7 @@ class PickPlaceOracle:
             if stop_on_support_contact:
                 support_contact = any(
                     "pick_object" in {contact.body_a, contact.body_b}
-                    and "workspace_calibration" in {contact.body_a, contact.body_b}
+                    and support_body_name in {contact.body_a, contact.body_b}
                     for contact in self.backend.contacts()
                 )
                 if support_contact and float(np.linalg.norm(position_error[:2])) < 0.02:
@@ -911,7 +1317,7 @@ class PickPlaceOracle:
                 break
             mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.backend.ee_site)
             jacobian = np.vstack((jacp[:, self.backend.arm_dofs], jacr[:, self.backend.arm_dofs]))
-            error = np.concatenate((position_error * 1.1, rotation_error * 0.45))
+            error = np.concatenate((position_error * 1.1, rotation_error * rotation_gain))
             lhs = jacobian @ jacobian.T + np.eye(6) * 0.004
             delta = jacobian.T @ np.linalg.solve(lhs, error)
             norm = float(np.linalg.norm(delta))
@@ -924,7 +1330,7 @@ class PickPlaceOracle:
             action[:7] = target_qpos
             self.backend.apply_action(action)
             self.backend.step(PHYSICS_HZ // CONTROL_HZ)
-            if tick % 2 == 0:
+            if self.live_frame_callback is not None or tick % 2 == 0:
                 self._record(phase)
             if not self.backend.state()["finite"]:
                 return False
@@ -939,6 +1345,7 @@ class PickPlaceOracle:
                 "stopReason": stop_reason,
                 "positionToleranceM": position_tolerance_m,
                 "rotationToleranceRad": rotation_tolerance_rad,
+                "rotationGain": rotation_gain,
                 "axisTolerance": list(axis_tolerance) if axis_tolerance is not None else None,
                 "finalErrorM": float(np.linalg.norm(target_position - self.data.site_xpos[position_site])),
             }
@@ -1084,8 +1491,23 @@ class PickPlaceOracle:
 class CompiledAssetPickPlaceOracle(PickPlaceOracle):
     """Deterministic contact oracle for a compiler-authored rigid asset."""
 
-    def __init__(self, backend: MujocoFrankaBackend, artifact_dir: Path, template: dict[str, Any]):
-        super().__init__(backend, artifact_dir)
+    def __init__(
+        self,
+        backend: MujocoFrankaBackend,
+        artifact_dir: Path,
+        template: dict[str, Any],
+        *,
+        record_observations: bool = False,
+        live_frame_callback: Callable[[dict[str, Any], np.ndarray, np.ndarray], None] | None = None,
+        realtime: bool = False,
+    ):
+        super().__init__(
+            backend,
+            artifact_dir,
+            record_observations=record_observations,
+            live_frame_callback=live_frame_callback,
+            realtime=realtime,
+        )
         self.template = template
         self.grasp_site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "compiled_asset_grasp")
         if self.grasp_site < 0:
@@ -1171,33 +1593,37 @@ class CompiledAssetPickPlaceOracle(PickPlaceOracle):
                 else:
                     target = self.template["targetVolumes"][0]
                     target_xy = np.asarray(target["centerM"][:2], dtype=float)
+                    support_top = float(target.get("supportTopM", TABLE_TOP_Z))
+                    support_body = str(target.get("supportBody", "workspace_calibration"))
                     height = float(self.template["graspContract"]["placedObjectHeightM"])
                     placed_grasp_height = float(self.template["graspContract"]["placedGraspHeightM"])
                     if not self._move(
-                        np.array([target_xy[0], target_xy[1], max(0.47, TABLE_TOP_Z + height + 0.12)]),
+                        np.array([target_xy[0], target_xy[1], support_top + height + 0.12]),
                         "transport",
                         max_ticks=240,
                         tracked_site=self.grasp_site,
                     ):
                         failure = ("policy_timeout", "The deterministic controller did not reach the transport waypoint.")
                     elif not self._move(
-                        np.array([target_xy[0], target_xy[1], TABLE_TOP_Z + placed_grasp_height + 0.012]),
+                        np.array([target_xy[0], target_xy[1], support_top + placed_grasp_height + 0.012]),
                         "place",
                         max_ticks=220,
                         tracked_site=self.grasp_site,
                         stop_on_support_contact=True,
+                        support_body_name=support_body,
                     ):
                         failure = ("pre_grasp_collision", "The deterministic controller did not reach the placement waypoint.")
                     else:
                         self._gripper(255.0, "release", steps=260)
-                        self._move(np.array([target_xy[0], target_xy[1], max(0.47, TABLE_TOP_Z + height + 0.12)]), "retract", max_ticks=140)
+                        self._move(np.array([target_xy[0], target_xy[1], support_top + height + 0.12]), "retract", max_ticks=140)
                         for index in range(6000):
                             self.backend.step()
                             settle_positions.append(self.data.site_xpos[self.grasp_site].copy())
                             settle_quaternions.append(self.data.xquat[self.backend.object_body].copy())
                             settle_linear_speeds.append(float(np.linalg.norm(self.data.cvel[self.backend.object_body, 3:])))
                             settle_angular_speeds.append(float(np.linalg.norm(self.data.cvel[self.backend.object_body, :3])))
-                            if index % 100 == 0:
+                            record_interval = 20 if self.live_frame_callback is not None else 100
+                            if index % record_interval == 0:
                                 self._record("settle")
                             settle_steps = index + 1
                             if settle_steps >= 3000 and settle_steps % 25 == 0:
@@ -1227,13 +1653,14 @@ class CompiledAssetPickPlaceOracle(PickPlaceOracle):
         settle_rotation_span = _quaternion_rotation_span(settle_quaternions[-375:]) if settle_quaternions else None
         target = self.template["targetVolumes"][0]
         target_xy = np.asarray(target["centerM"][:2], dtype=float)
+        support_body = str(target.get("supportBody", "workspace_calibration"))
         target_error = float(np.linalg.norm(final_grasp_position[:2] - target_xy))
         bounding_radius = float(self.template["graspContract"]["localBoundingRadiusM"])
         containment_residual = target_error + bounding_radius - float(target["radiusM"])
         final_contacts = self.backend.contacts()
         support_contact = any(
             "pick_object" in {contact.body_a, contact.body_b}
-            and "workspace_calibration" in {contact.body_a, contact.body_b}
+            and support_body in {contact.body_a, contact.body_b}
             for contact in final_contacts
         )
         finger_contact = any(
@@ -1326,12 +1753,373 @@ class CompiledAssetPickPlaceOracle(PickPlaceOracle):
         )
 
 
+class AuthoredScenePickPlaceOracle(CompiledAssetPickPlaceOracle):
+    """Compiled-asset oracle with an exact pre-contact IK approach.
+
+    The generic validation bench deliberately retains its already-regressed
+    differential-IK behavior. Generated kitchen geometry leaves only a few
+    millimetres of clearance around the apple, so this authored-scene adapter
+    solves the two free-space approach poses before tracking them through the
+    same actuators and physics contacts.
+    """
+
+    def _move_solved_ik(
+        self,
+        target_position: np.ndarray,
+        phase: str,
+        *,
+        max_ticks: int,
+        position_tolerance_m: float,
+        rotation_tolerance_rad: float,
+        tracked_site: int | None = None,
+    ) -> bool:
+        from scipy.optimize import least_squares
+
+        tracked_site_id = self.backend.ee_site if tracked_site is None else tracked_site
+        tracked_offset = self.data.site_xpos[self.backend.ee_site].copy() - self.data.site_xpos[tracked_site_id].copy()
+        ee_target_position = target_position + tracked_offset
+        scratch = mujoco.MjData(self.model)
+        scratch.qpos[:] = self.data.qpos
+        scratch.qvel[:] = 0
+        lower = self.model.jnt_range[self.backend.arm_joints, 0] + 0.01
+        upper = self.model.jnt_range[self.backend.arm_joints, 1] - 0.01
+        seed = np.asarray([self.data.qpos[index] for index in self.backend.arm_qpos], dtype=float)
+
+        def residual(joints: np.ndarray) -> np.ndarray:
+            scratch.qpos[:] = self.data.qpos
+            scratch.qvel[:] = 0
+            for index, qpos_address in enumerate(self.backend.arm_qpos):
+                scratch.qpos[qpos_address] = joints[index]
+            mujoco.mj_forward(self.model, scratch)
+            current_rotation = scratch.site_xmat[self.backend.ee_site].reshape(3, 3)
+            return np.concatenate((
+                (scratch.site_xpos[self.backend.ee_site] - ee_target_position) * 3.0,
+                self._orientation_error(current_rotation, self.desired_rotation) * 0.35,
+            ))
+
+        solution = least_squares(
+            residual,
+            np.clip(seed, lower, upper),
+            bounds=(lower, upper),
+            max_nfev=600,
+            ftol=1e-11,
+            xtol=1e-11,
+            gtol=1e-11,
+        )
+        solved = np.asarray(solution.x, dtype=float)
+        solved_residual = residual(solved)
+        solved_position_error = float(np.linalg.norm(solved_residual[:3]) / 3.0)
+        reached = False
+        stop_reason = "ik_solution_tracking_timeout"
+        max_command_step = 0.012 if phase.startswith(("lift", "transport")) else 0.035
+        for tick in range(max_ticks):
+            current = np.asarray([self.data.qpos[index] for index in self.backend.arm_qpos], dtype=float)
+            # Position actuators need a bounded command lead to cancel the
+            # steady gravity/contact bias between qpos and ctrl. This remains
+            # closed-loop and never teleports qpos.
+            delta = np.clip((solved - current) * 8.0, -max_command_step, max_command_step)
+            action = self.data.ctrl.copy()
+            action[:7] = np.clip(current + delta, lower, upper)
+            self.backend.apply_action(action)
+            self.backend.step(PHYSICS_HZ // CONTROL_HZ)
+            if self.live_frame_callback is not None or tick % 2 == 0:
+                self._record(phase)
+            current_position = self.data.site_xpos[tracked_site_id].copy()
+            current_rotation = self.data.site_xmat[self.backend.ee_site].reshape(3, 3).copy()
+            position_error = float(np.linalg.norm(target_position - current_position))
+            rotation_error = float(np.linalg.norm(self._orientation_error(current_rotation, self.desired_rotation)))
+            if position_error < position_tolerance_m and rotation_error < rotation_tolerance_rad:
+                reached = True
+                stop_reason = "numerical_ik_pose_tolerance"
+                break
+            if not self.backend.state()["finite"]:
+                stop_reason = "non_finite_state"
+                break
+        final_error = float(np.linalg.norm(target_position - self.data.site_xpos[tracked_site_id]))
+        self.phases.append({
+            "phase": phase,
+            "reached": reached,
+            "ticks": tick + 1,
+            "targetM": [float(value) for value in target_position],
+            "trackedSite": "franka_ee" if tracked_site is None else "compiled_asset_grasp",
+            "stopReason": stop_reason,
+            "solver": "bounded_scipy_least_squares_then_mujoco_actuator_tracking",
+            "solverSuccess": bool(solution.success),
+            "solverEvaluations": int(solution.nfev),
+            "solvedPositionErrorM": solved_position_error,
+            "solutionDeltaNormRad": float(np.linalg.norm(solved - seed)),
+            "finalJointErrorNormRad": float(np.linalg.norm(solved - np.asarray([self.data.qpos[index] for index in self.backend.arm_qpos]))),
+            "positionToleranceM": position_tolerance_m,
+            "rotationToleranceRad": rotation_tolerance_rad,
+            "maxJointCommandStepRad": max_command_step,
+            "finalErrorM": final_error,
+        })
+        self._capture(phase)
+        return reached
+
+    def _contacting_fingers(self) -> set[str]:
+        return {
+            finger
+            for contact in self.backend.contacts()
+            if "pick_object" in {contact.body_a, contact.body_b}
+            for finger in ({contact.body_a, contact.body_b} & {"left_finger", "right_finger"})
+        }
+
+    def _gripper(self, control: float, phase: str, steps: int = 220) -> None:
+        super()._gripper(control, phase, steps)
+        if phase != "close_gripper" or self._contacting_fingers() == {"left_finger", "right_finger"}:
+            return
+        # A rounded convex hull can translate slightly during the first pad
+        # touch. Re-open, read the new physical grasp-site pose, re-center in
+        # free space, and close once more. This is contact feedback, not an
+        # object teleport or a relaxed bilateral-contact predicate.
+        super()._gripper(255.0, "reopen_after_unilateral_contact", steps=120)
+        moved = self._move_solved_ik(
+            self.data.site_xpos[self.grasp_site].copy(),
+            "contact_feedback_recenter",
+            max_ticks=220,
+            position_tolerance_m=0.0008,
+            rotation_tolerance_rad=0.09,
+        )
+        if moved:
+            super()._gripper(0.0, "reclose_gripper", steps=320)
+
+    def _move(
+        self,
+        target_position: np.ndarray,
+        phase: str,
+        max_ticks: int = 180,
+        **kwargs: Any,
+    ) -> bool:
+        if phase.startswith(("lift", "transport")):
+            tracked_site = kwargs.get("tracked_site")
+            tracked_site_id = self.backend.ee_site if tracked_site is None else int(tracked_site)
+            start = self.data.site_xpos[tracked_site_id].copy()
+            distance = float(np.linalg.norm(target_position - start))
+            segment_count = max(1, int(math.ceil(distance / 0.035)))
+            for segment in range(1, segment_count + 1):
+                fraction = segment / segment_count
+                waypoint = start + (target_position - start) * fraction
+                if not self._move_solved_ik(
+                    waypoint,
+                    f"{phase}_segment_{segment:02d}",
+                    max_ticks=max(300, max_ticks // segment_count + 60),
+                    position_tolerance_m=0.006,
+                    rotation_tolerance_rad=0.1,
+                    tracked_site=tracked_site,
+                ):
+                    self.phases.append({
+                        "phase": phase,
+                        "reached": False,
+                        "completedSegments": segment - 1,
+                        "segmentCount": segment_count,
+                        "finalErrorM": float(np.linalg.norm(target_position - self.data.site_xpos[tracked_site_id])),
+                    })
+                    return False
+            self.phases.append({
+                "phase": phase,
+                "reached": True,
+                "completedSegments": segment_count,
+                "segmentCount": segment_count,
+                "finalErrorM": float(np.linalg.norm(target_position - self.data.site_xpos[tracked_site_id])),
+            })
+            return True
+        if phase in {"pre_grasp", "grasp_approach"}:
+            return self._move_solved_ik(
+                target_position,
+                phase,
+                max_ticks=max(max_ticks, 260),
+                position_tolerance_m=0.0008 if phase == "pre_grasp" else 0.001,
+                rotation_tolerance_rad=0.09,
+                tracked_site=kwargs.get("tracked_site"),
+            )
+        return super()._move(target_position, phase, max_ticks=max_ticks, **kwargs)
+
+
+class AuthoredSceneDropOffTableOracle(AuthoredScenePickPlaceOracle):
+    """Pick one compiled object, release it beyond the measured counter edge,
+    and verify the resulting MuJoCo motion instead of reusing a place target.
+    """
+
+    def run(self, seed: int = 0) -> OracleResult:
+        started = time.perf_counter()
+        self.backend.reset(seed)
+        self.backend.step(250)
+        self.desired_rotation = self.data.site_xmat[self.backend.ee_site].reshape(3, 3).copy()
+        initial_grasp = self.data.site_xpos[self.grasp_site].copy()
+        self._record("reset")
+        self._capture("reset")
+        failure: tuple[str, str] | None = None
+        settle_positions: list[np.ndarray] = []
+        settle_quaternions: list[np.ndarray] = []
+        settle_linear_speeds: list[float] = []
+        settle_angular_speeds: list[float] = []
+        settle_steps = 0
+        grasp_contract = self.template["graspContract"]
+        required_width = float(grasp_contract["requiredGripperWidthM"])
+        configured_open_width = 0.08
+        if required_width > configured_open_width - 0.003:
+            failure = (
+                "unreachable_target",
+                f"Asset grasp cross-section {required_width:.4f} m exceeds the validated Franka opening with 3 mm clearance.",
+            )
+        else:
+            action = self.data.ctrl.copy()
+            action[-1] = 255.0
+            self.backend.apply_action(action)
+            self.backend.step(120)
+            pregrasp = initial_grasp + np.array([0.0, 0.0, 0.14])
+            grasp = initial_grasp + np.array([0.0, 0.0, 0.004])
+            if not self._move(pregrasp, "pre_grasp", max_ticks=260):
+                failure = ("unreachable_target", "Differential IK did not reach the authored object pre-grasp waypoint.")
+            elif not self._move(grasp, "grasp_approach", max_ticks=260):
+                failure = ("pre_grasp_collision", "Differential IK did not reach the authored object grasp frame.")
+            elif not self._align_axis(grasp, int(grasp_contract["gripperClosingAxisIndex"]), "grasp_axis_alignment"):
+                failure = ("pre_grasp_collision", "Fine jaw-axis alignment did not converge at the authored grasp frame.")
+            else:
+                self._gripper(0.0, "close_gripper", steps=300)
+                contacting_fingers = self._contacting_fingers()
+                if contacting_fingers != {"left_finger", "right_finger"}:
+                    failure = (
+                        "grasp_miss",
+                        f"Bilateral gripper contact was not established; contacting fingers={sorted(contacting_fingers)}.",
+                    )
+                elif not self._move(
+                    initial_grasp + np.array([0.0, 0.0, 0.17]),
+                    "lift",
+                    max_ticks=260,
+                    tracked_site=self.grasp_site,
+                ):
+                    failure = ("object_dropped", "The deterministic controller did not reach the lift waypoint.")
+                elif self.data.site_xpos[self.grasp_site, 2] < initial_grasp[2] + 0.08:
+                    failure = ("grasp_slip", "Gripper motion did not lift the compiler-authored body by 8 cm.")
+                else:
+                    drop_region = self.template["dropRegions"][0]
+                    release_center = np.asarray(drop_region["releaseCenterM"], dtype=float)
+                    if not self._move(
+                        release_center,
+                        "transport_off_table",
+                        max_ticks=320,
+                        tracked_site=self.grasp_site,
+                    ):
+                        failure = ("policy_timeout", "The deterministic controller did not reach the off-table release waypoint.")
+                    else:
+                        self._gripper(255.0, "release_off_table", steps=160)
+                        retract = release_center + np.array([0.0, -0.10, 0.12])
+                        self._move(retract, "retract", max_ticks=180)
+                        for index in range(6000):
+                            self.backend.step()
+                            settle_positions.append(self.data.xpos[self.backend.object_body].copy())
+                            settle_quaternions.append(self.data.xquat[self.backend.object_body].copy())
+                            settle_linear_speeds.append(float(np.linalg.norm(self.data.cvel[self.backend.object_body, 3:])))
+                            settle_angular_speeds.append(float(np.linalg.norm(self.data.cvel[self.backend.object_body, :3])))
+                            record_interval = 20 if self.live_frame_callback is not None else 100
+                            if index % record_interval == 0:
+                                self._record("settle_after_drop")
+                            settle_steps = index + 1
+                            if settle_steps >= 1500 and settle_steps % 25 == 0:
+                                window = np.asarray(settle_positions[-375:])
+                                position_span = float(np.max(np.ptp(window, axis=0)))
+                                linear_p95 = float(np.quantile(settle_linear_speeds[-375:], 0.95))
+                                angular_p95 = float(np.quantile(settle_angular_speeds[-375:], 0.95))
+                                rotation_span = _quaternion_rotation_span(settle_quaternions[-375:])
+                                if (
+                                    position_span < 0.003
+                                    and linear_p95 < 0.02
+                                    and settle_linear_speeds[-1] < 0.01
+                                    and ((angular_p95 < 0.15 and settle_angular_speeds[-1] < 0.05) or rotation_span < 0.01)
+                                ):
+                                    break
+                        self._capture("settle_after_drop")
+
+        final_position = self.data.xpos[self.backend.object_body].copy()
+        final_linear_speed = float(np.linalg.norm(self.data.cvel[self.backend.object_body, 3:]))
+        final_angular_speed = float(np.linalg.norm(self.data.cvel[self.backend.object_body, :3]))
+        settle_window = np.asarray(settle_positions[-375:]) if settle_positions else None
+        settle_span = float(np.max(np.ptp(settle_window, axis=0))) if settle_window is not None else None
+        settle_linear_p95 = float(np.quantile(settle_linear_speeds[-375:], 0.95)) if settle_linear_speeds else None
+        settle_angular_p95 = float(np.quantile(settle_angular_speeds[-375:], 0.95)) if settle_angular_speeds else None
+        settle_rotation_span = _quaternion_rotation_span(settle_quaternions[-375:]) if settle_quaternions else None
+        counter_low, counter_high = np.asarray(self.template["dropRegions"][0]["counterBoundsM"], dtype=float)
+        radius = float(grasp_contract["localBoundingRadiusM"])
+        outside_support = bool(
+            final_position[0] + radius < counter_low[0]
+            or final_position[0] - radius > counter_high[0]
+            or final_position[1] + radius < counter_low[1]
+            or final_position[1] - radius > counter_high[1]
+        )
+        below_counter_top = bool(final_position[2] + radius < counter_high[2] - 0.02)
+        final_contacts = self.backend.contacts()
+        finger_contact = any(
+            "pick_object" in {contact.body_a, contact.body_b}
+            and ({contact.body_a, contact.body_b} & {"left_finger", "right_finger"})
+            for contact in final_contacts
+        )
+        released = not finger_contact
+        settled = bool(
+            settle_span is not None
+            and settle_span < 0.003
+            and settle_linear_p95 is not None
+            and settle_linear_p95 < 0.02
+            and final_linear_speed < 0.01
+            and (
+                (settle_angular_p95 is not None and settle_angular_p95 < 0.15 and final_angular_speed < 0.05)
+                or (settle_rotation_span is not None and settle_rotation_span < 0.01)
+            )
+        )
+        success = bool(failure is None and outside_support and below_counter_top and released and settled)
+        if failure is None and not success:
+            failure = (
+                "success_predicate_failure",
+                f"outsideSupport={outside_support}, belowCounterTop={below_counter_top}, released={released}, "
+                f"settled={settled}, finalPosition={final_position.tolist()}.",
+            )
+        predicate = {
+            "assetVersionId": self.template["assetVersionId"],
+            "assetManifestSha256": self.template["assetManifestSha256"],
+            "taskKind": "drop_off_table",
+            "outsideSupportPolygon": outside_support,
+            "belowCounterTop": below_counter_top,
+            "released": released,
+            "settled": settled,
+            "finalObjectPositionM": [float(value) for value in final_position],
+            "counterBoundsM": [counter_low.tolist(), counter_high.tolist()],
+            "objectBoundingRadiusM": radius,
+            "finalLinearSpeedMps": final_linear_speed,
+            "finalAngularSpeedRadS": final_angular_speed,
+            "settlePositionSpanM": settle_span,
+            "settleLinearSpeedP95Mps": settle_linear_p95,
+            "settleAngularSpeedP95RadS": settle_angular_p95,
+            "settleRotationSpanRad": settle_rotation_span,
+            "settleSimulatedSeconds": settle_steps / PHYSICS_HZ if settle_steps else None,
+            "placementEvidence": self.template["placements"][0],
+        }
+        return OracleResult(
+            success=success,
+            failure_code=failure[0] if failure else None,
+            failure_detail=failure[1] if failure else None,
+            duration_s=time.perf_counter() - started,
+            phases=self.phases,
+            trajectory=self.trajectory,
+            contact_summary={
+                "sampledPairs": self.contact_pairs,
+                "samples": sum(self.contact_pairs.values()),
+                "finalFingerContact": finger_contact,
+            },
+            predicate=predicate,
+            frames=self.frames,
+        )
+
+
 def run_compiled_asset_oracle(
     robot_id: str,
     asset_version: dict[str, Any],
     run_id: str,
     seed: int = 0,
     placement_request: PlacementRequest | dict[str, Any] | None = None,
+    record_observations: bool = False,
+    live_frame_callback: Callable[[dict[str, Any], np.ndarray, np.ndarray], None] | None = None,
+    realtime: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     template = compile_compiled_asset_world_template(
         robot_id,
@@ -1344,7 +2132,14 @@ def run_compiled_asset_oracle(
         raise ValueError("Invalid evaluation artifact target.")
     backend = MujocoFrankaBackend(Path(template["runtimePath"]))
     try:
-        result = CompiledAssetPickPlaceOracle(backend, artifact_dir, template).run(seed)
+        result = CompiledAssetPickPlaceOracle(
+            backend,
+            artifact_dir,
+            template,
+            record_observations=record_observations,
+            live_frame_callback=live_frame_callback,
+            realtime=realtime,
+        ).run(seed)
         output = {
             "schemaVersion": "robotworld.evaluation-result.v1",
             "runId": run_id,
@@ -1373,7 +2168,85 @@ def run_compiled_asset_oracle(
         backend.close()
 
 
-def run_oracle(robot_id: str, run_id: str, seed: int = 0) -> dict[str, Any]:
+def run_authored_scene_oracle(
+    robot_id: str,
+    asset_version: dict[str, Any],
+    run_id: str,
+    seed: int,
+    world_id: str,
+    source_placement: dict[str, Any],
+    target_placement: dict[str, Any] | None,
+    counter_placement: dict[str, Any],
+    *,
+    robot_spawn: dict[str, Any] | None = None,
+    task_kind: str = "pick_place",
+    live_frame_callback: Callable[[dict[str, Any], np.ndarray, np.ndarray], None] | None = None,
+    realtime: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    template = compile_authored_scene_asset_world(
+        robot_id,
+        asset_version,
+        world_id=world_id,
+        source_placement=source_placement,
+        target_placement=target_placement,
+        counter_placement=counter_placement,
+        robot_spawn=robot_spawn,
+        task_kind=task_kind,
+    )
+    artifact_dir = (Path(template["runtimePath"]).parent.parent / "evaluations" / run_id).resolve()
+    if not artifact_dir.is_relative_to(WORLDS_DIR.resolve()):
+        raise ValueError("Invalid authored-scene evaluation artifact target.")
+    backend = MujocoFrankaBackend(Path(template["runtimePath"]))
+    try:
+        oracle_type = AuthoredScenePickPlaceOracle if task_kind == "pick_place" else AuthoredSceneDropOffTableOracle
+        result = oracle_type(
+            backend,
+            artifact_dir,
+            template,
+            live_frame_callback=live_frame_callback,
+            realtime=realtime,
+        ).run(seed)
+        output = {
+            "schemaVersion": "robotworld.evaluation-result.v1",
+            "runId": run_id,
+            "robotId": robot_id,
+            "worldTemplateId": template["id"],
+            "worldTemplateRevision": int(template["revision"]),
+            "worldRuntimeSha256": template["runtimeSha256"],
+            "policy": AUTHORED_SCENE_ORACLE_POLICY if task_kind == "pick_place" else AUTHORED_SCENE_DROP_ORACLE_POLICY,
+            "seed": seed,
+            "success": result.success,
+            "failureCode": result.failure_code,
+            "failureDetail": result.failure_detail,
+            "durationSeconds": result.duration_s,
+            "physicsHz": PHYSICS_HZ,
+            "controlHz": CONTROL_HZ,
+            "phases": result.phases,
+            "trajectory": result.trajectory,
+            "contactSummary": result.contact_summary,
+            "predicate": result.predicate | {
+                "authoredWorldId": world_id,
+                "sourceAssetId": source_placement["assetId"],
+                "targetAssetId": target_placement["assetId"] if target_placement is not None else None,
+                "taskKind": task_kind,
+            },
+            "frameHashes": result.frames,
+        }
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "evaluation.json").write_text(json.dumps(output, indent=2), encoding="utf8")
+        return output, template
+    finally:
+        backend.close()
+
+
+def run_oracle(
+    robot_id: str,
+    run_id: str,
+    seed: int = 0,
+    *,
+    live_frame_callback: Callable[[dict[str, Any], np.ndarray, np.ndarray], None] | None = None,
+    realtime: bool = False,
+) -> dict[str, Any]:
     template = compile_world_template(robot_id)
     artifact_dir = (WORLDS_DIR / TEMPLATE_ID / "evaluations" / run_id).resolve()
     expected = (WORLDS_DIR / TEMPLATE_ID / "evaluations").resolve()
@@ -1381,7 +2254,12 @@ def run_oracle(robot_id: str, run_id: str, seed: int = 0) -> dict[str, Any]:
         raise ValueError("Invalid evaluation artifact target.")
     backend = MujocoFrankaBackend(Path(template["runtimePath"]))
     try:
-        result = PickPlaceOracle(backend, artifact_dir).run(seed)
+        result = PickPlaceOracle(
+            backend,
+            artifact_dir,
+            live_frame_callback=live_frame_callback,
+            realtime=realtime,
+        ).run(seed)
         output = {
             "schemaVersion": "robotworld.evaluation-result.v1",
             "runId": run_id,

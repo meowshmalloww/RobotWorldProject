@@ -69,6 +69,14 @@ interface CommandResponse {
   result: { robot?: RobotManifest; registration?: RobotRegistration; loadProbe?: { resident: boolean; homeFinite: boolean; nq: number; actuators: number; workerContract: string } };
 }
 
+interface IsaacStatus {
+  installed: boolean;
+  ready: boolean;
+  version: string;
+  eulaAcceptedForApiProcess: boolean;
+  blockers: string[];
+}
+
 function failureText(error: unknown): string {
   return error instanceof ApiError ? error.message : String(error);
 }
@@ -76,6 +84,7 @@ function failureText(error: unknown): string {
 export default function Robots() {
   const toast = useToast();
   const { data, error, loading, refetch } = useApi<RobotListResponse>("/robots");
+  const { data: isaac } = useApi<IsaacStatus>("/simulation/isaac");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -155,7 +164,7 @@ export default function Robots() {
 
       <div className="callout" style={{ margin: "0 0 10px", borderColor: "rgba(94, 234, 212, .25)" }}>
         <Icon name="info" size={13} style={{ color: "var(--teal)" }} />
-        <span><b>Authoritative backend: MuJoCo.</b> Isaac Sim is deferred and disabled. Calibration previews below are rendered from the pinned MJCF state, not frontend animation.</span>
+        <span><b>Live backend: MuJoCo.</b> Isaac Sim {isaac?.installed ? `${isaac.version} is installed${isaac.ready ? " and worker-ready" : " but still gated before live PhysX"}` : "is not installed"}. Calibration previews below are authoritative MJCF renders, not frontend animation.</span>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "330px minmax(0, 1fr)", gap: 10, alignItems: "start" }}>
@@ -192,7 +201,7 @@ export default function Robots() {
               <div className="kv-row"><span className="kv-k">Runtime hash</span><span className="kv-v mono">{selected.runtimeSha256 ? `${selected.runtimeSha256.slice(0, 16)}…` : "not compiled"}</span></div>
               <div className="kv-row"><span className="kv-k">Lifecycle</span><span className="kv-v">{selectedRegistration?.lifecycleState ?? "imported only"}</span></div>
             </div>
-            <div className="row" style={{ marginTop: 10, gap: 8 }}><button className="btn btn-primary" disabled={busy !== null || !selectedRegistration || !selected.physicsReady} onClick={() => activate(selected)}><Icon name="play" size={12} /> {busy === `activate:${selected.id}` ? "Loading…" : "Select runtime"}</button>{selected.sourceUrl && <a className="btn btn-secondary" href={selected.sourceUrl} target="_blank" rel="noreferrer"><Icon name="external" size={12} /> Source attribution</a>}</div>
+            <div className="row" style={{ marginTop: 10, gap: 8 }}><button className="btn btn-primary" disabled={busy !== null || !selectedRegistration || !selected.physicsReady} onClick={() => activate(selected)}><Icon name="play" size={12} /> {busy === `activate:${selected.id}` ? "Loading…" : "Select runtime"}</button><a className="btn btn-secondary" href="#/worlds"><Icon name="worlds" size={12} /> Use in Worlds</a>{selected.sourceUrl && <a className="btn btn-secondary" href={selected.sourceUrl} target="_blank" rel="noreferrer"><Icon name="external" size={12} /> Source attribution</a>}</div>
           </Card>
 
           {selected.validation ? <>

@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services import model_registry, vla_policy_worker
+from workers import vla_policy_worker as isolated_vla_worker
 
 
 def _checkpoint(root: Path) -> Path:
@@ -47,6 +48,7 @@ def _checkpoint(root: Path) -> Path:
 def _isolate(monkeypatch: pytest.MonkeyPatch, checkpoint: Path) -> None:
     vla_policy_worker.stop()
     monkeypatch.setenv("VLA_JEPA_PYTHON", sys.executable)
+    monkeypatch.setenv("ROBOTWORLD_DISABLE_LOCAL_RUNTIME_DEFAULTS", "1")
     monkeypatch.delenv("LEROBOT_REPO_PATH", raising=False)
     monkeypatch.delenv("ROBOTWORLD_ALLOW_MODEL_DOWNLOADS", raising=False)
     for name in model_registry.MODEL_PATH_ENV_VARS:
@@ -86,8 +88,9 @@ def test_inference_request_keeps_artifacts_server_side_and_identifies_normalized
             requests.append((operation, payload, timeout))
             return {
                 "normalizedAction": [0.0] * 7,
+                "checkpointAction": [0.0] * 6 + [1.0],
                 "actionDimension": 7,
-                "outputStage": "policy_normalized_before_checkpoint_postprocessor",
+                "outputStage": "checkpoint_postprocessed_droid_relative_action",
             }
 
         def status(self):
@@ -107,6 +110,31 @@ def test_inference_request_keeps_artifacts_server_side_and_identifies_normalized
     assert payload["images"] == {"observation.images.front": "D:/artifact/front.png"}
     assert payload["allowedArtifactRoots"]
     assert "imageBytes" not in payload
+
+
+def test_checkpoint_declared_normalized_action_clamp_is_bounded_and_auditable() -> None:
+    bounded, clipped, maximum_delta = isolated_vla_worker._clip_normalized_action(
+        [0.03, -0.1, 0.2, 0.0, 0.24, -0.01, 1.0016577243804932]
+    )
+    assert bounded == [0.03, -0.1, 0.2, 0.0, 0.24, -0.01, 1.0]
+    assert clipped is True
+    assert maximum_delta == pytest.approx(0.001657724380493164)
+    with pytest.raises(RuntimeError, match="invalid normalized action"):
+        isolated_vla_worker._clip_normalized_action([0.0] * 6 + [float("nan")])
+
+
+def test_transformers_dependency_does_not_treat_metadata_only_directory_as_full_weights(tmp_path: Path) -> None:
+    metadata = tmp_path / "qwen-metadata"
+    metadata.mkdir()
+    (metadata / "config.json").write_text("{}", encoding="utf8")
+    result = isolated_vla_worker._local_transformers_dependency(str(metadata))
+    assert result["availableLocally"] is False
+    assert result["reason"] == "configured_metadata_only_directory"
+
+    (metadata / "model.safetensors").write_bytes(b"weights")
+    result = isolated_vla_worker._local_transformers_dependency(str(metadata))
+    assert result["availableLocally"] is True
+    assert result["reason"] == "configured_local_directory"
 
 
 def test_worker_environment_does_not_inherit_provider_secrets(monkeypatch: pytest.MonkeyPatch) -> None:

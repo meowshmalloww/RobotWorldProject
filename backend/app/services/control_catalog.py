@@ -5,6 +5,7 @@ import asyncio
 import os
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -370,6 +371,47 @@ async def load_model(
         if row is None:
             await command_store.finish_command(command.id, error="Model registration not found.")
             raise KeyError(model_id)
+        if (
+            row.lifecycle_state == ModelLifecycle.LOADED
+            and row.provider_type == ModelProviderType.LOCAL_PATH
+            and "vla_policy" in (row.roles or [])
+        ):
+            worker_status = await asyncio.to_thread(vla_policy_worker.status)
+            resident_path = str((worker_status.get("resident") or {}).get("checkpointPath") or "")
+            requested_path = str(row.local_path or "")
+            same_resident = bool(
+                resident_path
+                and requested_path
+                and Path(resident_path).resolve() == Path(requested_path).resolve()
+            )
+            if same_resident:
+                row.health_status = "healthy"
+                row.last_error = None
+                await session.commit()
+                output = {"model": model_view(row), "worker": {"loaded": True, "worker": worker_status}}
+                await command_store.finish_command(command.id, output=output)
+                command.output = command_store.json_safe(output)
+                command.status = "SUCCEEDED"
+                return command_view(command)
+            await _transition(
+                session,
+                row,
+                ModelLifecycle.UNLOADING,
+                command_id=command.id,
+                action="model.worker_mismatch",
+                actor=actor,
+                detail={"residentCheckpointPath": resident_path or None},
+            )
+            await _transition(
+                session,
+                row,
+                ModelLifecycle.AVAILABLE,
+                command_id=command.id,
+                action="model.worker_mismatch_reconciled",
+                actor=actor,
+            )
+            row.health_status = "worker_stopped"
+            row.last_error = "Catalog state was reconciled because a different checkpoint was resident."
         if row.lifecycle_state != ModelLifecycle.AVAILABLE:
             await command_store.finish_command(command.id, error=f"Model must be AVAILABLE, not {row.lifecycle_state}.")
             raise RegistryConflict(f"Model must be AVAILABLE before loading; current state is {row.lifecycle_state}.")
@@ -398,6 +440,37 @@ async def load_model(
             message = "No isolated worker adapter is registered for this model provider."
             await command_store.finish_command(command.id, error=message)
             raise RegistryConflict(message)
+        loaded_rows = (
+            await session.execute(
+                select(ModelRegistrationRecord).where(
+                    ModelRegistrationRecord.id != row.id,
+                    ModelRegistrationRecord.provider_type == ModelProviderType.LOCAL_PATH,
+                    ModelRegistrationRecord.lifecycle_state == ModelLifecycle.LOADED,
+                )
+            )
+        ).scalars().all()
+        for previous in loaded_rows:
+            if "vla_policy" not in (previous.roles or []):
+                continue
+            await _transition(
+                session,
+                previous,
+                ModelLifecycle.UNLOADING,
+                command_id=command.id,
+                action="model.worker_replaced",
+                actor=actor,
+                detail={"replacedByModelId": row.id},
+            )
+            await _transition(
+                session,
+                previous,
+                ModelLifecycle.AVAILABLE,
+                command_id=command.id,
+                action="model.worker_replacement_finished",
+                actor=actor,
+            )
+            previous.health_status = "worker_stopped"
+            previous.last_error = f"Isolated worker now hosts {row.id}."
         await _transition(session, row, ModelLifecycle.LOADED, command_id=command.id, action="model.load", actor=actor)
         row.last_loaded_at = _now()
         row.last_error = None

@@ -13,6 +13,7 @@ import "./styles/shell.css";
 import "./styles/components.css";
 import "./styles/pages.css";
 import "./styles/ui2.css";
+import "./styles/ai-chat.css";
 import App from "./App";
 
 createRoot(document.getElementById("root")!).render(

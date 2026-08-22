@@ -34,3 +34,6 @@ Thumbs.db
 
 # Large local model/runtime installers
 .downloads/
+
+# Generated self-hosted SigNoz Foundry deployment (reproducible from casting.yaml)
+ops/signoz/pours/

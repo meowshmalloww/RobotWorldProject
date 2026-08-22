@@ -121,6 +121,30 @@ export interface Asset {
     results: { type: string; value: string; title?: string; domain?: string; state?: string }[];
     resultCount: number;
   };
+  partGraph?: {
+    id: string;
+    revision: number;
+    rootPartId: string;
+    lifecycleState: string;
+    graphSha256: string;
+    validationErrors: string[];
+    parts: { id: string; semanticLabel: string; parentPartId?: string | null; confidence: number }[];
+    joints: { id: string; jointType: string; parentPartId: string; childPartId: string; axis: number[]; lower: number; upper: number; confidence: number }[];
+    affordances: { id: string; semantic: string; parentPartId: string; confidence: number }[];
+  };
+  physicsValidation?: {
+    success?: boolean | null;
+    failure_mode?: string | null;
+    failure_detail?: string | null;
+    jointSweep?: {
+      passed: boolean;
+      sampleCount: number;
+      handleAttachedToMovingPart: boolean;
+      handlePathSpanM: number;
+      severePenetrationCount: number;
+      errors: string[];
+    };
+  };
   parts: AssetPart[];
   artifacts: Artifact[];
   compile: CompileStage[];

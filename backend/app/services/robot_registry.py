@@ -187,16 +187,20 @@ def register_isaac_franka(runtime_status: dict[str, Any]) -> dict[str, Any]:
         "joints": 9,
         "armDof": 7,
         "gripperJoints": 2,
-        "cameras": 0,
-        "cameraNames": [],
+        "cameras": 2,
+        "cameraNames": ["front", "wrist"],
         "externalResources": [runtime_status.get("frankaAsset")],
         "unresolvedResources": [] if runtime_status.get("ready") else [runtime_status.get("frankaAsset")],
         "missingJointLimits": 0,
         "articulated": True,
         "physicsParsed": True,
         "isaacAssetPath": runtime_status.get("frankaAsset"),
-        "cameraMappings": existing.get("cameraMappings") or {},
-        "policyAdapter": existing.get("policyAdapter"),
+        "cameraMappings": existing.get("cameraMappings")
+        or {
+            "observation.images.exterior_1_left": "front",
+            "observation.images.exterior_2_left": "wrist",
+        },
+        "policyAdapter": existing.get("policyAdapter") or "isaaclab-franka-cartesian-delta-dls-v1",
         "runtimeBlockers": list(runtime_status.get("blockers") or []),
     }
     manifest["readiness"] = readiness(manifest)

@@ -230,8 +230,8 @@ export default function AgentControl() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1 className="page-title">Agent Control</h1>
-          <p className="page-sub">Persisted, budget-bounded orchestration over the same typed planner, MuJoCo oracle, VLA, and failure-analysis commands used by the API.</p>
+          <h1 className="page-title">Operate</h1>
+          <p className="page-sub">Give RobotWorld one task and a bounded policy; the durable agent runs the planner, physics oracle, VLA, and failure analysis through the same typed commands as the API.</p>
         </div>
         <Badge tone="teal" icon="shield">Authoritative execution</Badge>
       </div>

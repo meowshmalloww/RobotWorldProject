@@ -50,9 +50,9 @@ def test_pinned_franka_registers_validates_and_activates() -> None:
 
         listing = client.get("/api/robots")
         assert listing.status_code == 200
-        assert listing.json()["defaultBackend"] == "mujoco"
+        assert listing.json()["defaultBackend"] == "isaac_sim"
+        assert listing.json()["fallbackBackends"] == ["mujoco"]
         assert any(row["id"] == robot_id and row["active"] for row in listing.json()["registrations"])
-        assert all(not str(row["format"]).startswith("isaac") for row in listing.json()["robots"])
 
         activated = client.post(
             f"/api/robots/{robot_id}/activate",
@@ -74,4 +74,3 @@ def test_pinned_franka_registers_validates_and_activates() -> None:
             "robot.franka.register",
             "robot.activate",
         }
-

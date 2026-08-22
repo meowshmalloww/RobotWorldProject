@@ -170,16 +170,19 @@ def write_visual_usdc(
     *,
     uniform_scale: float = 1.0,
     translation_m: tuple[float, float, float] = (0.0, 0.0, 0.0),
-) -> tuple[Path, dict[str, int]]:
+    appearance_variants: list[dict[str, Any]] | None = None,
+) -> tuple[Path, dict[str, Any]]:
     """Convert a verified GLB mesh into an actual OpenUSD visual layer.
 
     The physics layer remains separate: this layer contains the generated
-    TRELLIS geometry itself, not an inferred box/capsule proxy.
+    TRELLIS geometry itself, not an inferred box/capsule proxy. Optional
+    appearances must have identical vertices, faces, and UVs; otherwise they
+    are different geometry and must become distinct immutable asset versions.
     """
     try:
         import numpy as np
         import trimesh
-        from pxr import Sdf, Usd, UsdGeom, UsdShade  # type: ignore
+        from pxr import Sdf, Usd, UsdGeom, UsdShade, Vt  # type: ignore
     except ImportError as exc:
         raise RuntimeError("OpenUSD visual conversion unavailable: install usd-core, numpy, and trimesh") from exc
 
@@ -227,16 +230,17 @@ def write_visual_usdc(
     if pbr is not None:
         factor = getattr(pbr, "baseColorFactor", None)
         if factor is not None and len(factor) >= 3:
-            base = tuple(float(v) / 255.0 for v in factor[:3])
+            divisor = 255.0 if max(float(v) for v in factor[:3]) > 1.0 else 1.0
+            base = tuple(float(v) / divisor for v in factor[:3])
         metallic = float(getattr(pbr, "metallicFactor", metallic) or metallic)
         roughness = float(getattr(pbr, "roughnessFactor", roughness) or roughness)
     diffuse = shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f)
     diffuse.Set(base)
     uv = getattr(getattr(mesh, "visual", None), "uv", None)
-    texture_image = getattr(pbr, "baseColorTexture", None) if pbr is not None else None
-    if uv is not None and len(uv) == len(points) and texture_image is not None:
-        texture_path = out_path.with_name("basecolor.png")
-        texture_image.convert("RGBA").save(texture_path, format="PNG", optimize=True)
+    texture_artifacts: list[dict[str, str]] = []
+    has_uv = uv is not None and len(uv) == len(points)
+    reader = None
+    if has_uv:
         # glTF texture V origin is opposite USD's conventional image origin.
         uv_values = [(float(row[0]), 1.0 - float(row[1])) for row in np.asarray(uv)]
         primvar = UsdGeom.PrimvarsAPI(usd_mesh).CreatePrimvar(
@@ -247,17 +251,269 @@ def write_visual_usdc(
         reader.CreateIdAttr("UsdPrimvarReader_float2")
         reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
         reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+
+    texture_image = getattr(pbr, "baseColorTexture", None) if pbr is not None else None
+    if reader is not None and texture_image is not None:
+        texture_path = out_path.with_name("basecolor.png")
+        texture_image.convert("RGBA").save(texture_path, format="PNG", optimize=True)
+        texture_artifacts.append({"file": texture_path.name, "role": "base_color", "colorSpace": "sRGB"})
         texture = UsdShade.Shader.Define(stage, "/Visual/GeneratedMaterial/BaseColorTexture")
         texture.CreateIdAttr("UsdUVTexture")
         texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(texture_path.name))
         texture.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
         texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(reader.ConnectableAPI(), "result")
         texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        texture.CreateOutput("a", Sdf.ValueTypeNames.Float)
         diffuse.ConnectToSource(texture.ConnectableAPI(), "rgb")
-    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(metallic)
-    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(roughness)
+        shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).ConnectToSource(texture.ConnectableAPI(), "a")
+
+    metallic_input = shader.CreateInput("metallic", Sdf.ValueTypeNames.Float)
+    metallic_input.Set(metallic)
+    roughness_input = shader.CreateInput("roughness", Sdf.ValueTypeNames.Float)
+    roughness_input.Set(roughness)
+    metallic_roughness_image = getattr(pbr, "metallicRoughnessTexture", None) if pbr is not None else None
+    if reader is not None and metallic_roughness_image is not None:
+        metallic_roughness_path = out_path.with_name("metallic_roughness.png")
+        metallic_roughness_image.convert("RGB").save(metallic_roughness_path, format="PNG", optimize=True)
+        texture_artifacts.append(
+            {"file": metallic_roughness_path.name, "role": "metallic_roughness", "colorSpace": "raw"}
+        )
+        texture = UsdShade.Shader.Define(stage, "/Visual/GeneratedMaterial/MetallicRoughnessTexture")
+        texture.CreateIdAttr("UsdUVTexture")
+        texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(metallic_roughness_path.name))
+        texture.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("raw")
+        texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(reader.ConnectableAPI(), "result")
+        texture.CreateOutput("g", Sdf.ValueTypeNames.Float)
+        texture.CreateOutput("b", Sdf.ValueTypeNames.Float)
+        # glTF packs perceptual roughness in G and metallic in B.
+        roughness_input.ConnectToSource(texture.ConnectableAPI(), "g")
+        metallic_input.ConnectToSource(texture.ConnectableAPI(), "b")
+
+    normal_image = getattr(pbr, "normalTexture", None) if pbr is not None else None
+    if reader is not None and normal_image is not None:
+        normal_path = out_path.with_name("normal.png")
+        normal_image.convert("RGB").save(normal_path, format="PNG", optimize=True)
+        texture_artifacts.append({"file": normal_path.name, "role": "normal", "colorSpace": "raw"})
+        texture = UsdShade.Shader.Define(stage, "/Visual/GeneratedMaterial/NormalTexture")
+        texture.CreateIdAttr("UsdUVTexture")
+        texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(normal_path.name))
+        texture.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("raw")
+        texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(reader.ConnectableAPI(), "result")
+        texture.CreateInput("scale", Sdf.ValueTypeNames.Float4).Set((2.0, 2.0, 2.0, 1.0))
+        texture.CreateInput("bias", Sdf.ValueTypeNames.Float4).Set((-1.0, -1.0, -1.0, 0.0))
+        texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        shader.CreateInput("normal", Sdf.ValueTypeNames.Normal3f).ConnectToSource(texture.ConnectableAPI(), "rgb")
+
+    emissive_image = getattr(pbr, "emissiveTexture", None) if pbr is not None else None
+    emissive_input = shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f)
+    emissive_factor = getattr(pbr, "emissiveFactor", None) if pbr is not None else None
+    if emissive_factor is not None and len(emissive_factor) >= 3:
+        divisor = 255.0 if max(float(v) for v in emissive_factor[:3]) > 1.0 else 1.0
+        emissive_input.Set(tuple(float(v) / divisor for v in emissive_factor[:3]))
+    else:
+        emissive_input.Set((0.0, 0.0, 0.0))
+    if reader is not None and emissive_image is not None:
+        emissive_path = out_path.with_name("emissive.png")
+        emissive_image.convert("RGB").save(emissive_path, format="PNG", optimize=True)
+        texture_artifacts.append({"file": emissive_path.name, "role": "emissive", "colorSpace": "sRGB"})
+        texture = UsdShade.Shader.Define(stage, "/Visual/GeneratedMaterial/EmissiveTexture")
+        texture.CreateIdAttr("UsdUVTexture")
+        texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(emissive_path.name))
+        texture.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
+        texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(reader.ConnectableAPI(), "result")
+        texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        emissive_input.ConnectToSource(texture.ConnectableAPI(), "rgb")
     material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
-    UsdShade.MaterialBindingAPI(usd_mesh).Bind(material)
+    binding_api = UsdShade.MaterialBindingAPI.Apply(usd_mesh.GetPrim())
+
+    appearance_report: list[dict[str, Any]] = [
+        {
+            "id": "generated",
+            "displayName": "Generated source",
+            "materialPath": str(material.GetPath()),
+            "textures": list(texture_artifacts),
+        }
+    ]
+    appearance_bindings: list[tuple[str, Any]] = [("generated", material)]
+    base_faces = np.asarray(mesh.faces, dtype=np.int64)
+    base_vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    base_uv = np.asarray(uv, dtype=np.float64) if has_uv else None
+
+    for definition in appearance_variants or []:
+        variant_id = str(definition["id"])
+        display_name = str(definition.get("displayName") or variant_id)
+        variant_path = Path(str(definition["sourcePath"]))
+        if not variant_path.is_file():
+            raise RuntimeError(f"Appearance source is missing: {variant_path}")
+        alternate_loaded = trimesh.load(variant_path, force="scene", process=False)
+        alternate_mesh = (
+            alternate_loaded.to_geometry() if isinstance(alternate_loaded, trimesh.Scene) else alternate_loaded
+        )
+        if not isinstance(alternate_mesh, trimesh.Trimesh):
+            raise RuntimeError(f"Appearance '{variant_id}' did not contain one usable mesh")
+        alternate_faces = np.asarray(alternate_mesh.faces, dtype=np.int64)
+        alternate_vertices = np.asarray(alternate_mesh.vertices, dtype=np.float64)
+        alternate_uv_value = getattr(getattr(alternate_mesh, "visual", None), "uv", None)
+        alternate_uv = np.asarray(alternate_uv_value, dtype=np.float64) if alternate_uv_value is not None else None
+        topology_matches = (
+            alternate_faces.shape == base_faces.shape
+            and np.array_equal(alternate_faces, base_faces)
+            and alternate_vertices.shape == base_vertices.shape
+            and np.allclose(alternate_vertices, base_vertices, rtol=0.0, atol=1e-8)
+        )
+        uv_matches = (base_uv is None and alternate_uv is None) or (
+            base_uv is not None
+            and alternate_uv is not None
+            and base_uv.shape == alternate_uv.shape
+            and np.allclose(base_uv, alternate_uv, rtol=0.0, atol=1e-8)
+        )
+        if not topology_matches or not uv_matches:
+            raise RuntimeError(
+                f"Appearance '{variant_id}' changes geometry/topology/UVs; compile it as a new asset version"
+            )
+
+        material_name = _identifier(variant_id)
+        material_path = f"/Visual/AppearanceMaterials/{material_name}"
+        alternate_material = UsdShade.Material.Define(stage, material_path)
+        alternate_shader = UsdShade.Shader.Define(stage, f"{material_path}/PreviewSurface")
+        alternate_shader.CreateIdAttr("UsdPreviewSurface")
+        alternate_pbr = getattr(getattr(alternate_mesh, "visual", None), "material", None)
+        alternate_base = (0.55, 0.55, 0.55)
+        alternate_metallic, alternate_roughness = 0.0, 0.65
+        if alternate_pbr is not None:
+            factor = getattr(alternate_pbr, "baseColorFactor", None)
+            if factor is not None and len(factor) >= 3:
+                divisor = 255.0 if max(float(value) for value in factor[:3]) > 1.0 else 1.0
+                alternate_base = tuple(float(value) / divisor for value in factor[:3])
+            alternate_metallic = float(
+                getattr(alternate_pbr, "metallicFactor", alternate_metallic) or alternate_metallic
+            )
+            alternate_roughness = float(
+                getattr(alternate_pbr, "roughnessFactor", alternate_roughness) or alternate_roughness
+            )
+        alternate_diffuse = alternate_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f)
+        alternate_diffuse.Set(alternate_base)
+        alternate_metallic_input = alternate_shader.CreateInput("metallic", Sdf.ValueTypeNames.Float)
+        alternate_metallic_input.Set(alternate_metallic)
+        alternate_roughness_input = alternate_shader.CreateInput("roughness", Sdf.ValueTypeNames.Float)
+        alternate_roughness_input.Set(alternate_roughness)
+        variant_textures: list[dict[str, str]] = []
+
+        def _variant_texture(
+            image: Any,
+            *,
+            role: str,
+            color_space: str,
+            mode: str,
+            node_name: str,
+        ) -> Any | None:
+            if reader is None or image is None:
+                return None
+            filename = f"{material_name}_{role}.png"
+            image.convert(mode).save(out_path.with_name(filename), format="PNG", optimize=True)
+            metadata = {
+                "file": filename,
+                "role": role,
+                "colorSpace": color_space,
+                "appearanceId": variant_id,
+            }
+            variant_textures.append(metadata)
+            texture_artifacts.append(metadata)
+            texture_shader = UsdShade.Shader.Define(stage, f"{material_path}/{node_name}")
+            texture_shader.CreateIdAttr("UsdUVTexture")
+            texture_shader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(filename))
+            texture_shader.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set(color_space)
+            texture_shader.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+                reader.ConnectableAPI(), "result"
+            )
+            return texture_shader
+
+        alternate_base_texture = _variant_texture(
+            getattr(alternate_pbr, "baseColorTexture", None) if alternate_pbr is not None else None,
+            role="base_color",
+            color_space="sRGB",
+            mode="RGBA",
+            node_name="BaseColorTexture",
+        )
+        if alternate_base_texture is not None:
+            alternate_base_texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+            alternate_base_texture.CreateOutput("a", Sdf.ValueTypeNames.Float)
+            alternate_diffuse.ConnectToSource(alternate_base_texture.ConnectableAPI(), "rgb")
+            alternate_shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).ConnectToSource(
+                alternate_base_texture.ConnectableAPI(), "a"
+            )
+
+        alternate_mr_texture = _variant_texture(
+            getattr(alternate_pbr, "metallicRoughnessTexture", None) if alternate_pbr is not None else None,
+            role="metallic_roughness",
+            color_space="raw",
+            mode="RGB",
+            node_name="MetallicRoughnessTexture",
+        )
+        if alternate_mr_texture is not None:
+            alternate_mr_texture.CreateOutput("g", Sdf.ValueTypeNames.Float)
+            alternate_mr_texture.CreateOutput("b", Sdf.ValueTypeNames.Float)
+            alternate_roughness_input.ConnectToSource(alternate_mr_texture.ConnectableAPI(), "g")
+            alternate_metallic_input.ConnectToSource(alternate_mr_texture.ConnectableAPI(), "b")
+
+        alternate_normal_texture = _variant_texture(
+            getattr(alternate_pbr, "normalTexture", None) if alternate_pbr is not None else None,
+            role="normal",
+            color_space="raw",
+            mode="RGB",
+            node_name="NormalTexture",
+        )
+        if alternate_normal_texture is not None:
+            alternate_normal_texture.CreateInput("scale", Sdf.ValueTypeNames.Float4).Set((2.0, 2.0, 2.0, 1.0))
+            alternate_normal_texture.CreateInput("bias", Sdf.ValueTypeNames.Float4).Set((-1.0, -1.0, -1.0, 0.0))
+            alternate_normal_texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+            alternate_shader.CreateInput("normal", Sdf.ValueTypeNames.Normal3f).ConnectToSource(
+                alternate_normal_texture.ConnectableAPI(), "rgb"
+            )
+
+        alternate_emissive = alternate_shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f)
+        alternate_emissive_factor = (
+            getattr(alternate_pbr, "emissiveFactor", None) if alternate_pbr is not None else None
+        )
+        if alternate_emissive_factor is not None and len(alternate_emissive_factor) >= 3:
+            divisor = (
+                255.0 if max(float(value) for value in alternate_emissive_factor[:3]) > 1.0 else 1.0
+            )
+            alternate_emissive.Set(tuple(float(value) / divisor for value in alternate_emissive_factor[:3]))
+        else:
+            alternate_emissive.Set((0.0, 0.0, 0.0))
+        alternate_emissive_texture = _variant_texture(
+            getattr(alternate_pbr, "emissiveTexture", None) if alternate_pbr is not None else None,
+            role="emissive",
+            color_space="sRGB",
+            mode="RGB",
+            node_name="EmissiveTexture",
+        )
+        if alternate_emissive_texture is not None:
+            alternate_emissive_texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+            alternate_emissive.ConnectToSource(alternate_emissive_texture.ConnectableAPI(), "rgb")
+
+        alternate_material.CreateSurfaceOutput().ConnectToSource(alternate_shader.ConnectableAPI(), "surface")
+        appearance_bindings.append((variant_id, alternate_material))
+        appearance_report.append(
+            {
+                "id": variant_id,
+                "displayName": display_name,
+                "materialPath": material_path,
+                "textures": variant_textures,
+            }
+        )
+
+    appearance_set = visual.GetPrim().GetVariantSets().AddVariantSet("appearance")
+    for variant_id, variant_material in appearance_bindings:
+        appearance_set.AddVariant(variant_id)
+        appearance_set.SetVariantSelection(variant_id)
+        with appearance_set.GetVariantEditContext():
+            binding_api.Bind(variant_material)
+    appearance_set.SetVariantSelection("generated")
+    visual.GetPrim().SetCustomDataByKey(
+        "robotworld:appearanceVariantIds", Vt.StringArray([item[0] for item in appearance_bindings])
+    )
     stage.SetDefaultPrim(visual.GetPrim())
     stage.Save()
 
@@ -265,7 +521,21 @@ def write_visual_usdc(
     composed = UsdGeom.Mesh.Get(reopened, "/Visual/Mesh") if reopened else None
     if not composed or not composed.GetPointsAttr().Get() or not composed.GetFaceVertexIndicesAttr().Get():
         raise RuntimeError("OpenUSD visual conversion failed validation")
-    return out_path, {"vertices": len(points), "faces": len(faces)}
+    reopened_appearance = reopened.GetPrimAtPath("/Visual").GetVariantSet("appearance")
+    if not reopened_appearance or set(reopened_appearance.GetVariantNames()) != {
+        item["id"] for item in appearance_report
+    }:
+        raise RuntimeError("OpenUSD appearance VariantSet failed validation")
+    return out_path, {
+        "vertices": len(points),
+        "faces": len(faces),
+        "materialCount": 1 if pbr is not None else 0,
+        "textures": texture_artifacts,
+        "sourcePbrPreserved": bool(texture_artifacts),
+        "appearanceVariantSet": "appearance",
+        "defaultAppearanceVariantId": "generated",
+        "appearanceVariants": appearance_report,
+    }
 
 
 def write_usda(spec: dict[str, Any], asset_name: str, out_path: Path, *, visual_layer: str | None = None) -> tuple[Path, bool]:

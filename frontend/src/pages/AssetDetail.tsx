@@ -397,12 +397,20 @@ export default function AssetDetail() {
         </Card>
         
         {/* Part tree */}
-        <Card title="Part Tree" right={<Badge tone="grey">{asset.parts[0]?.children?.length ?? 0} parts</Badge>} flush>
+        <Card title="Part Tree" right={<Badge tone={asset.partGraph?.lifecycleState === "PHYSICS_VALIDATED" ? "green" : "grey"}>{asset.partGraph?.parts.length ?? asset.parts[0]?.children?.length ?? 0} parts</Badge>} flush>
           <div style={{ padding: "6px 4px", maxHeight: 430, overflowY: "auto" }}>
             {asset.parts.length > 0 ? (
               <Tree nodes={partsToTree(asset.parts)} selected={part} onSelect={(id) => setPart(id)} />
             ) : (
               <EmptyState icon="cube">No part hierarchy compiled yet.</EmptyState>
+            )}
+            {asset.partGraph && (
+              <div className="empty-note" style={{ margin: 8 }}>
+                <div className="row between"><span>Canonical PartGraph r{asset.partGraph.revision}</span><span className="mono">{asset.partGraph.lifecycleState}</span></div>
+                <div className="micro t3" style={{ marginTop: 5 }}>
+                  {asset.partGraph.joints.length} joints · handle parent verified {asset.physicsValidation?.jointSweep?.handleAttachedToMovingPart ? "yes" : "no"} · sweep {asset.physicsValidation?.jointSweep?.passed ? "passed" : "not passed"}
+                </div>
+              </div>
             )}
           </div>
         </Card>

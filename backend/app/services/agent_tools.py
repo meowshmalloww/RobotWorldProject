@@ -40,15 +40,20 @@ from ..contracts import (
     EvaluationAnalysisRequest,
     EvaluationTargetToolInput,
     FrankaRegistrationRequest,
+    LeRobotDatasetExportRequest,
     ModelRegistrationCreate,
     ModelTargetToolInput,
     NormalizeRecordedEvidenceToolInput,
     ObjectRequest,
     ObjectRequestTargetToolInput,
     OracleEvaluationRequest,
+    PolicyCandidateDecisionRequest,
+    PolicyCandidateRollbackRequest,
     RobotTargetToolInput,
     RigidAssetCompileRequest,
     ScenarioTargetToolInput,
+    SigNozMetricQueryToolInput,
+    SigNozTraceSearchToolInput,
     ScraperCollectorVersionsListToolInput,
     ScraperRepairCreate,
     ScraperRepairDecision,
@@ -58,11 +63,14 @@ from ..contracts import (
     ScraperRepairTargetToolInput,
     ValidateModelToolInput,
     VlaBridgeStatusToolInput,
+    VlaFrankaZeroShotBridgeToolInput,
+    VlaJepaFineTuneExecuteRequest,
+    VlaJepaFineTuneValidationRequest,
 )
 from ..db import SessionLocal
 from ..models import AgentToolCallRecord, ApprovalDecisionRecord, AuditEvent
 from ..util import new_id
-from . import autonomous_curriculum, command_store, control_catalog, curriculum_catalog, evaluation_catalog, evidence_catalog, evidence_collection, rigid_asset_compiler, robot_catalog, scraper_repair, vla_bridge, vla_policy_worker
+from . import autonomous_curriculum, command_store, control_catalog, curriculum_catalog, evaluation_catalog, evidence_catalog, evidence_collection, lerobot_dataset, lerobot_training, policy_lifecycle, rigid_asset_compiler, robot_catalog, scraper_repair, signoz, vla_bridge, vla_policy_worker
 
 
 class AgentToolError(RuntimeError):
@@ -324,6 +332,21 @@ async def _run_oracle(payload: ContractModel, call: AgentToolCall) -> dict[str, 
     }
 
 
+async def _run_drawer_oracle(payload: ContractModel, call: AgentToolCall) -> dict[str, Any]:
+    assert isinstance(payload, OracleEvaluationRequest)
+    value = await evaluation_catalog.run_franka_drawer_oracle(
+        payload,
+        idempotency_key=call.idempotency_key,
+        actor=call.actor,
+    )
+    nested = dict(value.get("result") or {})
+    return {
+        "command": _command_metadata(value),
+        "evaluation": _evaluation_summary(nested.get("evaluation")),
+        "worldTemplate": nested.get("worldTemplate"),
+    }
+
+
 async def _run_compiled_asset_oracle(payload: ContractModel, call: AgentToolCall) -> dict[str, Any]:
     assert isinstance(payload, CompiledAssetOracleRequest)
     value = await evaluation_catalog.run_compiled_asset_pick_place_oracle(
@@ -449,6 +472,18 @@ async def _cancel_autonomous_run(payload: ContractModel, call: AgentToolCall) ->
 async def _bridge_status(payload: ContractModel, _: AgentToolCall) -> dict[str, Any]:
     assert isinstance(payload, VlaBridgeStatusToolInput)
     return {"bridge": await vla_bridge.bridge_status(payload.model_id, payload.robot_id)}
+
+
+async def _attach_zero_shot_bridge(payload: ContractModel, call: AgentToolCall) -> dict[str, Any]:
+    assert isinstance(payload, VlaFrankaZeroShotBridgeToolInput)
+    return await vla_bridge.attach_zero_shot_bridge(
+        payload.model_id,
+        payload.robot_id,
+        camera_mapping=payload.camera_mapping,
+        policy_control_hz=payload.policy_control_hz,
+        idempotency_key=call.idempotency_key,
+        actor=call.actor,
+    )
 
 
 async def _list_audit(payload: ContractModel, _: AgentToolCall) -> dict[str, Any]:
@@ -610,6 +645,70 @@ async def _compile_rigid_asset(payload: ContractModel, call: AgentToolCall) -> d
     return value
 
 
+async def _export_lerobot_dataset(payload: ContractModel, call: AgentToolCall) -> dict[str, Any]:
+    assert isinstance(payload, LeRobotDatasetExportRequest)
+    return await lerobot_dataset.export_evaluation(
+        payload,
+        idempotency_key=call.idempotency_key,
+        actor=call.actor,
+    )
+
+
+async def _validate_vla_jepa_fine_tune(payload: ContractModel, call: AgentToolCall) -> dict[str, Any]:
+    assert isinstance(payload, VlaJepaFineTuneValidationRequest)
+    return await lerobot_training.validate_candidate(
+        payload,
+        idempotency_key=call.idempotency_key,
+        actor=call.actor,
+    )
+
+
+async def _execute_vla_jepa_fine_tune(payload: ContractModel, call: AgentToolCall) -> dict[str, Any]:
+    assert isinstance(payload, VlaJepaFineTuneExecuteRequest)
+    return await lerobot_training.execute_candidate(
+        payload,
+        idempotency_key=call.idempotency_key,
+        actor=call.actor,
+    )
+
+
+async def _decide_policy_candidate(payload: ContractModel, call: AgentToolCall) -> dict[str, Any]:
+    assert isinstance(payload, PolicyCandidateDecisionRequest)
+    return await policy_lifecycle.decide(
+        payload,
+        idempotency_key=call.idempotency_key,
+        actor=call.actor,
+    )
+
+
+async def _rollback_policy_candidate(payload: ContractModel, call: AgentToolCall) -> dict[str, Any]:
+    assert isinstance(payload, PolicyCandidateRollbackRequest)
+    return await policy_lifecycle.rollback(
+        payload,
+        idempotency_key=call.idempotency_key,
+        actor=call.actor,
+    )
+
+
+async def _search_signoz_traces(payload: ContractModel, _: AgentToolCall) -> dict[str, Any]:
+    assert isinstance(payload, SigNozTraceSearchToolInput)
+    return await signoz.search_traces(
+        minutes=payload.minutes,
+        filter_expr=payload.filter_expression,
+        limit=payload.limit,
+    )
+
+
+async def _query_signoz_metric(payload: ContractModel, _: AgentToolCall) -> dict[str, Any]:
+    assert isinstance(payload, SigNozMetricQueryToolInput)
+    return await signoz.metric_timeseries(
+        payload.metric,
+        minutes=payload.minutes,
+        step=payload.step_seconds,
+        agg=payload.aggregation,
+    )
+
+
 _SPECS = (
     ToolSpec("models.list", "1.0.0", "List configured model registrations and real lifecycle health.", AgentToolEffect.QUERY, "catalog.read", EmptyToolInput, _list_models),
     ToolSpec("models.get", "1.0.0", "Inspect one configured model registration and capabilities.", AgentToolEffect.QUERY, "catalog.read", ModelTargetToolInput, _get_model),
@@ -626,6 +725,7 @@ _SPECS = (
     ToolSpec("evaluations.list", "1.0.0", "List bounded structured evaluation summaries.", AgentToolEffect.QUERY, "evaluations.read", EvaluationListToolInput, _list_evaluations),
     ToolSpec("evaluations.get", "1.0.0", "Retrieve bounded predicates, contacts, phase frames, and trajectory samples for one run.", AgentToolEffect.QUERY, "evaluations.read", EvaluationTargetToolInput, _get_evaluation),
     ToolSpec("evaluations.run_oracle_pick_place", "1.0.0", "Run one real deterministic Franka pick/place episode.", AgentToolEffect.MUTATION, "evaluations.run", OracleEvaluationRequest, _run_oracle),
+    ToolSpec("evaluations.run_oracle_franka_drawer", "1.0.0", "Run the controlled Franka drawer oracle with real bilateral handle contact and prismatic-joint displacement predicates.", AgentToolEffect.MUTATION, "evaluations.run", OracleEvaluationRequest, _run_drawer_oracle),
     ToolSpec("evaluations.run_oracle_compiled_asset", "1.0.0", "Compose one PHYSICS_VALIDATED asset version into the Franka world and run real contact/lift/place predicates.", AgentToolEffect.MUTATION, "evaluations.run", CompiledAssetOracleRequest, _run_compiled_asset_oracle),
     ToolSpec("evaluations.run_vla_compiled_asset", "1.0.0", "Run a loaded VLA-JEPA policy against an ORACLE_VALIDATED asset in authoritative MuJoCo; never substitute scripted or random actions.", AgentToolEffect.MUTATION, "evaluations.run", CompiledAssetVlaEvaluationRequest, _run_compiled_asset_vla),
     ToolSpec("evaluations.analyze_failure", "1.0.0", "Persist a structured failure event and coverage observation from one terminal authoritative evaluation.", AgentToolEffect.MUTATION, "evaluations.analyze", EvaluationAnalysisRequest, _analyze_evaluation),
@@ -637,7 +737,10 @@ _SPECS = (
     ToolSpec("curriculum.runs.list", "1.0.0", "List persisted curriculum-run budgets, real phase progress, blockers, and terminal reasons.", AgentToolEffect.QUERY, "curriculum.read", EmptyToolInput, _list_autonomous_runs),
     ToolSpec("curriculum.runs.cancel", "1.0.0", "Request the cooperative kill switch for a non-terminal curriculum run.", AgentToolEffect.MUTATION, "curriculum.stop", AutonomousRunTargetToolInput, _cancel_autonomous_run, autonomous_allowed=True),
     ToolSpec("vla.bridge_status", "1.0.0", "Check checkpoint/robot/adapter compatibility and explicit blockers.", AgentToolEffect.QUERY, "models.read", VlaBridgeStatusToolInput, _bridge_status),
+    ToolSpec("vla.attach_franka_zero_shot_bridge", "1.0.0", "Explicitly bind a loaded two-view seven-dimensional checkpoint to this exact Franka definition for uncalibrated evaluation. cameraMapping must be {observation.images.exterior_1_left: front, observation.images.exterior_2_left: wrist}; never claims training compatibility.", AgentToolEffect.MUTATION, "models.manage", VlaFrankaZeroShotBridgeToolInput, _attach_zero_shot_bridge),
     ToolSpec("audit.list", "1.0.0", "Read bounded immutable state-transition and command audit events.", AgentToolEffect.QUERY, "audit.read", AuditListToolInput, _list_audit),
+    ToolSpec("telemetry.signoz.search_traces", "1.0.0", "Query bounded trace evidence from the configured self-hosted SigNoz Community instance.", AgentToolEffect.QUERY, "telemetry.read", SigNozTraceSearchToolInput, _search_signoz_traces),
+    ToolSpec("telemetry.signoz.metric_timeseries", "1.0.0", "Query one bounded metric time series from the configured self-hosted SigNoz Community instance.", AgentToolEffect.QUERY, "telemetry.read", SigNozMetricQueryToolInput, _query_signoz_metric),
     ToolSpec("evidence.requests.list", "1.0.0", "List exact-object requests and evidence lifecycle state.", AgentToolEffect.QUERY, "evidence.read", EmptyToolInput, _list_evidence_requests),
     ToolSpec("evidence.requests.get", "1.0.0", "Inspect one object request, its immutable bundles, and normalized records.", AgentToolEffect.QUERY, "evidence.read", ObjectRequestTargetToolInput, _get_evidence_request),
     ToolSpec("evidence.requests.create", "1.0.0", "Create an exact or category-level object evidence request.", AgentToolEffect.MUTATION, "evidence.manage", ObjectRequest, _create_evidence_request),
@@ -657,6 +760,11 @@ _SPECS = (
     ToolSpec("assets.versions.list", "1.0.0", "List immutable compiler versions, validation evidence, and promotion blockers.", AgentToolEffect.QUERY, "assets.read", EmptyToolInput, _list_asset_versions),
     ToolSpec("assets.versions.get", "1.0.0", "Inspect one canonical asset manifest and bounded validation report.", AgentToolEffect.QUERY, "assets.read", AssetVersionTargetToolInput, _get_asset_version),
     ToolSpec("assets.rigid.compile", "1.0.0", "Compile an allowlisted immutable GLB into separately validated OpenUSD and MuJoCo physical artifacts.", AgentToolEffect.MUTATION, "assets.manage", RigidAssetCompileRequest, _compile_rigid_asset),
+    ToolSpec("training.datasets.create_from_evaluation", "1.0.0", "Export one successful deterministic-oracle evaluation with synchronized two-camera observations into a locally validated LeRobot dataset; never launches training or pushes to Hub.", AgentToolEffect.MUTATION, "training.datasets.manage", LeRobotDatasetExportRequest, _export_lerobot_dataset),
+    ToolSpec("training.vla_jepa.validate_fine_tune", "1.0.0", "Create a durable local-only VLA-JEPA fine-tuning candidate and validate its exact dataset, checkpoint, dependency, device, and output contracts without executing optimization.", AgentToolEffect.MUTATION, "training.runs.manage", VlaJepaFineTuneValidationRequest, _validate_vla_jepa_fine_tune),
+    ToolSpec("training.vla_jepa.execute_fine_tune", "1.0.0", "Execute an explicitly approved READY VLA-JEPA candidate for its bounded 1-10 step local optimizer profile; writes a new immutable checkpoint and never replaces the active policy.", AgentToolEffect.MUTATION, "training.runs.execute", VlaJepaFineTuneExecuteRequest, _execute_vla_jepa_fine_tune),
+    ToolSpec("training.policy_candidates.decide", "1.0.0", "Promote or reject an immutable policy candidate from exact terminal evaluation IDs. Promotion requires the configured passing multi-seed gate and preserves a rollback model.", AgentToolEffect.MUTATION, "training.policies.promote", PolicyCandidateDecisionRequest, _decide_policy_candidate),
+    ToolSpec("training.policy_candidates.rollback", "1.0.0", "Restore the recorded previous policy for a PROMOTED candidate and append an immutable rollback audit event.", AgentToolEffect.MUTATION, "training.policies.rollback", PolicyCandidateRollbackRequest, _rollback_policy_candidate),
     ToolSpec("workers.vla_jepa.stop", "1.0.0", "Immediately terminate the local VLA-JEPA worker and reconcile resident model state.", AgentToolEffect.MUTATION, "workers.stop", EmptyToolInput, _stop_vla_worker),
 )
 REGISTRY = {spec.name: spec for spec in _SPECS}

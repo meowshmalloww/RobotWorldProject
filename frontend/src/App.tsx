@@ -1,6 +1,7 @@
 import { Suspense, lazy, useEffect, useState } from "react";
 import { HashRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AppErrorBoundary } from "./components/ErrorBoundary";
+import { AiChatPanel } from "./components/ai/AiChatPanel";
 import { Sidebar } from "./components/shell/Sidebar";
 import { StatusBar, Titlebar } from "./components/shell/Titlebar";
 import { ToastProvider } from "./components/ui/Toast";
@@ -17,7 +18,6 @@ const ScraperRepair = lazy(() => import("./pages/ScraperRepair"));
 const Sources = lazy(() => import("./pages/Sources"));
 const Models = lazy(() => import("./pages/Models"));
 const Robots = lazy(() => import("./pages/Robots"));
-const Simulation = lazy(() => import("./pages/Simulation"));
 const FailureAnalysis = lazy(() => import("./pages/FailureAnalysis"));
 const AgentControl = lazy(() => import("./pages/AgentControl"));
 const Training = lazy(() => import("./pages/Training"));
@@ -26,7 +26,24 @@ const Settings = lazy(() => import("./pages/Settings"));
 
 export default function App() {
   const [collapsed, setCollapsed] = useState(false);
+  const [copilotOpen, setCopilotOpen] = useState(false);
   useEffect(() => installGlobalDiagnostics(), []);
+  useEffect(() => {
+    const toggle = () => setCopilotOpen((open) => !open);
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setCopilotOpen(false);
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "l") {
+        event.preventDefault();
+        setCopilotOpen((open) => !open);
+      }
+    };
+    window.addEventListener("robotworld:toggle-copilot", toggle);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("robotworld:toggle-copilot", toggle);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, []);
   return (
     <HashRouter>
       <ToastProvider>
@@ -48,9 +65,10 @@ export default function App() {
                   <Route path="/sources" element={<Sources />} />
                   <Route path="/models" element={<Models />} />
                   <Route path="/robots" element={<Robots />} />
-                  <Route path="/simulation" element={<Simulation />} />
+                  <Route path="/simulation" element={<Navigate to="/worlds" replace />} />
                   <Route path="/failure-analysis" element={<FailureAnalysis />} />
                   <Route path="/agent-control" element={<AgentControl />} />
+                  <Route path="/operate" element={<AgentControl />} />
                   <Route path="/training" element={<Training />} />
                   <Route path="/observability" element={<Observability />} />
                   <Route path="/observability/:tab" element={<Observability />} />
@@ -62,6 +80,7 @@ export default function App() {
               </AppErrorBoundary>
             </main>
             <StatusBar />
+            <AiChatPanel open={copilotOpen} onClose={() => setCopilotOpen(false)} />
           </div>
       </ToastProvider>
     </HashRouter>

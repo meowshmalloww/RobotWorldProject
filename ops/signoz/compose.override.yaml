@@ -1,0 +1,8 @@
+services:
+  ingester:
+    image: signoz/signoz-otel-collector@sha256:6d1a59bc553e041014597eff0970608948c5c7447aaa984c4d109f2bc9f4062c
+    command:
+      - -c
+      - |
+        /signoz-otel-collector migrate sync check &&
+        exec /signoz-otel-collector --config=/etc/otel-collector-config.yaml

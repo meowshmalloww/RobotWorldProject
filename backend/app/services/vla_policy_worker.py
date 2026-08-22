@@ -24,10 +24,12 @@ class VlaWorkerUnavailable(VlaWorkerError):
 
 WORKER_SCRIPT = (BASE_DIR / "workers" / "vla_policy_worker.py").resolve()
 DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_VLA_PYTHON = Path(r"D:\RobotWorldRuntimes\vla-env\Scripts\python.exe")
+DEFAULT_LEROBOT_REPO = Path(r"D:\LeRobot")
 
 
 def _configured_python() -> Path:
-    value = os.environ.get("VLA_JEPA_PYTHON") or sys.executable
+    value = os.environ.get("VLA_JEPA_PYTHON") or (str(DEFAULT_VLA_PYTHON) if DEFAULT_VLA_PYTHON.is_file() else sys.executable)
     path = Path(value).expanduser().resolve(strict=True)
     if not path.is_file():
         raise VlaWorkerUnavailable(f"VLA_JEPA_PYTHON is not a file: {path}")
@@ -36,6 +38,9 @@ def _configured_python() -> Path:
 
 def _configured_lerobot_repo() -> Path | None:
     value = os.environ.get("LEROBOT_REPO_PATH")
+    defaults_disabled = os.environ.get("ROBOTWORLD_DISABLE_LOCAL_RUNTIME_DEFAULTS", "").lower() in {"1", "true", "yes"}
+    if not value and not defaults_disabled:
+        value = str(DEFAULT_LEROBOT_REPO) if DEFAULT_LEROBOT_REPO.is_dir() else ""
     if not value:
         return None
     path = Path(value).expanduser().resolve(strict=True)
@@ -53,6 +58,10 @@ def _worker_environment() -> dict[str, str]:
         "PATHEXT",
         "TEMP",
         "TMP",
+        "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "USERNAME",
         "USERPROFILE",
         "LOCALAPPDATA",
         "APPDATA",
@@ -157,7 +166,11 @@ class JsonLineWorker:
                 self._pending.pop(request_id, None)
         if not response.get("ok"):
             error_type = response.get("errorType") or "WorkerError"
-            raise VlaWorkerError(f"{error_type}: {response.get('error') or 'unknown worker failure'}")
+            trace = str(response.get("traceback") or "").strip()
+            detail = f"{error_type}: {response.get('error') or 'unknown worker failure'}"
+            if trace:
+                detail += f"\n{trace}"
+            raise VlaWorkerError(detail)
         result = response.get("result")
         if not isinstance(result, dict):
             raise VlaWorkerError("VLA-JEPA worker returned a malformed result.")
@@ -230,12 +243,24 @@ def _request_payload(checkpoint_path: str, expected_device: str) -> dict[str, An
     checkpoint = Path(checkpoint_path).expanduser().resolve(strict=True)
     repo = _configured_lerobot_repo()
     device = expected_device if expected_device and expected_device != "auto" else "cuda"
+    qwen_metadata = os.environ.get("QWEN3_VL_METADATA_PATH")
+    default_qwen_metadata = Path(r"D:\RobotWorldRuntimes\model-metadata\Qwen3-VL-2B-Instruct")
+    if (
+        not qwen_metadata
+        and os.environ.get("ROBOTWORLD_DISABLE_LOCAL_RUNTIME_DEFAULTS") != "1"
+        and default_qwen_metadata.is_dir()
+    ):
+        # This directory contains tokenizer/config metadata only. The scoped
+        # worker loader reconstructs Qwen structure and fills weights from the
+        # selected VLA checkpoint, whether it is the base or a candidate.
+        qwen_metadata = str(default_qwen_metadata)
     return {
         "checkpointPath": str(checkpoint),
         "lerobotRepoPath": str(repo) if repo else None,
         "device": device,
         "cudaDevice": 0,
         "loadWorldModelForInference": False,
+        "qwenMetadataPath": qwen_metadata,
     }
 
 
