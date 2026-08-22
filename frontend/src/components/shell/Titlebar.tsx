@@ -165,7 +165,7 @@ export function Titlebar() {
           align="right"
           width={180}
           trigger={() => (
-            <button className="tb-user">
+            <button className="tb-user" aria-label="Account menu">
               <MangoAvatar size={22} />
               <Icon name="chevronDown" size={11} style={{ color: "var(--text-3)" }} />
             </button>

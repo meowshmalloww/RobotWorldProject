@@ -18,6 +18,7 @@ def main() -> int:
     parser.add_argument("--active-world-id")
     parser.add_argument("--task", choices=("pick_place", "drop_off_table"), default="pick_place")
     parser.add_argument("--seed", type=int, default=6203)
+    parser.add_argument("--request-timeout", type=float, default=60.0)
     args = parser.parse_args()
     payload = {
         "robotId": args.robot_id,
@@ -38,7 +39,11 @@ def main() -> int:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urlopen(request, timeout=10) as response:
+    # Active-world session creation compiles the generated asset, target
+    # collision contract, counter, and Panda into one MuJoCo model.  On a
+    # Windows development workstation this can legitimately exceed ten
+    # seconds; timing out the client did not cancel the server-side compile.
+    with urlopen(request, timeout=args.request_timeout) as response:
         session = json.load(response)
     ws_url = args.api.replace("http://", "ws://").replace("https://", "wss://")
     frames = 0
@@ -50,7 +55,7 @@ def main() -> int:
     pbr_visual_frames = 0
     geometry_names: set[str] = set()
     evaluation = None
-    with connect(f"{ws_url}/ws/worlds/live/{session['sessionId']}", open_timeout=10) as socket:
+    with connect(f"{ws_url}/ws/worlds/live/{session['sessionId']}", open_timeout=min(args.request_timeout, 30.0)) as socket:
         while True:
             message = json.loads(socket.recv(timeout=120))
             if message["type"] == "frame":

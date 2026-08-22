@@ -73,7 +73,7 @@ interface AcceptanceJob {
 
 type WorldBackend = "mujoco" | "isaac_sim";
 type WorldController = "oracle" | "vla_jepa" | "agent";
-type WorldTask = "pick_place" | "drop_off_table" | "open_drawer";
+type WorldTask = "auto" | "pick_place" | "drop_off_table" | "open_drawer";
 type WorldViewport = "editor" | "live";
 
 interface ModelSummary {
@@ -198,7 +198,10 @@ function SceneComposer({ assetId }: { assetId: string }) {
   const [startingAcceptance, setStartingAcceptance] = useState(false);
   const [selected, setSelected] = useState<string | null>("cabinet-02");
   const [selectedName, setSelectedName] = useState("Kitchen Cabinet 02");
-  const [seed, setSeed] = useState("1048576");
+  // This seed is the persisted authored-kitchen acceptance seed.  The result
+  // always exposes it; additional seeds belong to the robustness run rather
+  // than an invisible retry loop.
+  const [seed, setSeed] = useState("1048577");
   const [variant, setVariant] = useState("");
   const [shadingVariant, setShadingVariant] = useState<"rgb" | "seg" | "depth">("rgb");
   const [gizmoMode, setGizmoMode] = useState<EditorTool>("camera");
@@ -219,12 +222,12 @@ function SceneComposer({ assetId }: { assetId: string }) {
   const [robotId, setRobotId] = useState("");
   const { data: authoringRobot } = useApi<AuthoringRobotPreview>(robotId ? `/worlds/scene/robot-preview?robot_id=${encodeURIComponent(robotId)}` : null);
   const [instruction, setInstruction] = useState("Pick up the apple and place it on top of the blender.");
-  const [command, setCommand] = useState<WorldCommandResult | null>(null);
+  const command: WorldCommandResult | null = null;
   const [operation, setOperation] = useState<WorldOperationResult | null>(null);
   const [activeRun, setActiveRun] = useState<AutonomousRunSummary | null>(null);
   const [backend, setBackend] = useState<WorldBackend>("mujoco");
   const [controller, setController] = useState<WorldController>("oracle");
-  const [task, setTask] = useState<WorldTask>("pick_place");
+  const task: WorldTask = "auto";
   const [assetVersionId, setAssetVersionId] = useState("");
   const [modelId, setModelId] = useState("");
   const [viewport, setViewport] = useState<WorldViewport>("editor");
@@ -236,6 +239,16 @@ function SceneComposer({ assetId }: { assetId: string }) {
   const [manualBusy, setManualBusy] = useState(false);
   const [importingRobot, setImportingRobot] = useState(false);
   const [arranging, setArranging] = useState(false);
+  const worldRobots = useMemo(() => {
+    const ranked = [...(robotData?.robots ?? [])].sort((left, right) => Number(Boolean(right.physicsReady)) - Number(Boolean(left.physicsReady)));
+    const seen = new Set<string>();
+    return ranked.filter((item) => {
+      const key = `${item.format}:${item.name.trim().toLowerCase()}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [robotData?.robots]);
 
   // panel state - resizable + collapsible
   const [leftW, setLeftW] = usePanelSize(260, 150, 560, "robotworld.worlds.leftW");
@@ -294,7 +307,7 @@ function SceneComposer({ assetId }: { assetId: string }) {
   );
   const hasPlacedWorldAssets = Boolean(scene?.placedAssets?.length);
 
-  useEffect(() => { if (!robotId && robotData?.robots[0]) setRobotId(robotData.robots[0].id); }, [robotData, robotId]);
+  useEffect(() => { if (!robotId && worldRobots[0]) setRobotId(worldRobots[0].id); }, [robotId, worldRobots]);
   useEffect(() => {
     const policies = modelData?.models.filter((item) => item.roles.includes("vla_policy")) ?? [];
     if (!modelId && policies.length) setModelId((policies.find((item) => item.lifecycleState === "LOADED") ?? policies[0]).id);
@@ -429,9 +442,8 @@ function SceneComposer({ assetId }: { assetId: string }) {
     }
   };
 
-  const planCommand = async (mode: "plan" | "execute" = "plan") => {
-    if (mode === "execute") {
-      if (backend === "mujoco" && controller === "oracle" && ["pick_place", "drop_off_table"].includes(task)) {
+  const planCommand = async () => {
+      if (backend === "mujoco" && controller === "oracle" && ["auto", "pick_place", "drop_off_table"].includes(task)) {
         await startLiveOracle();
         return;
       }
@@ -443,7 +455,7 @@ function SceneComposer({ assetId }: { assetId: string }) {
           backend,
           controller,
           task,
-          assetVersionId: task === "pick_place" && assetVersionId ? assetVersionId : null,
+          assetVersionId: assetVersionId || null,
           modelId: controller === "oracle" ? null : modelId || null,
           seed: Number(seed),
           maxPolicySteps: 150,
@@ -461,17 +473,6 @@ function SceneComposer({ assetId }: { assetId: string }) {
       } catch (e) {
         toast.push("err", "Execution failed", e instanceof ApiError ? e.message : String(e));
       } finally { setPlanning(false); }
-      return;
-    }
-    setPlanning(true);
-    try {
-      const result = await api.post<WorldCommandResult>("/worlds/commands", { instruction, robotId: robotId || null, mode: "plan" });
-      setCommand(result);
-      setInspTab("Agent");
-      setRightOpen(true);
-    } catch (e) {
-      toast.push("err", "Planning failed", e instanceof ApiError ? e.message : String(e));
-    } finally { setPlanning(false); }
   };
 
   useEffect(() => {
@@ -1027,7 +1028,7 @@ function SceneComposer({ assetId }: { assetId: string }) {
                 {inspTab === "Agent" || inspTab === "Robots" ? (
                   <RobotAgentPanel
                     tab={inspTab}
-                    robots={robotData?.robots ?? []}
+                    robots={worldRobots}
                     robotId={robotId}
                     setRobotId={setRobotId}
                     instruction={instruction}
@@ -1045,7 +1046,6 @@ function SceneComposer({ assetId }: { assetId: string }) {
                     controller={controller}
                     setController={setController}
                     task={task}
-                    setTask={setTask}
                     assets={physicalAssets?.assetVersions ?? []}
                     assetVersionId={assetVersionId}
                     setAssetVersionId={setAssetVersionId}
@@ -1146,15 +1146,15 @@ function RuntimeDiagnosticsPanel() {
   </div>;
 }
 
-function RobotAgentPanel({ tab, robots, robotId, setRobotId, instruction, setInstruction, command, operation, activeRun, planning, onPlan, onImport, importing, onRobotsChanged, backend, setBackend, controller, setController, task, setTask, assets, assetVersionId, setAssetVersionId, models, modelId, setModelId, hasPlacedWorldAssets, onManual }: {
+function RobotAgentPanel({ tab, robots, robotId, setRobotId, instruction, setInstruction, command, operation, activeRun, planning, onPlan, onImport, importing, onRobotsChanged, backend, setBackend, controller, setController, task, assets, assetVersionId, setAssetVersionId, models, modelId, setModelId, hasPlacedWorldAssets, onManual }: {
   tab: "Agent" | "Robots"; robots: RobotManifest[]; robotId: string; setRobotId: (id: string) => void;
   instruction: string; setInstruction: (value: string) => void; command: WorldCommandResult | null; planning: boolean;
   operation: WorldOperationResult | null; activeRun: AutonomousRunSummary | null;
-  onPlan: (mode?: "plan" | "execute") => void; onImport: (file?: File) => void; importing: boolean;
+  onPlan: () => void; onImport: (file?: File) => void; importing: boolean;
   onRobotsChanged: () => void;
   backend: WorldBackend; setBackend: (value: WorldBackend) => void;
   controller: WorldController; setController: (value: WorldController) => void;
-  task: WorldTask; setTask: (value: WorldTask) => void;
+  task: WorldTask;
   assets: PhysicalAssetVersion[]; assetVersionId: string; setAssetVersionId: (value: string) => void;
   models: ModelSummary[]; modelId: string; setModelId: (value: string) => void;
   hasPlacedWorldAssets: boolean;
@@ -1212,20 +1212,20 @@ function RobotAgentPanel({ tab, robots, robotId, setRobotId, instruction, setIns
     <div className="col" style={{ gap: 7 }}>
       <div className="row" style={{ gap: 6 }}>
         <label className="field grow"><span className="micro t3">Backend</span><select className="select" value={backend} onChange={(e) => { const value = e.target.value as WorldBackend; setBackend(value); if (value === "isaac_sim") { setController("oracle"); const isaacRobot = robots.find((item) => item.format === "isaac-openusd-reference"); if (isaacRobot) setRobotId(isaacRobot.id); } else { const mujocoRobot = robots.find((item) => item.format === "mjcf" && item.physicsReady); if (mujocoRobot) setRobotId(mujocoRobot.id); } }}><option value="mujoco">MuJoCo</option><option value="isaac_sim">NVIDIA Isaac Sim + Isaac Lab</option></select></label>
-        <label className="field grow"><span className="micro t3">Task</span><select className="select" value={task} onChange={(e) => { const value = e.target.value as WorldTask; setTask(value); if (value !== "pick_place") setController("oracle"); if (value === "drop_off_table") setInstruction("Pick up the apple and drop it off the table."); }}><option value="pick_place">Pick and place</option><option value="drop_off_table" disabled={!hasPlacedWorldAssets}>Drop off table</option><option value="open_drawer">Open drawer</option></select></label>
+        <div className="field grow"><span className="micro t3">Instruction compiler</span><div className="select" style={{ display: "flex", alignItems: "center" }}>Automatic · active world</div></div>
       </div>
       <label className="field"><span className="micro t3">Robot in this world</span><select className="select" value={robotId} onChange={(e) => setRobotId(e.target.value)}><option value="">No robot selected</option>{robots.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-      <label className="field"><span className="micro t3">Controller</span><select className="select" value={controller} disabled={backend === "isaac_sim" || task !== "pick_place"} onChange={(e) => setController(e.target.value as WorldController)}><option value="oracle">Deterministic Franka oracle</option><option value="vla_jepa">VLA-JEPA policy</option><option value="agent" disabled={hasPlacedWorldAssets}>Autonomous oracle → VLA → diagnose{hasPlacedWorldAssets ? " · validation world only" : ""}</option></select></label>
+      <div className="field"><span className="micro t3">Execution</span><div className="select" style={{ display: "flex", alignItems: "center" }}>{backend === "mujoco" ? "Deterministic Panda physics" : "Isaac worker · license gated"}</div></div>
       {task === "pick_place" && !hasPlacedWorldAssets && <label className="field"><span className="micro t3">Validation asset</span><select className="select" value={assetVersionId} onChange={(e) => setAssetVersionId(e.target.value)}><option value="">Known-good cube</option>{assets.map((item) => <option key={item.id} value={item.id}>{item.displayName} · {item.lifecycleState}</option>)}</select></label>}
       {controller !== "oracle" && <label className="field"><span className="micro t3">Policy brain</span><select className="select" value={modelId} onChange={(e) => setModelId(e.target.value)}><option value="">Select loaded VLA</option>{models.map((item) => <option key={item.id} value={item.id}>{item.displayName} · {item.lifecycleState}/{item.healthStatus}</option>)}</select></label>}
-      <textarea className="input" style={{ minHeight: 82, padding: 9, resize: "vertical" }} value={instruction} onChange={(e) => setInstruction(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !planning && canExecute) void onPlan("execute"); }} placeholder="Describe the selected task. Unsupported intents are rejected before physics starts." />
-      <span className="micro t3">{hasPlacedWorldAssets && task === "pick_place" ? "Name one movable object and one fixed target, for example apple → on top of blender." : task === "drop_off_table" ? "Name one movable object. The oracle must grasp it, carry it beyond the measured counter edge, release it under gravity, and verify it settled off the support." : `Execution contract: ${task === "pick_place" ? "pick object → release inside target" : "grasp handle → open one validated drawer"}. Unsupported intent is rejected before physics starts.`}</span>
-      <div className="row"><button className="btn btn-secondary btn-sm grow" disabled={planning || instruction.trim().length < 2} onClick={() => void onPlan("plan")}><Icon name="spark" size={12} /> Plan</button><button className="btn btn-primary btn-sm grow" disabled={planning || !canExecute} onClick={() => void onPlan("execute")} title={canExecute ? "Run the selected real controller" : "Select a ready robot, physical asset, and loaded policy"}><Icon name="play" size={12} /> {planning ? "Running live..." : controller === "agent" ? "Start loop" : backend === "mujoco" && controller === "oracle" && ["pick_place", "drop_off_table"].includes(task) ? "Run live" : "Execute"}</button></div>
-      {hasPlacedWorldAssets && backend === "mujoco" && controller === "oracle" && task === "pick_place" && <button className="btn btn-secondary btn-sm" disabled={planning || !canExecute} onClick={onManual}><Icon name="robot" size={12} /> Control Panda in this world</button>}
+      <textarea className="input" style={{ minHeight: 82, padding: 9, resize: "vertical" }} value={instruction} onChange={(e) => setInstruction(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !planning && canExecute) void onPlan(); }} placeholder="Put the apple inside the sink; drop the banana off the table; place the apple on top of the orange." />
+      <span className="micro t3">One action grounds the named objects, compiles the relation, checks physical readiness, and starts the authoritative run. Unknown or ambiguous instructions stop before physics.</span>
+      <button className="btn btn-primary btn-sm" disabled={planning || !canExecute} onClick={() => void onPlan()} title={canExecute ? "Compile and run against the active world" : "Select a ready robot and instruction"}><Icon name="play" size={12} /> {planning ? "Compiling and running..." : "Run instruction"}</button>
+      {hasPlacedWorldAssets && backend === "mujoco" && controller === "oracle" && ["auto", "pick_place"].includes(task) && <button className="btn btn-secondary btn-sm" disabled={planning || !canExecute} onClick={onManual}><Icon name="robot" size={12} /> Control Panda in this world</button>}
       {operation?.evaluation && <div className={`world-operation-result ${operation.evaluation.success ? "passed" : "failed"}`}><b>{operation.evaluation.success ? "Task predicate passed" : operation.evaluation.failureCode ?? operation.evaluation.status}</b><span className="micro mono">{operation.evaluation.id} · {operation.evaluation.worldTemplateId} · seed {operation.evaluation.seed}</span>{operation.evaluation.failureDetail && <span className="micro t3">{operation.evaluation.failureDetail}</span>}</div>}
       {run && <div className="world-operation-result"><b>Agent {run.lifecycleState}</b><span className="micro mono">{run.id}{run.stopReason ? ` · ${run.stopReason}` : ""}</span>{history.slice(-3).map((item, index) => <span className="micro t3" key={`${String(item.phase ?? item.kind ?? "step")}-${index}`}>{String(item.phase ?? item.kind ?? "step")} · {String(item.failureCode ?? item.reason ?? item.planId ?? "completed")}</span>)}</div>}
       {command && <><div className="small"><b>{command.plan.summary}</b> <span className="micro t3 mono">{command.plannerProvenance}</span></div>{command.plan.steps.map((step, i) => <div className="console-line" key={`${i}-${step}`}><span className="console-time">{String(i + 1).padStart(2, "0")}</span><span>{step}</span></div>)}</>}
-      {!command && !operation && <div className="empty-note">{hasPlacedWorldAssets ? "The editor contains the registered Panda and generated assets. Run live compiles the named object, target, counter, and Panda into one authoritative MuJoCo task; it does not substitute the cube validation bench. Other kitchen meshes remain authoring visuals until their collision contracts are validated." : "Run live opens one continuous authoritative MuJoCo 3D view. Panda and world poses come from MuJoCo; synchronized front/wrist observations remain visible as an inset while the persisted evaluation runs."}</div>}
+      {!command && !operation && <div className="empty-note">{hasPlacedWorldAssets ? "The instruction compiler uses the registered Panda and active editor placements. A movable source must have a validated physical version; visual meshes are never silently substituted as colliders." : "Run instruction opens one continuous authoritative MuJoCo view with synchronized front and wrist observations."}</div>}
     </div>
     <div className="col" style={{ borderTop: "1px solid var(--border)", paddingTop: 9, gap: 5 }}><b className="small">Readiness</b>{backend === "isaac_sim" && <span className="micro t3">Isaac execution will return its exact runtime/EULA blocker if the native process cannot launch.</span>}{hasPlacedWorldAssets && <span className="micro t3">Oracle and VLA use the same compiled apple/blender/counter/Panda runtime. Agent curriculum remains validation-world only.</span>}{!modelReady && <span className="micro t3">Load a healthy VLA policy before VLA or autonomous execution.</span>}{!assetReady && !hasPlacedWorldAssets && <span className="micro t3">The selected asset must pass the deterministic oracle before VLA execution.</span>}{robot?.readiness.blockers.map((value) => <span className="micro t3" key={value}>{value}</span>)}</div>
   </div>;

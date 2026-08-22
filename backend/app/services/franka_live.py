@@ -105,7 +105,10 @@ def info(session: FrankaLiveSession) -> dict[str, Any]:
             "targetPlacement": {"assetId": (authored.get("targetPlacement") or {}).get("assetId")} if authored.get("targetPlacement") else None,
             "counterPlacement": {"assetId": (authored.get("counterPlacement") or {}).get("assetId")},
             "robotSpawn": authored.get("robotSpawn"),
+            "relation": authored.get("relation"),
         }
+    if operation.get("compiledGoal"):
+        operation_view["compiledGoal"] = dict(operation["compiledGoal"])
     return {
         "schemaVersion": "robotworld.franka-live-session.v1",
         "sessionId": session.session_id,

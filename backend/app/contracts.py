@@ -374,7 +374,7 @@ class WorldOperateRequest(ContractModel):
     instruction: str = Field(min_length=2, max_length=1000)
     backend: Literal["mujoco", "isaac_sim"] = "mujoco"
     controller: Literal["oracle", "vla_jepa", "agent"] = "oracle"
-    task: Literal["pick_place", "drop_off_table", "open_drawer"] = "pick_place"
+    task: Literal["auto", "pick_place", "drop_off_table", "open_drawer"] = "pick_place"
     asset_version_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     model_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     seed: int = Field(default=6203, ge=0, le=2**31 - 1)
@@ -386,6 +386,12 @@ class WorldOperateRequest(ContractModel):
     def supported_execution_contract(self) -> "WorldOperateRequest":
         if self.backend == "isaac_sim" and (self.task != "pick_place" or self.controller != "oracle"):
             raise ValueError("Isaac Sim currently supports the bounded Franka pick/place oracle only")
+        if self.task == "auto" and (
+            self.backend != "mujoco"
+            or self.controller != "oracle"
+            or self.execution_scope != "active_world"
+        ):
+            raise ValueError("Automatic instruction compilation requires the active MuJoCo world and deterministic Franka oracle")
         if self.task == "open_drawer" and self.controller != "oracle":
             raise ValueError("The validated drawer task currently supports its deterministic oracle only")
         if self.task == "drop_off_table":

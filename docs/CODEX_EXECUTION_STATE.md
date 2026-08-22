@@ -1,6 +1,6 @@
 # Codex execution state
 
-Last updated: 2026-08-21 (America/Los_Angeles)
+Last updated: 2026-08-22 (America/Los_Angeles)
 
 ## Resume point
 
@@ -12,7 +12,7 @@ Last updated: 2026-08-21 (America/Los_Angeles)
 - The active Kitchen Juice Workspace now resolves the exact instruction `Pick up the apple and place it on top of the blender.` to the persisted apple and blender placements, compiles their task-relevant physical subset with the counter and Panda, and runs it through the same live MuJoCo stream. It does not substitute the cube validation bench.
 - Production run `live_c54c9a8f` / `eval_a5e8369b` succeeded with 1,636 streamed frames across 44 controller phases and 66.242 simulated seconds. Bilateral gripper contact, lift, transport, release, target-support contact, containment, settling, and a 4.787 mm target error were measured.
 - The validation-bench stream remains a continuous authoritative MuJoCo view rather than phase-by-phase recorded-image navigation. Panda links now use MuJoCo-compiled mesh vertices plus current `geom_xpos/geom_xmat`; the previous raw-OBJ pairing and stale async callback were the causes of the exploded arm in the user screenshots.
-- Free text cannot silently change a task contract. `pick_place` still rejects throw/off-table text, while the explicit `drop_off_table` task now compiles and measures a distinct release-and-settle predicate. General prompt-to-new-skill generation is not complete.
+- Worlds now uses one `auto` instruction action. A deterministic active-world compiler grounds named movable/fixed placements and the measured relations `inside`, `on_top_of`, or `outside_support`; the compiled relation selects the distinct pick/place or off-table controller and predicate before MuJoCo starts. Unknown/ambiguous relations still fail closed. General synthesis of a brand-new controller skill remains incomplete.
 - `#/simulation` now redirects to `#/worlds`; the separate legacy refrigerator runtime is no longer exposed as a second authoritative simulator page.
 - Runtime Diagnostics now scopes ERROR/WARN rows to the current backend process. Historical frontend/exporter errors remain in the durable log store but no longer make a restarted healthy process appear degraded.
 - AI chat is grounded in current robot/model/asset/evaluation state. High-confidence robot/dataset/fine-tuning intents use a typed workspace planner before free-form LLM reasoning, so the exact prompt cannot be derailed by redundant questions or invalid camera-map keys. After an approved tool result, chat automatically requests the next grounded action.
@@ -20,11 +20,22 @@ Last updated: 2026-08-21 (America/Los_Angeles)
 - Successful recorded oracle evaluations export into locally validated LeRobot datasets. A real bounded one-step optimizer run also completed into a separate candidate checkpoint. Promotion/held-out evaluation and a resumable long-run worker remain incomplete.
 - SigNoz Community `v0.137.1` is live at `http://127.0.0.1:8080`; RobotWorld exports OTLP to `http://127.0.0.1:4318`. ClickHouse contains live `robotworld-backend` spans.
 
+## 2026-08-21 production agent-loop completion
+
+- `/api/chat` now runs a bounded OpenAI Responses function-calling loop instead of a one-shot text completion. It exposes the registered typed tools, validates every argument through the existing Pydantic contracts, executes read-only tools durably, and returns mutation requests as approval cards without executing them. The loop is capped at six model turns, sixteen tool calls, and 24,000 output characters per tool result; provider responses use `store=false` and replay encrypted reasoning items where supplied.
+- Live production proof after the final backend restart: the prompt asking the agent to inspect the latest evaluation produced provenance `llm:openai-compatible:tool-loop`; response IDs `resp_00e75ec3f9b60362016a8938e2bd3887d0aeb034e97c6ae8e4` and `resp_00e75ec3f9b60362016a8938e6c6a087d0858ea0e3c9fec4bf`; request IDs `req_bc36e2bb7e39403e884fbd081e13a892` and `req_2ddf40b5aebb48cb815e25ce5766b3bb`; and a successful real `evaluations.list` call `call_4pRl1RGbbciIeXAc4vwRJi8T`. It grounded the answer in `eval_868de5ec/SUCCEEDED`, returned no mutation, and `/api/health` then reported OpenAI `healthy`.
+- A second live grounded proof earlier in the pass queried `eval_7f72f749/FAILED` with failure `unreachable_target`; its durable query record was `toolcall_f4c2596a`, actor `openai-copilot`, permission `OBSERVE_ONLY`. These different outcomes demonstrate that the model reports persisted evidence rather than a canned success path.
+- Real autonomous run `autorun_f044e7cd` planned `curriculum_3747dcea` / `scenario_d3960b95`, passed deterministic oracle `eval_d174a033`, then ran the resident 2,593,879,303-parameter VLA-JEPA checkpoint on CUDA for 15 policy steps. Learned-policy evaluation `eval_32d9b19d` failed honestly with `grasp_miss`; the controller stopped cleanly with `consecutive_failure_stop` after two evaluation episodes and `0.09372964` GPU minutes. The API remained responsive during inference.
+- The production SQLite database now uses WAL plus a 30,000 ms busy timeout. This repairs the reproduced `database is locked` crash from `autorun_e2523c3d`. Terminal evaluation indexing now skips already-indexed immutable rows and commits missing observations/failures in one batch. Nested scenario-oracle retries derive a fresh child idempotency key from the parent attempt, preventing a failed child command from being replayed forever.
+- Manual Franka sessions keep MuJoCo/GL context creation, jog, gripper, rendering, and close operations on one session-owned worker thread. The previously observed `glfwMakeContextCurrent` access violation no longer reproduced: the real live-stream test passed in 29.38 s and the heavyweight compiler -> oracle -> autonomous integration test passed in 126.83 s.
+- Final verification: focused agent/database/curriculum tests `17 passed`; API plus agent-loop tests `23 passed`; non-live API suite `22 passed`; real live-stream test `1 passed`; heavyweight integration `1 passed`; frontend typecheck, lint, and production build passed (95 modules); Python compileall and `git diff --check` passed.
+- SigNoz trace ingestion is live, but server-side graph/table query tools remain credential-blocked until the local SigNoz onboarding screen is completed and a read-only service-account key is saved under Settings. No credential was fabricated. Port remains intentionally deferred.
+
 ## Latest live evidence
 
 ### 2026-08-21 real active-world Panda control and drop task
 
-Status: **IMPLEMENTED_AND_TESTED** for deterministic apple pick/place, apple drop-off-table, active-world live streaming, persisted Panda base translation, and manual Cartesian/gripper control. Learned VLA task success remains **BROKEN** (`grasp_miss`); banana at its current authored pose remains **BROKEN** (`unreachable_target`).
+Status: **IMPLEMENTED_AND_TESTED** for deterministic apple pick/place, apple inside-sink, apple-on-orange stacking, apple drop-off-table, active-world live streaming, persisted Panda base translation, and manual Cartesian/gripper control. Learned VLA task success remains **BROKEN** (`grasp_miss`); banana is reachable but remains **BROKEN** (`object_dropped`) because the current top-grasp frame causes finger/counter contact.
 
 - Added a typed `drop_off_table` task with its own compiler family and oracle policy. It carries the compiled movable asset beyond the measured counter support polygon, releases it under gravity, and requires `outsideSupportPolygon`, `belowCounterTop`, `released`, and `settled`; it does not reuse the in-target predicate.
 - Browser-run evidence: `live_fefac91d` streamed 1,048 continuous authoritative frames in the actual Kitchen Juice Workspace and persisted `eval_868de5ec/SUCCEEDED` at seed `1048576`. At 30.80 simulated seconds it was in `transport_off_table_segment_08`; at 42.68 seconds it finished `settle_after_drop`, finite, with the task predicate passed.
@@ -526,13 +537,74 @@ One initial verification command was intentionally retained as evidence of an in
 
 The in-app browser provider returned `No browser is available`, so this pass does not claim visual click-through of the rebuilt UI. Recorded physics images were inspected directly and API/UI routes were exercised live.
 
+## 2026-08-22 one-action active-world task compiler and live evidence
+
+Status: **IMPLEMENTED_AND_TESTED** for automatic named-entity grounding and three measured apple task relations. **PARTIAL/BROKEN** for thin-object grasping (banana). VLA-JEPA training/task success was not fabricated or started in this slice.
+
+Implemented:
+
+- `WorldOperateRequest.task="auto"` is valid only for the active MuJoCo world with the deterministic oracle. `/api/worlds/live-sessions` compiles the instruction once into a durable `compiledGoal` containing source/target IDs, names, relation, and grounding revision.
+- The compiler is noun-independent across registered active-world placements and recognizes `on top of`/`onto`, `inside`/`into`, and drop/throw/toss off the measured table/counter. It rejects ambiguous entities, unsupported relations, missing physical source versions, and task-contract conflicts before physics.
+- Worlds has one `Run instruction` action (Ctrl/Cmd+Enter also runs). The separate Plan button/task selector was removed. The 3D editor and authoritative live stream use the same persisted Panda mount and active asset placements.
+- Inside-sink composition now cuts the counter collider around the measured sink AABB and authors a basin floor plus four walls. Inside uses rectangular full-object containment. `on_top_of` uses centre-of-mass-inside-support plus actual contact/release/stability gates, allowing physically stable overhang without loosening settle/contact requirements.
+- Long-flat grasp clearance and joint-command pacing are gated by measured planar aspect ratio. Compact apple/cube objects retain their validated controller profile.
+- Durable trajectory samples no longer repeat `renderGeometries`; those are streamed only to the live viewport. `backend/scripts/compact_evaluation_results.py` verifies each immutable `evaluation.json` before compacting the SQLite duplicate.
+- The live-stream CLI request timeout is now 60 s because compiling the generated GLB/collision/counter/Panda scene can legitimately exceed the old 10 s client timeout.
+
+Live authoritative results (all active `door-validation-lab`, registered Panda `franka-panda-mujoco-f9a4918f6663`, seed `1048577`):
+
+- `Pick up the apple and put it inside the sink.` -> `live_f1fc531e` / `eval_d191bc93` **SUCCEEDED**; 749 WebSocket frames, 30.722 simulated seconds, front+wrist JPEG observations, PBR source geometry in every frame, sink containment/contact/release/settle passed.
+- `Pick up the apple and drop it off the table.` -> `live_6b51f1ba` / `eval_fcc2f710` **SUCCEEDED**; 1,046 frames, 42.582 simulated seconds, distinct `transport_off_table`, `release_off_table`, and `settle_after_drop` phases.
+- `Pick up the apple and put it on top of the orange.` -> `live_9d64753b` / `eval_0b2ee738` **SUCCEEDED**; 755 frames, support contact and settle passed, COM residual `-0.0333986 m` under `center_of_mass_inside_support_polygon_with_2mm_margin`.
+- `Pick up the banana and put it on top of the blender.` -> `live_f71647d7` / `eval_ee1ffa2c` **FAILED/object_dropped**; the source is reachable and bilateral contact occurred, but the current thin-object top grasp recorded 427 left-finger/object, 34 right-finger/object, and 213 left-finger/counter samples before lift failure. Next repair is an oriented side-grasp affordance, not a success-label or predicate change.
+- The orange source GLB was compiled separately as `assetver_831e43af` and correctly **REJECTED** because its convex body did not settle within the configured stability window. In apple-on-orange, orange is therefore a fixed measured-AABB support proxy corresponding to the authored target, not a promoted dynamic orange asset.
+
+Persistence repair evidence:
+
+```powershell
+cd D:\RobotWorldProject\backend
+.\.venv\Scripts\python.exe scripts\compact_evaluation_results.py
+# dry-run: 46 verified rows; 45,358 repeated geometry copies; 1,504,382,660 -> 67,940,465 bytes; skipped=[]
+
+.\.venv\Scripts\python.exe scripts\compact_evaluation_results.py --apply
+# same counts applied; immutable evaluation.json artifacts retained
+
+.\.venv\Scripts\python.exe scripts\compact_evaluation_results.py
+# changedRows=0; skipped=[]
+```
+
+Verification:
+
+```powershell
+cd D:\RobotWorldProject\backend
+.\.venv\Scripts\python.exe -m pytest -q
+# 92 passed in 82.63s
+
+.\.venv\Scripts\python.exe -m compileall -q app scripts
+# passed
+
+cd D:\RobotWorldProject\frontend
+npm.cmd run lint
+# passed
+npm.cmd run build
+# passed; TypeScript + Vite, 95 modules
+
+Invoke-RestMethod http://127.0.0.1:8000/api/health
+Invoke-WebRequest http://127.0.0.1:5173/#/worlds -UseBasicParsing
+# backend healthy, MuJoCo 3.11.0/500 Hz, SigNoz exporting; frontend HTTP 200
+```
+
+Files changed in this slice: `backend/app/contracts.py`, `backend/app/main.py`, `backend/app/services/franka_live.py`, `backend/app/services/franka_pick_place.py`, `backend/scripts/run_live_franka_stream.py`, `backend/scripts/compact_evaluation_results.py`, `backend/tests/test_api.py`, `backend/tests/test_franka_oracle.py`, `frontend/src/pages/Worlds.tsx`, and this state file. Other dirty-worktree changes are preserved user/prior work.
+
 ## Exact next executable task
 
-Add frame callbacks and bounded WebSocket messages to the now-tested authored-kitchen VLA evaluator so Worlds displays its 10 Hz learned actions continuously instead of returning only the persisted terminal result. Keep `eval_3d3211dc/grasp_miss` visible beside the passing oracle; never substitute or animate a scripted success.
+Implement a geometry-derived side-grasp candidate for long, thin rigid assets. Compile at least top and side grasp frames with approach vector, closing axis, required width, table-clearance sweep, IK reachability, and finger/support collision preview; select a frame only after the deterministic pre-grasp/grasp/lift gate. Re-run `assetver_7aa76e7d` banana at the current persisted pose and keep `eval_ee1ffa2c/object_dropped` visible until a new run passes.
+
+Then add frame callbacks and bounded WebSocket messages to the authored-kitchen VLA evaluator so Worlds can display real learned actions continuously. Do not label oracle demonstrations as VLA learning or task success.
 
 Then run the active kitchen apple-to-blender oracle over at least three distinct persisted placement seeds and add those runs as an automated integration gate. The one current production seed passes, but variation robustness is not yet proven.
 
-Then add a typed manual-control session to the same authoritative Worlds viewport (pause/resume/reset, bounded Cartesian jog, gripper open/close, cancellation) with every command persisted and safety-checked. Add an explicit `throw_off_table` task definition and predicate before allowing that instruction to execute; until then throw instructions must continue to fail before simulation.
+The typed manual-control session and explicit off-table task now exist. The next manual-control hardening is persisted pause/resume/reset/cancellation plus controller-state audit events.
 
 After those interaction contracts pass, build a targeted pose/orientation scenario and demonstration dataset from `failure_5c63d864` plus passing oracle `eval_fa78ceae`, then create and evaluate a fresh candidate across at least three distinct held-out seeds. Do not reuse or promote rejected `mdl_3394f1ab`.
 
@@ -545,3 +617,37 @@ After that:
 5. After reading NVIDIA's license, accept it as the operator with `[Environment]::SetEnvironmentVariable("OMNI_KIT_ACCEPT_EULA","YES","User")`, restart RobotWorld, then execute the bounded Isaac Franka worker from Worlds.
 
 Do not claim VLA task success, candidate promotion, a new live Bright Data request, product articulation, Isaac execution, or SigNoz integration until their recorded gates pass.
+
+## 2026-08-21 — Lighthouse remediation pass (frontend only, additive/scoped)
+
+Lighthouse 13.4.0 against the Vite dev server (127.0.0.1:5173) reported Perf 61 / A11y 85 / BP 92 / SEO 73.
+Key context: the "Minify JavaScript ~3,983 KiB" and "unused JavaScript" findings are dev-mode artifacts
+(unminified, unbundled modules); the production build is code-split (main chunk 289 KB / 92 KB gzip,
+per-page lazy chunks, GLTFLoader isolated). No backend, physics, policy, or evidence path was touched.
+
+Changes (all frontend-only):
+- frontend/index.html: added <meta name="description"> (SEO: document lacks meta description).
+- frontend/public/robots.txt: NEW valid robots.txt (User-agent: * / Allow: /); dev server previously
+  served HTML fallback at /robots.txt which parsed as invalid (20 errors).
+- frontend/public/llms.txt: NEW agent-facing summary with hash-route map (Agentic Browsing llms.txt audit).
+- Titlebar.tsx: user-menu button got ria-label="Account menu" (button-has-accessible-name).
+- ai-chat-input.tsx: gallery close button got ria-label="Close image gallery" (same audit; these were
+  the only two icon-only buttons without an accessible name in source — all others have visible text or title).
+- tokens.css: --text-3 #929292 -> #9E9E9E so muted text meets WCAG AA >= 4.5:1 on bg-panel-2/panel-3
+  (previously ~4.0-4.5:1, flagged contrast).
+- components.css: non-composited animations converted to composited transforms:
+  .busy-bar > i left-keyframes -> translateX(-100%..286%); .skl background-position shimmer ->
+  ::after sheen translateX sweep; .loading-label background-clip:text transparent shimmer ->
+  solid var(--text-2) + opacity pulse (also removes transparent-text contrast flag).
+  Visual behavior preserved; prefers-reduced-motion rules unchanged.
+
+Verification:
+npm.cmd run typecheck OK;
+npm.cmd run lint 0 warnings/0 errors;
+pm.cmd run build
+OK (95 modules, dist emitted). Backend pytest not re-run (no backend change).
+
+Not addressed (intentional): tabindex>0 and console-error findings are runtime/library artifacts of the
+dev session (no tabIndex>0 exists in source); long-task/TBT numbers are dominated by dev-mode serving;
+"User Timing marks" come from intentional runtimeDiagnostics performance.mark calls and do not affect score.
+Re-measure with a production preview build before drawing conclusions from Performance category deltas.

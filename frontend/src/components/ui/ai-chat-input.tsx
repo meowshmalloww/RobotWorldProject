@@ -296,6 +296,7 @@ function AttachmentGalleryModal({
 
       <button
         type="button"
+        aria-label="Close image gallery"
         onClick={handleClose}
         style={{ opacity: isOpen ? 1 : 0, transform: isOpen ? "scale(1)" : "scale(0.7)" }}
         className={cn("ai-gallery-close", !isOpen && "off")}

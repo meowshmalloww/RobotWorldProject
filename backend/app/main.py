@@ -3114,7 +3114,8 @@ async def world_operate(
             supported_active = (
                 payload.backend == "mujoco"
                 and (
-                    (payload.task == "pick_place" and payload.controller in {"oracle", "vla_jepa"})
+                    (payload.task == "auto" and payload.controller == "oracle")
+                    or (payload.task == "pick_place" and payload.controller in {"oracle", "vla_jepa"})
                     or (payload.task == "drop_off_table" and payload.controller == "oracle")
                 )
             )
@@ -3126,6 +3127,7 @@ async def world_operate(
                 )
             active_resolution = await _resolve_active_world_task(payload)
             operation.update(active_resolution)
+            operation["task"] = str(active_resolution["compiledTaskKind"])
         if payload.backend == "isaac_sim":
             robots = await asyncio.to_thread(robot_registry.list_all)
             selected_robot = next((item for item in robots if item.get("id") == payload.robot_id), None)
@@ -3174,7 +3176,7 @@ async def world_operate(
                     seed=payload.seed,
                     scene_spec=dict(active_resolution["authoredScene"]),
                     idempotency_key=key,
-                    task_kind=payload.task,
+                    task_kind=str(active_resolution.get("compiledTaskKind") or payload.task),
                 )
             elif payload.asset_version_id:
                 envelope = await evaluation_catalog.run_compiled_asset_pick_place_oracle(
@@ -3462,14 +3464,16 @@ async def registered_model_create(
 async def world_live_session_create(payload: WorldOperateRequest):
     """Create a continuous view of the real persisted MuJoCo oracle run."""
 
-    if payload.backend != "mujoco" or payload.controller != "oracle" or payload.task not in {"pick_place", "drop_off_table"}:
+    if payload.backend != "mujoco" or payload.controller != "oracle" or payload.task not in {"auto", "pick_place", "drop_off_table"}:
         raise HTTPException(
             422,
             "Live in-app streaming currently requires MuJoCo and a deterministic pick/place or drop-off-table oracle.",
         )
     operation = payload.model_dump(mode="json", by_alias=True, exclude_none=True)
     if payload.execution_scope == "active_world":
-        operation.update(await _resolve_active_world_task(payload))
+        resolution = await _resolve_active_world_task(payload)
+        operation.update(resolution)
+        operation["task"] = str(resolution["compiledTaskKind"])
     return franka_live.info(franka_live.create(operation))
 
 
@@ -3533,7 +3537,13 @@ async def world_manual_session_close(session_id: str):
 
 
 async def _resolve_active_world_task(payload: WorldOperateRequest) -> dict[str, Any]:
-    """Resolve named authored objects for one explicit physical task."""
+    """Compile free text into grounded entities plus a measured predicate.
+
+    Language is allowed to select catalogued bodies and one supported spatial
+    relation.  It never supplies coordinates, collision geometry, or a
+    success result; those remain outputs of the deterministic compiler and
+    MuJoCo execution.
+    """
 
     async with SessionLocal() as session:
         world = (await session.execute(select(World).where(World.active.is_(True)).limit(1))).scalar_one_or_none()
@@ -3544,32 +3554,71 @@ async def _resolve_active_world_task(payload: WorldOperateRequest) -> dict[str, 
         rows = _world_assembly_rows(ids, {row.id: row for row in assets}, _placement_state(world.scene_tree))
     placements = [_placement_api(row) for row in rows]
     instruction = " ".join(payload.instruction.lower().replace("-", " ").split())
-    if payload.task == "pick_place" and not any(phrase in instruction for phrase in ("on top of", "on top", "onto")):
+
+    off_tokens = ("off the table", "off table", "off the counter", "off counter")
+    drop_verbs = ("throw", "toss", "drop")
+    if any(token in instruction for token in off_tokens) or (
+        any(token in instruction for token in drop_verbs)
+        and any(token in instruction for token in ("table", "counter", "floor", "ground"))
+    ):
+        compiled_task = "drop_off_table"
+        relation = "outside_support"
+        source_clause = instruction
+        target_clause = ""
+    else:
+        relation_phrases = (
+            ("on top of", "on_top_of"),
+            ("on top", "on_top_of"),
+            ("onto", "on_top_of"),
+            ("inside of", "inside"),
+            ("inside", "inside"),
+            ("into", "inside"),
+        )
+        matched = next(
+            ((phrase, kind, instruction.find(phrase)) for phrase, kind in relation_phrases if phrase in instruction),
+            None,
+        )
+        if matched is None:
+            in_match = re.search(r"\bin\s+(?:the\s+)?[a-z0-9 ]+$", instruction)
+            if in_match is not None:
+                matched = (in_match.group(0).split(maxsplit=1)[0], "inside", in_match.start())
+        if matched is None:
+            raise HTTPException(
+                422,
+                "Name a measurable destination relation: 'on top of <object>', 'inside <container>', or 'off the table'. No simulation was started.",
+            )
+        phrase, relation, relation_index = matched
+        compiled_task = "pick_place"
+        source_clause = instruction[:relation_index]
+        target_clause = instruction[relation_index + len(phrase):]
+
+    if payload.task not in {"auto", compiled_task}:
         raise HTTPException(
             422,
-            "Active-world pick/place currently requires an explicit 'on top of <named target>' relation. No simulation was started.",
+            f"The instruction compiles to {compiled_task}, but the request selected {payload.task}. No simulation was started.",
         )
 
     stop_words = {"real", "single", "whole", "isolated", "product", "photo", "white", "background", "site", "com", "steel", "kitchen", "countertop"}
 
-    def score(placement: dict[str, Any]) -> int:
+    def score(placement: dict[str, Any], text: str) -> int:
         words = {
             token
             for token in re.findall(r"[a-z0-9]+", str(placement["name"]).lower())
             if len(token) >= 4 and token not in stop_words
         }
-        return sum(word in instruction for word in words)
+        return sum(word in text for word in words)
 
-    sources = [item for item in placements if item.get("mobility") == "movable" and score(item) > 0]
-    targets = [item for item in placements if item.get("mobility") == "fixed" and score(item) > 0]
-    target_count_ok = len(targets) == 1 if payload.task == "pick_place" else True
+    sources = [item for item in placements if item.get("mobility") == "movable" and score(item, source_clause) > 0]
+    source_ids = {item["assetId"] for item in sources}
+    targets = [item for item in placements if item["assetId"] not in source_ids and score(item, target_clause) > 0]
+    target_count_ok = len(targets) == 1 if compiled_task == "pick_place" else True
     if len(sources) != 1 or not target_count_ok:
         raise HTTPException(
             422,
-            ("Name exactly one movable source and one fixed target from the active scene. " if payload.task == "pick_place" else "Name exactly one movable source from the active scene. ")
+            ("Name exactly one movable source and one destination from the active scene. " if compiled_task == "pick_place" else "Name exactly one movable source from the active scene. ")
             +
-            f"Resolved sources={[(item['name'], score(item)) for item in sources]}, "
-            f"targets={[(item['name'], score(item)) for item in targets]}. No simulation was started.",
+            f"Resolved sources={[(item['name'], score(item, source_clause)) for item in sources]}, "
+            f"targets={[(item['name'], score(item, target_clause)) for item in targets]}. No simulation was started.",
         )
     counter_row = _primary_counter(rows)
     if counter_row is None:
@@ -3593,6 +3642,15 @@ async def _resolve_active_world_task(payload: WorldOperateRequest) -> dict[str, 
         )
     return {
         "assetVersionId": physical["id"],
+        "compiledTaskKind": compiled_task,
+        "compiledGoal": {
+            "sourceAssetId": sources[0]["assetId"],
+            "sourceName": sources[0]["name"],
+            "relation": relation,
+            "targetAssetId": targets[0]["assetId"] if targets else None,
+            "targetName": targets[0]["name"] if targets else "outside the measured support polygon",
+            "grounding": "deterministic_active_world_entity_and_relation_parser_v1",
+        },
         "sourcePbrTransform": {
             "uniformScale": float((physical.get("manifest") or {}).get("uniformScale") or 1.0),
             "translationM": list(((physical.get("manifest") or {}).get("coordinateConvention") or {}).get("translationM") or [0.0, 0.0, 0.0]),
@@ -3600,9 +3658,10 @@ async def _resolve_active_world_task(payload: WorldOperateRequest) -> dict[str, 
         },
         "authoredScene": {
             "worldId": world.id,
-            "taskKind": payload.task,
+            "taskKind": compiled_task,
+            "relation": relation,
             "sourcePlacement": sources[0],
-            "targetPlacement": targets[0] if payload.task == "pick_place" else None,
+            "targetPlacement": targets[0] if compiled_task == "pick_place" else None,
             "counterPlacement": counter,
             "robotSpawn": {
                 "positionM": spawn_position,

@@ -303,6 +303,16 @@ def test_grounded_chat_exports_only_recorded_successful_oracle_demonstration() -
 
 
 def test_world_operator_rejects_implicit_or_unsupported_execution_contracts() -> None:
+    automatic = WorldOperateRequest.model_validate({
+        "robotId": "franka",
+        "instruction": "Put the apple inside the sink.",
+        "backend": "mujoco",
+        "controller": "oracle",
+        "task": "auto",
+        "executionScope": "active_world",
+        "worldId": "kitchen",
+    })
+    assert automatic.task == "auto"
     drop = WorldOperateRequest.model_validate({
         "robotId": "franka",
         "instruction": "Pick up the apple and throw it off the table.",

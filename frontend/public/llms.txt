@@ -1,0 +1,26 @@
+# RobotWorld
+
+> Local-first desktop system for physical AI world-building: compiles provenance-tagged 3D objects
+> into physically valid interactive assets, validates them in real MuJoCo contact physics with a
+> pinned Franka Panda embodiment and deterministic IK oracles, and evaluates VLA vision-language-action
+> policies with structured failure diagnosis.
+
+RobotWorld is an Electron desktop application, not a public website. All functionality runs locally:
+the React UI is served by the Electron shell (or a local dev server) and talks to a FastAPI control
+plane on 127.0.0.1:8000.
+
+## Main sections (hash-routed)
+
+- /#/ : Overview — pipeline status and system summary
+- /#/models : Model registry (local model roots, capability probing)
+- /#/robots : Registered robots (Franka Panda MuJoCo)
+- /#/assets : Rigid asset compiler (GLB QA → OpenUSD + MJCF)
+- /#/worlds : World editor and authoritative simulation streaming
+- /#/skills : Skill library and task definitions
+- /#/evidence : Evidence collection pipeline
+- /#/scraper-repair : Governed scraper self-heal state machine
+- /#/failure-analysis : Failure taxonomy and coverage tracking
+- /#/agent-control : Autonomous curriculum engine with budgets
+- /#/training : Bounded fine-tune preflight and candidate lifecycle
+- /#/observability : Self-hosted SigNoz traces/logs/metrics
+- /#/settings : Local settings and integrations

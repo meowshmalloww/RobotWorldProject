@@ -180,6 +180,7 @@ async def ensure_authored_scene_world_template(
         counter_placement=scene_spec["counterPlacement"],
         robot_spawn=scene_spec.get("robotSpawn"),
         task_kind=str(scene_spec.get("taskKind") or "pick_place"),
+        relation=str(scene_spec.get("relation") or "on_top_of"),
     )
     record_id = f"authored:{scene_spec['worldId'][:20]}:{asset_version['id']}:{template['runtimeSha256'][:12]}"
     async with SessionLocal() as session:
@@ -795,6 +796,7 @@ async def run_authored_scene_pick_place_oracle(
                 scene_spec["counterPlacement"],
                 robot_spawn=scene_spec.get("robotSpawn"),
                 task_kind=task_kind,
+                relation=str(scene_spec.get("relation") or "on_top_of"),
                 live_frame_callback=live_frame_callback,
                 realtime=realtime,
             )

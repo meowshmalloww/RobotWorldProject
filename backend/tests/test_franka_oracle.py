@@ -209,3 +209,5 @@ def test_worlds_live_stream_is_continuous_and_persists_same_evaluation() -> None
         persisted = client.get(f"/api/evaluations/{evaluation['id']}")
         assert persisted.status_code == 200
         assert persisted.json()["result"]["predicate"]["contained"] is True
+        assert persisted.json()["result"]["trajectory"]
+        assert all("renderGeometries" not in sample for sample in persisted.json()["result"]["trajectory"])

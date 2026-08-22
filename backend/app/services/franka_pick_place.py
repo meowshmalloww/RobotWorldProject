@@ -706,6 +706,7 @@ def compile_authored_scene_asset_world(
     counter_placement: dict[str, Any],
     robot_spawn: dict[str, Any] | None = None,
     task_kind: str = "pick_place",
+    relation: str = "on_top_of",
 ) -> dict[str, Any]:
     """Compose one catalogued physical asset into the active authored world.
 
@@ -717,6 +718,8 @@ def compile_authored_scene_asset_world(
 
     if task_kind not in {"pick_place", "drop_off_table"}:
         raise ValueError(f"Unsupported authored-scene task kind: {task_kind}")
+    if relation not in {"on_top_of", "inside", "outside_support"}:
+        raise ValueError(f"Unsupported authored-scene relation: {relation}")
     identifiers = [world_id, str(source_placement.get("assetId") or "")]
     if target_placement is not None:
         identifiers.append(str(target_placement.get("assetId") or ""))
@@ -781,6 +784,50 @@ def compile_authored_scene_asset_world(
         raise ValueError("Compiled world workspace has no collision geometry.")
     workspace_geom.set("size", " ".join(f"{value:.12g}" for value in counter_half))
 
+    # An integrated sink cannot coexist with a solid countertop box.  Split
+    # the measured counter AABB around the measured sink opening so the source
+    # can physically descend into the basin instead of colliding with an
+    # invisible slab.  These are explicit AABB collision proxies, not claims
+    # that the generated visual mesh itself is a validated collider.
+    if task_kind == "pick_place" and relation == "inside" and target_placement is not None and "sink" in str(target_placement.get("name") or "").lower():
+        workspace.set("pos", "0 0 0")
+        workspace.remove(workspace_geom)
+
+        def add_counter_box(name: str, low: np.ndarray, high: np.ndarray) -> None:
+            if np.any(high - low <= 0.002):
+                return
+            center = (low + high) / 2
+            half = (high - low) / 2
+            ET.SubElement(
+                workspace,
+                "geom",
+                {
+                    "name": name,
+                    "type": "box",
+                    "pos": " ".join(f"{value:.12g}" for value in center),
+                    "size": " ".join(f"{value:.12g}" for value in half),
+                    "rgba": "0.38 0.40 0.44 1",
+                    "friction": "0.8 0.01 0.001",
+                },
+            )
+
+        opening_center = (target_low + target_high) / 2
+        opening_half = (target_high - target_low) / 2 * 0.72
+        opening_low = np.maximum(counter_low, opening_center - opening_half)
+        opening_high = np.minimum(counter_high, opening_center + opening_half)
+        add_counter_box("counter_left", counter_low, np.array([opening_low[0], counter_high[1], counter_high[2]]))
+        add_counter_box("counter_right", np.array([opening_high[0], counter_low[1], counter_low[2]]), counter_high)
+        add_counter_box(
+            "counter_front",
+            np.array([opening_low[0], counter_low[1], counter_low[2]]),
+            np.array([opening_high[0], opening_low[1], counter_high[2]]),
+        )
+        add_counter_box(
+            "counter_back",
+            np.array([opening_low[0], opening_high[1], counter_low[2]]),
+            np.array([opening_high[0], counter_high[1], counter_high[2]]),
+        )
+
     original_position = np.asarray([float(value) for value in str(pick_object.get("pos") or "").split()], dtype=float)
     if original_position.shape != (3,):
         raise ValueError("Compiled object pose is invalid.")
@@ -807,6 +854,33 @@ def compile_authored_scene_asset_world(
             geom.set("friction", f"{authored_friction:.12g} 0.005 0.0001")
             geom.set("condim", "4")
 
+    authored_grasp_contract = dict(base.get("graspContract") or {})
+    grasp_clearance_adjustment = 0.0
+    placed_grasp_height = float(authored_grasp_contract.get("placedGraspHeightM") or 0.0)
+    # Long, flat generated objects need a small approach clearance so the
+    # fingers do not scrape the support plane.  Applying that offset to compact
+    # objects (the apple/cube contracts) moves the grasp above their validated
+    # contact band and can turn a proven grasp into an object_dropped failure.
+    # Gate the adjustment on measured XY aspect ratio rather than an asset name.
+    source_extent = np.maximum(source_high - source_low, 1e-9)
+    planar_aspect_ratio = float(max(source_extent[0], source_extent[1]) / min(source_extent[0], source_extent[1]))
+    authored_grasp_contract["planarAspectRatio"] = planar_aspect_ratio
+    minimum_tabletop_grasp_height = 0.030 if planar_aspect_ratio >= 2.0 else placed_grasp_height
+    if placed_grasp_height < minimum_tabletop_grasp_height:
+        grasp_site = next((site for site in pick_object.findall("site") if site.get("name") == "compiled_asset_grasp"), None)
+        if grasp_site is None:
+            raise ValueError("Compiled object is missing its candidate grasp site.")
+        grasp_site_position = np.asarray([float(value) for value in str(grasp_site.get("pos") or "").split()], dtype=float)
+        if grasp_site_position.shape != (3,):
+            raise ValueError("Compiled object grasp-site position is invalid.")
+        grasp_clearance_adjustment = minimum_tabletop_grasp_height - placed_grasp_height
+        grasp_site_position[2] += grasp_clearance_adjustment
+        grasp_site.set("pos", " ".join(f"{value:.12g}" for value in grasp_site_position))
+        authored_grasp_contract["placedGraspHeightM"] = minimum_tabletop_grasp_height
+        local_position = list(authored_grasp_contract.get("localPositionM") or grasp_site_position.tolist())
+        local_position[2] = float(local_position[2]) + grasp_clearance_adjustment
+        authored_grasp_contract["localPositionM"] = local_position
+
     for geom in list(worldbody.findall("geom")):
         if geom.get("name") == "target_marker":
             worldbody.remove(geom)
@@ -815,10 +889,21 @@ def compile_authored_scene_asset_world(
         assert target_placement is not None
         target_center = (target_low + target_high) / 2
         target_half = (target_high - target_low) / 2
+        target_support_top = target_top
+        support_half = target_half.copy()
+        support_center = target_center.copy()
+        if relation == "inside":
+            if "sink" in str(target_placement.get("name") or "").lower():
+                target_support_top = max(float(target_low[2] + 0.03), counter_top - 0.16)
+                support_half = np.array([target_half[0] * 0.72, target_half[1] * 0.72, 0.015])
+            else:
+                target_support_top = max(counter_top + 0.03, float(target_high[2] - min(0.12, target_half[2])))
+                support_half = np.array([target_half[0] * 0.72, target_half[1] * 0.72, 0.012])
+            support_center = np.array([target_center[0], target_center[1], target_support_top - support_half[2]])
         target_body = ET.SubElement(
             worldbody,
             "body",
-            {"name": "target_support", "pos": " ".join(f"{value:.12g}" for value in target_center)},
+            {"name": "target_support", "pos": " ".join(f"{value:.12g}" for value in support_center)},
         )
         ET.SubElement(
             target_body,
@@ -826,19 +911,42 @@ def compile_authored_scene_asset_world(
             {
                 "name": "target_support_collision",
                 "type": "box",
-                "size": " ".join(f"{value:.12g}" for value in target_half),
+                "size": " ".join(f"{value:.12g}" for value in support_half),
                 "rgba": "0.18 0.20 0.24 0.35",
                 "friction": "0.8 0.01 0.001",
             },
         )
-        target_radius = float(max(0.025, min(target_half[0], target_half[1]) * 0.82))
+        if relation == "inside":
+            wall_thickness = min(0.012, float(min(support_half[0], support_half[1]) * 0.12))
+            wall_half_height = max(0.025, float((target_top - target_support_top) / 2))
+            wall_z = float(support_half[2] + wall_half_height)
+            wall_specs = (
+                ("target_wall_left", [-support_half[0] + wall_thickness, 0.0, wall_z], [wall_thickness, support_half[1], wall_half_height]),
+                ("target_wall_right", [support_half[0] - wall_thickness, 0.0, wall_z], [wall_thickness, support_half[1], wall_half_height]),
+                ("target_wall_front", [0.0, -support_half[1] + wall_thickness, wall_z], [support_half[0], wall_thickness, wall_half_height]),
+                ("target_wall_back", [0.0, support_half[1] - wall_thickness, wall_z], [support_half[0], wall_thickness, wall_half_height]),
+            )
+            for wall_name, wall_pos, wall_size in wall_specs:
+                ET.SubElement(
+                    target_body,
+                    "geom",
+                    {
+                        "name": wall_name,
+                        "type": "box",
+                        "pos": " ".join(f"{value:.12g}" for value in wall_pos),
+                        "size": " ".join(f"{value:.12g}" for value in wall_size),
+                        "rgba": "0.18 0.20 0.24 0.22",
+                        "friction": "0.8 0.01 0.001",
+                    },
+                )
+        target_radius = float(max(0.025, min(support_half[0], support_half[1]) * (0.90 if relation == "inside" else 0.82)))
         ET.SubElement(
             worldbody,
             "geom",
             {
                 "name": "target_marker",
                 "type": "cylinder",
-                "pos": f"{target_center[0]:.12g} {target_center[1]:.12g} {target_top + 0.002:.12g}",
+                "pos": f"{target_center[0]:.12g} {target_center[1]:.12g} {target_support_top + 0.002:.12g}",
                 "size": f"{target_radius:.12g} 0.002",
                 "rgba": "0.12 0.72 0.36 0.6",
                 "contype": "0",
@@ -847,12 +955,14 @@ def compile_authored_scene_asset_world(
         )
         target_volumes = [{
             "id": "authored_target_top",
-            "shape": "cylinder",
+            "shape": "box" if relation == "inside" else "cylinder",
             "centerM": [float(target_center[0]), float(target_center[1]), target_top],
             "radiusM": target_radius,
-            "supportTopM": target_top,
+            "halfExtentsM": [float(support_half[0]), float(support_half[1])],
+            "supportTopM": target_support_top,
             "supportBody": "target_support",
             "assetId": target_placement["assetId"],
+            "relation": relation,
         }]
     front = next((camera for camera in worldbody.findall("camera") if camera.get("name") == "front"), None)
     if front is not None:
@@ -871,11 +981,15 @@ def compile_authored_scene_asset_world(
         raise ValueError("Authored-world reset produced non-finite physics state.")
 
     template = dict(base)
-    authored_grasp_contract = dict(base.get("graspContract") or {})
     authored_grasp_contract.update({
         "gripperClosingAxisWorld": [0.0, 1.0, 0.0],
         "gripperClosingAxisIndex": 1,
         "mountAdjusted": True,
+        "tabletopClearanceAdjustmentM": grasp_clearance_adjustment,
+        "sourceFootprintHalfExtentsM": [
+            float((source_high[0] - source_low[0]) / 2),
+            float((source_high[1] - source_low[1]) / 2),
+        ],
     })
     object_bounding_radius = float(authored_grasp_contract["localBoundingRadiusM"])
     drop_center = [
@@ -892,6 +1006,7 @@ def compile_authored_scene_asset_world(
         "revision": 1,
         "name": f"{world_id} · {source_placement['name']} → {target_name}",
         "taskKind": task_kind,
+        "relation": relation,
         "runtimePath": str(world_path),
         "runtimeSha256": _sha256(world_path),
         "authoredWorldId": world_id,
@@ -932,6 +1047,7 @@ def compile_authored_scene_asset_world(
             "sourceAssetId": source_placement["assetId"],
             "targetAssetId": target_placement["assetId"] if target_placement is not None else None,
             "omittedVisualOnlyAssets": True,
+            "targetCollisionPolicy": "measured_aabb_container_proxy" if relation == "inside" else "measured_aabb_support_proxy",
             "frictionSample": {"value": authored_friction, "method": "upper_evidence_range_for_grasp_validation"},
         },
         "validation": dict(base.get("validation") or {}) | {
@@ -1234,7 +1350,14 @@ class PickPlaceOracle:
             for contact in contacts
             if "pick_object" in {contact.body_a, contact.body_b}
         ][:16]
-        self.trajectory.append(state)
+        # Viewer geometry is derived from the compiled MuJoCo model and is
+        # needed by the live WebSocket frame, but repeating the complete
+        # geometry list in every durable trajectory sample inflated one live
+        # evaluation to tens of megabytes.  Keep the authoritative body/joint/
+        # contact state in the database and stream geometry only at the live
+        # boundary; the immutable evaluation artifact remains the source for
+        # recorded phase images.
+        self.trajectory.append({key: value for key, value in state.items() if key != "renderGeometries"})
         for contact in contacts:
             pair = "|".join(sorted((contact.body_a, contact.body_b)))
             self.contact_pairs[pair] = self.contact_pairs.get(pair, 0) + 1
@@ -1656,7 +1779,21 @@ class CompiledAssetPickPlaceOracle(PickPlaceOracle):
         support_body = str(target.get("supportBody", "workspace_calibration"))
         target_error = float(np.linalg.norm(final_grasp_position[:2] - target_xy))
         bounding_radius = float(self.template["graspContract"]["localBoundingRadiusM"])
-        containment_residual = target_error + bounding_radius - float(target["radiusM"])
+        containment_policy = "full_object_inside_target_volume"
+        if self.template.get("relation") == "on_top_of" and len(target.get("halfExtentsM") or []) == 2:
+            # Stacking does not require the entire source footprint to fit
+            # inside the target footprint (an apple may physically balance on
+            # a slightly smaller orange).  It requires the object's centre of
+            # mass to remain inside the measured support polygon, actual
+            # source/target contact, release, and a stable settle window.
+            half_extents = np.maximum(np.asarray(target["halfExtentsM"], dtype=float) - 0.002, 0.001)
+            containment_residual = float(np.max(np.abs(final_position[:2] - target_xy) - half_extents))
+            containment_policy = "center_of_mass_inside_support_polygon_with_2mm_margin"
+        elif target.get("shape") == "box" and len(target.get("halfExtentsM") or []) == 2:
+            half_extents = np.asarray(target["halfExtentsM"], dtype=float)
+            containment_residual = float(np.max(np.abs(final_grasp_position[:2] - target_xy) + bounding_radius - half_extents))
+        else:
+            containment_residual = target_error + bounding_radius - float(target["radiusM"])
         final_contacts = self.backend.contacts()
         support_contact = any(
             "pick_object" in {contact.body_a, contact.body_b}
@@ -1729,8 +1866,10 @@ class CompiledAssetPickPlaceOracle(PickPlaceOracle):
             "rotationTransformGatePassed": rotation_transform_gate,
             "settleSimulatedSeconds": settle_steps / PHYSICS_HZ if settle_steps else None,
             "targetRadiusM": float(target["radiusM"]),
+            "targetHalfExtentsM": target.get("halfExtentsM"),
             "objectBoundingRadiusM": bounding_radius,
             "containmentResidualM": containment_residual,
+            "containmentPolicy": containment_policy,
             "requiredGripperWidthM": required_width,
             "availableGripperWidthM": configured_open_width,
             "placementEvidence": self.template["placements"][0],
@@ -1811,7 +1950,12 @@ class AuthoredScenePickPlaceOracle(CompiledAssetPickPlaceOracle):
         solved_position_error = float(np.linalg.norm(solved_residual[:3]) / 3.0)
         reached = False
         stop_reason = "ik_solution_tracking_timeout"
-        max_command_step = 0.012 if phase.startswith(("lift", "transport")) else 0.035
+        long_flat_grasp = float((self.template.get("graspContract") or {}).get("planarAspectRatio") or 1.0) >= 2.0
+        max_command_step = (
+            (0.006 if long_flat_grasp else 0.012) if phase.startswith("lift")
+            else (0.008 if long_flat_grasp else 0.012) if phase.startswith("transport")
+            else 0.035
+        )
         for tick in range(max_ticks):
             current = np.asarray([self.data.qpos[index] for index in self.backend.arm_qpos], dtype=float)
             # Position actuators need a bounded command lead to cancel the
@@ -1904,7 +2048,7 @@ class AuthoredScenePickPlaceOracle(CompiledAssetPickPlaceOracle):
                     waypoint,
                     f"{phase}_segment_{segment:02d}",
                     max_ticks=max(300, max_ticks // segment_count + 60),
-                    position_tolerance_m=0.006,
+                    position_tolerance_m=0.007,
                     rotation_tolerance_rad=0.1,
                     tracked_site=tracked_site,
                 ):
@@ -1925,6 +2069,30 @@ class AuthoredScenePickPlaceOracle(CompiledAssetPickPlaceOracle):
             })
             return True
         if phase in {"pre_grasp", "grasp_approach"}:
+            if phase == "pre_grasp" and self.template.get("relation") == "on_top_of":
+                target_volume = (self.template.get("targetVolumes") or [{}])[0]
+                obstacle_clearance_z = float(target_volume.get("supportTopM", target_position[2])) + 0.12
+                obstacle_center = np.asarray(target_volume.get("centerM", target_position)[:2], dtype=float)
+                segment_start = self.data.site_xpos[self.backend.ee_site, :2].copy()
+                segment_end = target_position[:2]
+                segment = segment_end - segment_start
+                denominator = float(np.dot(segment, segment))
+                fraction = 0.0 if denominator < 1e-12 else float(np.clip(np.dot(obstacle_center - segment_start, segment) / denominator, 0.0, 1.0))
+                closest = segment_start + segment * fraction
+                obstacle_half = np.asarray(target_volume.get("halfExtentsM") or [target_volume.get("radiusM", 0.0)] * 2, dtype=float)
+                path_intersects_obstacle = float(np.linalg.norm(obstacle_center - closest)) <= float(np.linalg.norm(obstacle_half) + 0.08)
+                if obstacle_clearance_z > float(target_position[2]) + 0.05 and path_intersects_obstacle:
+                    clearance_target = target_position.copy()
+                    clearance_target[2] = obstacle_clearance_z
+                    if not self._move_solved_ik(
+                        clearance_target,
+                        "pre_grasp_obstacle_clearance",
+                        max_ticks=max(max_ticks, 360),
+                        position_tolerance_m=0.008,
+                        rotation_tolerance_rad=0.1,
+                        tracked_site=kwargs.get("tracked_site"),
+                    ):
+                        return False
             return self._move_solved_ik(
                 target_position,
                 phase,
@@ -2180,6 +2348,7 @@ def run_authored_scene_oracle(
     *,
     robot_spawn: dict[str, Any] | None = None,
     task_kind: str = "pick_place",
+    relation: str = "on_top_of",
     live_frame_callback: Callable[[dict[str, Any], np.ndarray, np.ndarray], None] | None = None,
     realtime: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2192,6 +2361,7 @@ def run_authored_scene_oracle(
         counter_placement=counter_placement,
         robot_spawn=robot_spawn,
         task_kind=task_kind,
+        relation=relation,
     )
     artifact_dir = (Path(template["runtimePath"]).parent.parent / "evaluations" / run_id).resolve()
     if not artifact_dir.is_relative_to(WORLDS_DIR.resolve()):
